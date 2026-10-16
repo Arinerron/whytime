@@ -7,6 +7,8 @@ members = [
     "crates/whytime-testbins",
     "xtask",
 ]
+# The tracekit submodule is a workspace of its own; its crates are path dependencies here.
+exclude = ["tracekit"]
 default-members = ["crates/whytime"]
 
 [workspace.package]
@@ -19,9 +21,9 @@ license = "MIT"
 whytime-abi = { path = "crates/whytime-abi" }
 whytime-bpf = { path = "crates/whytime-bpf" }
 
-wire = { path = "../tracekit/crates/wire", package = "tracekit-wire" }
-procctx = { path = "../tracekit/crates/procctx" }
-bpfdoctor = { path = "../tracekit/crates/bpfdoctor" }
+wire = { path = "tracekit/crates/wire", package = "tracekit-wire" }
+procctx = { path = "tracekit/crates/procctx" }
+bpfdoctor = { path = "tracekit/crates/bpfdoctor" }
 
 aya = { version = "0.14.0", default-features = false }
 anyhow = "1"

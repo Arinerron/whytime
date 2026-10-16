@@ -17,18 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: whytime
-      - uses: ./whytime/.github/actions/setup
+          submodules: recursive
+      - uses: ./.github/actions/setup
       - name: Build (static, x86_64 musl)
-        working-directory: whytime
         run: |
           cargo build --release -p whytime
           file target/x86_64-unknown-linux-musl/release/whytime | grep -Eq 'static-pie linked|statically linked'
       - name: Unit tests
-        working-directory: whytime
         run: cargo test --workspace
       - name: Completions and man pages
-        working-directory: whytime
         run: |
           for shell in bash zsh fish elvish powershell; do
             target/x86_64-unknown-linux-musl/release/whytime completions "$shell" > /dev/null
@@ -42,15 +39,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: whytime
-      - uses: ./whytime/.github/actions/setup
+          submodules: recursive
+      - uses: ./.github/actions/setup
       - name: Install qemu-user
         run: sudo apt-get install -yq --no-install-recommends qemu-user
       - name: Check
-        working-directory: whytime
         run: cargo check --target aarch64-unknown-linux-musl --workspace
       - name: Build (static, aarch64 musl, rust-lld)
-        working-directory: whytime
         run: |
           cargo build --release -p whytime --target aarch64-unknown-linux-musl
           bin=target/aarch64-unknown-linux-musl/release/whytime
@@ -67,8 +62,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: whytime
-      - uses: ./whytime/.github/actions/setup
+          submodules: recursive
+      - uses: ./.github/actions/setup
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -80,12 +75,10 @@ jobs:
           sudo apt-get install -yq --no-install-recommends qemu-system-x86 virtiofsd busybox-static
           pipx install virtme-ng
       - name: Build on the host (the VM has no network)
-        working-directory: whytime
         run: |
           cargo build --release -p whytime -p whytime-testbins
           cargo build -p xtask
       - name: cargo xtask test-e2e in the VM
-        working-directory: whytime
         run: |
           # The guest starts in this directory and sees the host's root filesystem read-only
           # (writes under /home and /etc go to a RAM overlay); it runs the suite as the runner

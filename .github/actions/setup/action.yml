@@ -1,28 +1,17 @@
 name: whytime build setup
 description: >
-  Checks out the tracekit path dependency next to the whytime checkout (../tracekit), installs
-  clang for the BPF object, and installs the toolchain and targets from rust-toolchain.toml.
-  Expects whytime checked out at $GITHUB_WORKSPACE/whytime.
-inputs:
-  tracekit-repository:
-    description: The tracekit repository (owner/name), checked out at $GITHUB_WORKSPACE/tracekit.
-    default: Arinerron/tracekit
-  tracekit-ref:
-    description: Branch, tag or commit of tracekit; empty for its default branch.
-    default: ""
-  tracekit-token:
-    description: Token that can read tracekit (a PAT or app token if it is private).
-    default: ${{ github.token }}
+  Installs clang for the BPF object and the toolchain and targets from rust-toolchain.toml.
+  Expects whytime checked out at $GITHUB_WORKSPACE with submodules (tracekit).
 runs:
   using: composite
   steps:
-    - name: Check out tracekit (path dependency ../tracekit)
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ inputs.tracekit-repository }}
-        ref: ${{ inputs.tracekit-ref }}
-        token: ${{ inputs.tracekit-token }}
-        path: tracekit
+    - name: Check the tracekit submodule
+      shell: bash
+      run: |
+        test -f tracekit/crates/wire/Cargo.toml || {
+          echo "::error::tracekit submodule missing: check out with submodules: recursive"
+          exit 1
+        }
     - name: Install clang
       shell: bash
       run: |
@@ -30,11 +19,8 @@ runs:
         sudo apt-get install -yq --no-install-recommends clang llvm
     - name: Install the Rust toolchain from rust-toolchain.toml
       shell: bash
-      working-directory: whytime
       run: |
         rustup toolchain install
         rustc --version
     - name: Cache cargo registry and target
       uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: whytime
