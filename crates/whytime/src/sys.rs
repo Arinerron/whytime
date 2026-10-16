@@ -1,11 +1,16 @@
-//! The syscalls whytime understands: what blocking in each one means, and which ones the BPF
-//! program should describe the file descriptor (or `connect` target) of when they block.
+//! The syscalls whytime understands: what blocking in each one means, which ones the BPF
+//! program should describe the file descriptor (or `connect` target) of when they block, and
+//! which ones its resolver capture watches at exit.
 //!
 //! Numbers come from `libc`, so the table follows the build target's syscall ABI; the kernel
 //! side only sees the `SYSF_*` bits user space writes into its `sys_flags` array.
 
 use libc::c_long;
-use whytime_abi::{SYS_TABLE_LEN, SYSF_FD0, SYSF_SOCKADDR};
+use whytime_abi::{
+    DNSOP_CLOSE, DNSOP_CONNECT, DNSOP_READ, DNSOP_READV, DNSOP_RECVMMSG, DNSOP_RECVMSG,
+    DNSOP_SENDMMSG, DNSOP_SENDMSG, DNSOP_SENDTO, DNSOP_WRITE, DNSOP_WRITEV, SYS_TABLE_LEN,
+    SYSF_DNS_SHIFT, SYSF_FD0, SYSF_SOCKADDR,
+};
 
 /// What a thread blocked in a syscall is waiting for, before looking at its descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +174,23 @@ const LEGACY: &[(c_long, &str, Kind)] = &[
 #[cfg(not(target_arch = "x86_64"))]
 const LEGACY: &[(c_long, &str, Kind)] = &[];
 
+/// Syscalls the resolver capture handles at exit, with their `DNSOP_*`: connects and sends
+/// that may name a resolver, closes, and the I/O whose payload it copies on resolver sockets.
+const RESOLVER_IO: &[(c_long, u32)] = &[
+    (libc::SYS_connect, DNSOP_CONNECT),
+    (libc::SYS_close, DNSOP_CLOSE),
+    (libc::SYS_read, DNSOP_READ),
+    (libc::SYS_recvfrom, DNSOP_READ),
+    (libc::SYS_readv, DNSOP_READV),
+    (libc::SYS_recvmsg, DNSOP_RECVMSG),
+    (libc::SYS_recvmmsg, DNSOP_RECVMMSG),
+    (libc::SYS_write, DNSOP_WRITE),
+    (libc::SYS_sendto, DNSOP_SENDTO),
+    (libc::SYS_writev, DNSOP_WRITEV),
+    (libc::SYS_sendmsg, DNSOP_SENDMSG),
+    (libc::SYS_sendmmsg, DNSOP_SENDMMSG),
+];
+
 /// One known syscall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Syscall {
@@ -182,6 +204,8 @@ pub struct Syscall {
 #[derive(Debug)]
 pub struct SyscallTable {
     by_nr: Vec<Option<Syscall>>,
+    /// `DNSOP_*` by number (0: none).
+    resolver: Vec<u32>,
 }
 
 impl SyscallTable {
@@ -193,7 +217,13 @@ impl SyscallTable {
                 *slot = Some(Syscall { name, kind });
             }
         }
-        Self { by_nr }
+        let mut resolver = vec![0; SYS_TABLE_LEN as usize];
+        for &(nr, op) in RESOLVER_IO {
+            if let Some(slot) = usize::try_from(nr).ok().and_then(|nr| resolver.get_mut(nr)) {
+                *slot = op;
+            }
+        }
+        Self { by_nr, resolver }
     }
 
     /// The syscall numbered `nr`, if whytime knows it.
@@ -203,16 +233,22 @@ impl SyscallTable {
             .and_then(|nr| self.by_nr.get(nr).copied().flatten())
     }
 
-    /// `(nr, SYSF_* bits)` for every syscall the BPF program should describe.
+    /// `(nr, sys_flags value)` for every syscall the BPF program describes at its first block
+    /// or handles in the resolver capture.
     pub fn bpf_flags(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.by_nr.iter().zip(0_u32..).filter_map(|(entry, nr)| {
-            let flags = entry.as_ref()?.kind.bpf_flags();
-            (flags != 0).then_some((nr, flags))
-        })
+        self.by_nr
+            .iter()
+            .zip(&self.resolver)
+            .zip(0_u32..)
+            .filter_map(|((entry, &op), nr)| {
+                let flags = entry.as_ref().map_or(0, |s| s.kind.bpf_flags()) | op << SYSF_DNS_SHIFT;
+                (flags != 0).then_some((nr, flags))
+            })
     }
 
-    /// The `SYSF_*` bits of syscall `nr` (0 when unknown): what the BPF program describes
-    /// at its entry, and attach mode describes from `/proc` for threads blocked in it.
+    /// The `SYSF_FD0`/`SYSF_SOCKADDR` bits of syscall `nr` (0 when unknown): what the BPF
+    /// program describes at its first block, and attach mode describes from `/proc` for
+    /// threads blocked in it.
     pub fn flags(&self, nr: i32) -> u32 {
         self.get(nr).map_or(0, |syscall| syscall.kind.bpf_flags())
     }
@@ -227,14 +263,30 @@ mod tests {
         let table = SyscallTable::new();
         let flags: std::collections::HashMap<u32, u32> = table.bpf_flags().collect();
         let nr = |n: c_long| u32::try_from(n).unwrap();
-        assert_eq!(flags[&nr(libc::SYS_read)], SYSF_FD0);
-        assert_eq!(flags[&nr(libc::SYS_fdatasync)], SYSF_FD0);
-        assert_eq!(flags[&nr(libc::SYS_connect)], SYSF_FD0 | SYSF_SOCKADDR);
+        let describe = |n: c_long| flags[&nr(n)] & (SYSF_FD0 | SYSF_SOCKADDR);
+        assert_eq!(describe(libc::SYS_read), SYSF_FD0);
+        assert_eq!(describe(libc::SYS_fdatasync), SYSF_FD0);
+        assert_eq!(describe(libc::SYS_connect), SYSF_FD0 | SYSF_SOCKADDR);
         assert_eq!(flags[&nr(libc::SYS_flock)], SYSF_FD0);
         assert_eq!(flags[&nr(libc::SYS_fcntl)], SYSF_FD0);
         assert!(!flags.contains_key(&nr(libc::SYS_futex)));
         assert!(!flags.contains_key(&nr(libc::SYS_openat)));
         assert!(!flags.contains_key(&nr(libc::SYS_io_uring_enter)));
+    }
+
+    #[test]
+    fn resolver_capture_ops_sit_above_the_describe_bits() {
+        let table = SyscallTable::new();
+        let flags: std::collections::HashMap<u32, u32> = table.bpf_flags().collect();
+        let nr = |n: c_long| u32::try_from(n).unwrap();
+        let op = |n: c_long| flags[&nr(n)] >> SYSF_DNS_SHIFT;
+        assert_eq!(op(libc::SYS_recvfrom), DNSOP_READ);
+        assert_eq!(op(libc::SYS_sendmsg), DNSOP_SENDMSG);
+        // close has no class of its own: only the capture needs it, and describing it
+        // stays off.
+        assert_eq!(flags[&nr(libc::SYS_close)], DNSOP_CLOSE << SYSF_DNS_SHIFT);
+        assert_eq!(table.flags(i32::try_from(libc::SYS_close).unwrap()), 0);
+        assert_eq!(op(libc::SYS_connect), DNSOP_CONNECT);
     }
 
     #[test]

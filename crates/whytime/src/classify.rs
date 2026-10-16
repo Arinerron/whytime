@@ -11,7 +11,9 @@
 //!
 //! Besides the syscall, a block may carry what ended or caused it: the descriptor whose
 //! readiness ended a poll/select/epoll wait, the mapped file of a page fault, and the `comm`
-//! of a waker outside the traced tree (see [`BlockInfo`]).
+//! of a waker outside the traced tree (see [`BlockInfo`]). Internet peers are named after the
+//! host the traced tree resolved to their address ([`Hosts`], fed from the ring buffer's
+//! resolver records), else shown as `ip:port`.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -24,10 +26,11 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use whytime_abi::{
-    ANON_INODE_FS_MAGIC, NR_NONE, PATH_BYTES, SYSD_DESCRIBED, SYSD_PATH_ROOTED,
+    ANON_INODE_FS_MAGIC, DnsRecord, NR_NONE, PATH_BYTES, SYSD_DESCRIBED, SYSD_PATH_ROOTED,
     SYSD_PATH_TRUNCATED, SysDetail, SysInfo,
 };
 
+use crate::dns::Hosts;
 use crate::sys::{Kind, SyscallTable};
 
 /// Where wall time went. Serialized in lower case (`"fsync"`).
@@ -86,6 +89,13 @@ pub enum Subject {
     },
     /// Peer of an internet socket.
     Peer(SocketAddr),
+    /// Peer of an internet socket whose address the traced tree resolved from `name`.
+    Host {
+        /// The name the program looked up.
+        name: Arc<str>,
+        /// The peer.
+        addr: SocketAddr,
+    },
     /// An internet socket without a peer (listening or not yet connected).
     Unconnected,
     /// The syscall, when it explains more than the class.
@@ -113,6 +123,7 @@ impl fmt::Display for Subject {
             Self::Path(path) => f.write_str(path),
             Self::Inode { dev, ino } => write!(f, "dev {}:{} ino {ino}", dev >> 20, dev & 0xf_ffff),
             Self::Peer(addr) => write!(f, "{addr}"),
+            Self::Host { name, addr } => write!(f, "{name}:{}", addr.port()),
             Self::Unconnected => f.write_str("unconnected socket"),
             Self::Syscall(name) => write!(f, "in {name}"),
             Self::Named(name) => f.write_str(name),
@@ -236,6 +247,11 @@ pub struct Classifier {
     files: Box<dyn FdTarget>,
     /// `(dev, ino)` → subject path.
     paths: HashMap<(u32, u64), Known>,
+    /// Names of resolved addresses.
+    hosts: Hosts,
+    /// Socket inode → its peer and the name it got when first classified, so one
+    /// connection keeps one subject even if its address is resolved again later.
+    peers: HashMap<u64, (SocketAddr, Option<Arc<str>>)>,
 }
 
 impl Classifier {
@@ -247,7 +263,14 @@ impl Classifier {
             home,
             files,
             paths: HashMap::new(),
+            hosts: Hosts::default(),
+            peers: HashMap::new(),
         }
+    }
+
+    /// Learns host names from resolver traffic; later blocks on their addresses use them.
+    pub fn resolved(&mut self, record: &DnsRecord) {
+        self.hosts.ingest(record);
     }
 
     /// Classifies a block of process `tgid` in `sys` (with the kernel's `detail` on it),
@@ -360,7 +383,9 @@ impl Classifier {
                 }
                 S_IFSOCK => match sys.family {
                     AF_INET | AF_INET6 => {
-                        let subject = peer(sys).map_or(Subject::Unconnected, Subject::Peer);
+                        let subject = peer(sys).map_or(Subject::Unconnected, |addr| {
+                            self.peer_subject(sys.ino, addr)
+                        });
                         return Blocked {
                             class: Class::Net,
                             subject,
@@ -379,6 +404,23 @@ impl Classifier {
             class,
             subject,
             socket: None,
+        }
+    }
+
+    /// The subject of socket `socket` connected to `addr`: the name resolved to the address
+    /// when the socket was first seen with that peer, else the address.
+    fn peer_subject(&mut self, socket: u64, addr: SocketAddr) -> Subject {
+        let name = match self.peers.get(&socket) {
+            Some((seen, name)) if *seen == addr => name.clone(),
+            _ => {
+                let name = self.hosts.name(addr.ip()).cloned();
+                self.peers.insert(socket, (addr, name.clone()));
+                name
+            }
+        };
+        match name {
+            Some(name) => Subject::Host { name, addr },
+            None => Subject::Peer(addr),
         }
     }
 

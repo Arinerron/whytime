@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use procctx::{Config, ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable, StartClock};
 use whytime_abi::{
-    CpuSegment, EPF_FAULT, EPF_READY, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord,
-    EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE, ST_RUNNING, ST_WOKEN,
-    TaskState,
+    CpuSegment, DnsRecord, EPF_FAULT, EPF_READY, EV_DNS, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK,
+    EpisodeRecord, EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE,
+    ST_RUNNING, ST_WOKEN, TaskState,
 };
 
 use crate::classify::{BlockInfo, Blocked, Classifier};
@@ -238,6 +238,8 @@ impl Trace {
             EV_EXEC => wire::from_bytes::<ExecRecord>(bytes).map(|r| self.on_exec(r)),
             EV_EPISODE => wire::from_bytes::<EpisodeRecord>(bytes).map(|r| self.on_episode(r)),
             EV_EXIT => wire::from_bytes::<ExitRecord>(bytes).map(|r| self.on_exit(r)),
+            // Resolver traffic: names for the peers of later blocks.
+            EV_DNS => wire::from_bytes::<DnsRecord>(bytes).map(|r| self.classifier.resolved(r)),
             _ => None,
         });
         if applied.is_none() {
@@ -531,11 +533,12 @@ fn cstr(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use libc::SYS_nanosleep;
+    use libc::{SYS_nanosleep, SYS_recvfrom};
+    use whytime_abi::{DNS_VARLINK, SysInfo};
 
     use super::*;
     use crate::classify::Class;
-    use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, task, trace};
+    use crate::testkit::{dns, episode, exec, exit, feed, fork, seg, sys, task, trace};
 
     fn spans(thread: &Thread) -> Vec<(u64, u64)> {
         thread.segs.iter().map(|s| (s.start, s.end)).collect()
@@ -687,5 +690,56 @@ mod tests {
         assert_eq!(spans(preempted), [(1_300, 10_000)]);
         assert!(matches!(preempted.segs[0].kind, SegKind::Mixed { run: 300, rq: 500, .. }));
         assert_eq!(t.procs[0].cpu_ns, 500 + 400 + 800 + 300);
+    }
+
+    #[test]
+    fn net_blocks_are_named_after_the_host_the_tree_resolved_to_their_peer() {
+        // `app` asks resolved for `name` and gets `ip` back, on varlink socket 9.
+        let resolve = |t: &mut Trace, name: &str, ip: [u8; 4]| {
+            let request = format!(
+                "{{\"method\":\"io.systemd.Resolve.ResolveHostname\",\"parameters\":{{\"name\":\"{name}\"}}}}\0"
+            );
+            let [a, b, c, d] = ip;
+            let reply = format!(
+                "{{\"parameters\":{{\"addresses\":[{{\"family\":2,\"address\":[{a},{b},{c},{d}]}}]}}}}\0"
+            );
+            feed(t, &dns(100, 9, DNS_VARLINK, true, request.as_bytes()));
+            feed(t, &dns(100, 9, DNS_VARLINK, false, reply.as_bytes()));
+        };
+        // A `recvfrom` on TCP socket `ino` connected to `ip:port`.
+        let recv = |ino: u64, ip: [u8; 4], port: u16| {
+            let mut s = sys(SYS_recvfrom);
+            s.mode = 0o140_000;
+            s.family = 2;
+            s.port = port;
+            s.addr[..4].copy_from_slice(&ip);
+            s.ino = ino;
+            s
+        };
+        let block = |t: &mut Trace, sys: SysInfo, from: u64, to: u64| {
+            feed(t, &episode(100, 100, seg(from, 0, 0), sys, [from, to, to]));
+        };
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        resolve(&mut t, "api.test", [10, 0, 0, 7]);
+        block(&mut t, recv(60, [10, 0, 0, 7], 443), 1_000, 2_000);
+        block(&mut t, recv(61, [10, 0, 0, 7], 443), 2_000, 3_000);
+        // The address answers another name now: socket 60 keeps its name, a new one takes it.
+        resolve(&mut t, "cdn.test", [10, 0, 0, 7]);
+        block(&mut t, recv(60, [10, 0, 0, 7], 443), 3_000, 3_500);
+        block(&mut t, recv(62, [10, 0, 0, 7], 443), 3_500, 4_000);
+        // Never resolved: numeric.
+        block(&mut t, recv(63, [10, 0, 0, 8], 80), 4_000, 4_400);
+        feed(&mut t, &exit(5_000, 100, 100, seg(4_400, 600, 0), 0, true));
+
+        let attribution = crate::attribute::attribute(&t, 0, 1_000, 5_000);
+        let line = |subject: &str| {
+            let line = attribution.lines.iter().find(|l| l.subject == subject);
+            let line = line.unwrap_or_else(|| panic!("no line {subject}"));
+            (line.class, line.ns, line.connections, line.addr.as_deref())
+        };
+        assert_eq!(line("api.test:443"), (Class::Net, 2_500, Some(2), Some("10.0.0.7:443")));
+        assert_eq!(line("cdn.test:443"), (Class::Net, 500, Some(1), Some("10.0.0.7:443")));
+        assert_eq!(line("10.0.0.8:80"), (Class::Net, 400, Some(1), None));
     }
 }

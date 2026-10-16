@@ -1,6 +1,7 @@
 //! The report: JSON schema `whytime.report/1` and the human rendering.
 
 use std::io::{self, Write};
+use std::net::SocketAddr;
 
 use serde::Serialize;
 
@@ -61,11 +62,15 @@ pub struct ReportLine {
     pub share: f64,
     /// Nanoseconds.
     pub ns: u64,
-    /// What within the class: a process comm, directory, `ip:port` or syscall.
+    /// What within the class: a process comm, directory, `ip:port`, `host:port` or syscall.
     pub subject: String,
     /// Distinct sockets, for `net` lines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connections: Option<usize>,
+    /// The numeric peer (`ip:port`) of a `net` line whose subject is a resolved
+    /// `host:port`: the one that took most of its time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
 }
 
 /// A process of the traced tree.
@@ -101,6 +106,9 @@ pub struct Quality {
     pub readiness: bool,
     /// Whether the page-fault probes were attached (blocks in page faults are `fault`).
     pub faults: bool,
+    /// Whether the resolver capture was attached (network peers are named after the host
+    /// the program resolved).
+    pub dns: bool,
 }
 
 /// Inputs of [`Report::new`] besides the trace.
@@ -122,6 +130,10 @@ pub struct Meta {
     pub readiness: bool,
     /// Page-fault probes attached.
     pub faults: bool,
+    /// Resolver capture attached.
+    pub dns: bool,
+    /// Resolver sockets or payloads the kernel could not capture.
+    pub dns_lost: u64,
     /// Attach mode: the target and how it was seeded.
     pub attached: Option<Attached>,
 }
@@ -154,12 +166,14 @@ impl Report {
                      subject,
                      ns,
                      connections,
+                     addr,
                  }| ReportLine {
                     class,
                     share: share(ns),
                     ns,
                     subject,
                     connections,
+                    addr,
                 },
             )
             .collect();
@@ -206,15 +220,34 @@ impl Report {
                 ));
             }
         }
-        if lines.iter().any(|line| line.class == Class::Net) {
-            notes.push(
-                "network subjects are ip:port; hostname/DNS correlation is a later milestone"
-                    .to_owned(),
-            );
+        let numeric = lines
+            .iter()
+            .filter(|line| line.class == Class::Net && line.subject.parse::<SocketAddr>().is_ok())
+            .count();
+        if meta.dns && numeric > 0 {
+            notes.push(format!(
+                "{numeric} network peer(s) shown as ip:port: no name lookup returning that address \
+                 was seen in the traced tree (resolved before the window, by another process, from \
+                 /etc/hosts or a cache inside the program, or connected to by address)"
+            ));
+        }
+        if meta.dns_lost > 0 {
+            notes.push(format!(
+                "{} resolver sockets or replies could not be captured in kernel; some network \
+                 peers may be shown as ip:port",
+                meta.dns_lost
+            ));
         }
         if !meta.syscalls {
             notes.push(
                 "syscall tracepoints unavailable: blocked time is not classified by resource"
+                    .to_owned(),
+            );
+        }
+        if meta.syscalls && !meta.dns {
+            notes.push(
+                "resolver capture unavailable: network peers are shown as ip:port, not by the \
+                 hostname the program resolved"
                     .to_owned(),
             );
         }
@@ -263,6 +296,7 @@ impl Report {
                 syscalls: meta.syscalls,
                 readiness: meta.readiness,
                 faults: meta.faults,
+                dns: meta.dns,
             },
             notes,
         }
@@ -408,6 +442,7 @@ mod tests {
                 ns,
                 subject: subject.to_owned(),
                 connections: None,
+                addr: None,
             })
             .collect();
         Report {
@@ -425,6 +460,7 @@ mod tests {
                 syscalls: true,
                 readiness: true,
                 faults: true,
+                dns: true,
             },
             notes: Vec::new(),
         }

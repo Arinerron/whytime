@@ -348,6 +348,7 @@ impl Session {
             ended_by,
             exit_code,
             dropped: maps.dropped(),
+            dns_lost: maps.dns_lost(),
         };
         drop(maps);
         crate::save(recorder.as_ref(), args, &tasks, &end);

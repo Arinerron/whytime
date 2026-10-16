@@ -12,6 +12,7 @@ mod attach;
 mod attribute;
 mod classify;
 mod cli;
+mod dns;
 mod doctor;
 mod logger;
 mod percpu;
@@ -143,10 +144,16 @@ fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, Probes)> {
              reported as fault"
         );
     }
+    if let (Ok(()), Err(err)) = (&loaded.syscalls, &loaded.dns) {
+        log::warn!(
+            "resolver capture unavailable ({err:#}); network peers will be shown as ip:port"
+        );
+    }
     let probes = Probes {
         syscalls: loaded.syscalls.is_ok(),
         readiness: loaded.readiness.is_ok(),
         faults: loaded.faults.is_ok(),
+        dns: loaded.dns.is_ok(),
     };
     Ok((loaded.tracer, probes))
 }
@@ -280,7 +287,7 @@ impl Session {
             ended_by,
             exit_code,
             dropped: maps.dropped(),
-
+            dns_lost: maps.dns_lost(),
         };
         drop(maps);
         save(recorder.as_ref(), args, &tasks, &end);
@@ -382,6 +389,8 @@ fn meta(header: &Header, end: &End) -> Meta {
         syscalls: header.probes.syscalls,
         readiness: header.probes.readiness,
         faults: header.probes.faults,
+        dns: header.probes.dns,
+        dns_lost: end.dns_lost,
         attached: header.attached,
     }
 }

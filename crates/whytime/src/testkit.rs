@@ -8,8 +8,8 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use whytime_abi::{
-    CpuSegment, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord, EvHeader, ExecRecord,
-    ExitRecord, ForkRecord, NR_NONE, SYSD_DESCRIBED, SysInfo, TaskState,
+    CpuSegment, DnsRecord, EV_DNS, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord,
+    EvHeader, ExecRecord, ExitRecord, ForkRecord, NR_NONE, SYSD_DESCRIBED, SysInfo, TaskState,
 };
 use wire::Pod;
 
@@ -147,6 +147,22 @@ pub fn exit(
     r.start = u64::from(tgid);
     r.code = code;
     r.group_dead = u32::from(group_dead);
+    r
+}
+
+/// Resolver traffic of `tgid` on socket `ino` over `transport` (`DNS_*`): `payload` received,
+/// or with `sent` sent; whole, unless it exceeds `DNS_BYTES` (then cut, like the kernel).
+pub fn dns(tgid: u32, ino: u64, transport: u32, sent: bool, payload: &[u8]) -> DnsRecord {
+    let mut r: DnsRecord = zeroed();
+    r.hdr = hdr(EV_DNS, 0, tgid, tgid);
+    r.ino = ino;
+    r.fd = 3;
+    r.transport = u16::try_from(transport).expect("a DNS_* transport");
+    r.sent = u16::from(sent);
+    r.total = u32::try_from(payload.len()).expect("a short payload");
+    let len = payload.len().min(r.data.len());
+    r.data[..len].copy_from_slice(&payload[..len]);
+    r.len = u32::try_from(len).expect("DNS_BYTES fits");
     r
 }
 
