@@ -15,7 +15,7 @@ jobs:
     name: x86_64 build and unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ./.github/actions/setup
@@ -40,7 +40,7 @@ jobs:
     name: aarch64 check, build and qemu smoke
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ./.github/actions/setup
@@ -63,7 +63,7 @@ jobs:
       # Ubuntu mainline build (BTF enabled) booted by virtme-ng; whytime needs >= 5.18.
       KERNEL: v6.12.40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ./.github/actions/setup
