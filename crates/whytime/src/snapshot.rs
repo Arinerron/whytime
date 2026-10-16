@@ -5,15 +5,22 @@
 //! in-kernel interval reads as if it had been tracked all along: a runnable thread is
 //! on-CPU from the attach on, an off-CPU one blocked since the attach in the syscall
 //! `/proc/<tid>/syscall` shows. For descriptor syscalls the descriptor is described like
-//! the BPF program would (`/proc/<tid>/fd`, `fdinfo`, and the socket tables under
-//! `/proc/<pid>/net` for peers), so the first block classifies like any other.
+//! the BPF program's first-block description would (`/proc/<tid>/fd`, `fdinfo`, `statfs` for
+//! the filesystem, the socket tables under `/proc/<pid>/net` for peers), so the first block
+//! classifies like any other. No path is captured except an anonymous inode's name: file
+//! subjects come from the classifier's `/proc` fallback when the record is processed.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 
 use procctx::StatLine;
-use whytime_abi::{CpuSegment, NR_NONE, ST_BLOCKED, ST_RUNNING, SYSF_FD0, SysInfo, TaskState};
+use whytime_abi::{
+    ANON_INODE_FS_MAGIC, CpuSegment, NR_NONE, PATH_BYTES, ST_BLOCKED, ST_RUNNING, SYSD_DESCRIBED,
+    SYSF_FD0, SysDetail, SysInfo, TaskState,
+};
 
 use crate::classify::NR_UNREADABLE;
 use crate::sys::SyscallTable;
@@ -51,6 +58,8 @@ pub enum Activity {
         block_state: u32,
         /// The syscall it sleeps in.
         sys: SysInfo,
+        /// Its first arguments and, when described, filesystem and anonymous-inode name.
+        detail: SysDetail,
     },
 }
 
@@ -59,12 +68,16 @@ pub enum Activity {
 /// Sets `seg` (empty, from `now`), `last_ts` (`now`), `tgid` and `state`: `ST_RUNNING` for
 /// a runnable thread (if it was waiting for a CPU instead, that wait is folded into its
 /// first segment), `ST_BLOCKED` for an off-CPU one, with `block_ts` = `now` (the true start
-/// is unknown), `block_state` and `sys`. Everything else is zero, `sys` of a runnable thread
-/// is "no syscall" (as in a fresh kernel-side entry).
+/// is unknown), `block_state`, `sys` and `detail`. Everything else is zero, `sys` of a
+/// runnable thread is "no syscall" (as in a fresh kernel-side entry).
 pub fn task_state(tgid: u32, now: u64, activity: &Activity) -> TaskState {
-    let (state, block_ts, block_state, sys) = match *activity {
-        Activity::Running => (ST_RUNNING, 0, 0, no_syscall()),
-        Activity::Blocked { block_state, sys } => (ST_BLOCKED, now, block_state, sys),
+    let (state, block_ts, block_state, sys, detail) = match *activity {
+        Activity::Running => (ST_RUNNING, 0, 0, no_syscall(), no_detail()),
+        Activity::Blocked {
+            block_state,
+            sys,
+            detail,
+        } => (ST_BLOCKED, now, block_state, sys, detail),
     };
     TaskState {
         seg: CpuSegment {
@@ -82,6 +95,7 @@ pub fn task_state(tgid: u32, now: u64, activity: &Activity) -> TaskState {
         waker_tid: 0,
         waker_tgid: 0,
         _pad: 0,
+        detail,
     }
 }
 
@@ -112,8 +126,8 @@ enum SyscallLine {
     Running,
     /// Off-CPU outside any syscall (page fault, signal stop).
     Outside,
-    /// In syscall `nr` with first argument `arg0`.
-    In { nr: i32, arg0: u64 },
+    /// In syscall `nr` with arguments 0..3 `args`.
+    In { nr: i32, args: [u64; 3] },
 }
 
 impl<'a> Snapshot<'a> {
@@ -139,6 +153,7 @@ impl<'a> Snapshot<'a> {
         let stopped = |block_state| Activity::Blocked {
             block_state,
             sys: no_syscall(),
+            detail: no_detail(),
         };
         let block_state = match stat.state {
             b'R' => return existing(Activity::Running),
@@ -151,11 +166,11 @@ impl<'a> Snapshot<'a> {
             b'P' => TASK_PARKED,
             _ => TASK_UNINTERRUPTIBLE,
         };
-        let sys = match fs::read_to_string(format!("{dir}/syscall")) {
+        let (sys, detail) = match fs::read_to_string(format!("{dir}/syscall")) {
             Ok(text) => match parse_syscall(&text) {
                 Some(SyscallLine::Running) => return existing(Activity::Running),
-                Some(SyscallLine::Outside) => no_syscall(),
-                Some(SyscallLine::In { nr, arg0 }) => self.syscall(tgid, &dir, nr, arg0),
+                Some(SyscallLine::Outside) => (no_syscall(), no_detail()),
+                Some(SyscallLine::In { nr, args }) => self.syscall(tgid, &dir, nr, args),
                 None => self.unread(),
             },
             Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
@@ -164,34 +179,52 @@ impl<'a> Snapshot<'a> {
             // EACCES/EPERM: reading it needs ptrace access to the thread.
             Err(_) => self.unread(),
         };
-        existing(Activity::Blocked { block_state, sys })
+        existing(Activity::Blocked {
+            block_state,
+            sys,
+            detail,
+        })
     }
 
-    fn unread(&mut self) -> SysInfo {
+    fn unread(&mut self) -> (SysInfo, SysDetail) {
         self.unreadable += 1;
-        SysInfo {
+        let sys = SysInfo {
             nr: NR_UNREADABLE,
             ..no_syscall()
-        }
+        };
+        (sys, no_detail())
     }
 
-    /// Syscall `nr` with first argument `arg0`, its descriptor described when the BPF
-    /// program would describe it.
-    fn syscall(&mut self, tgid: u32, dir: &str, nr: i32, arg0: u64) -> SysInfo {
+    /// Syscall `nr` with arguments `args`, as the BPF program leaves it after the syscall's
+    /// first block: arguments saved, `SYSD_DESCRIBED`, and for descriptor syscalls the
+    /// descriptor described. A descriptor `/proc` cannot show stays undescribed (the kernel
+    /// describes it if the syscall blocks again).
+    fn syscall(&mut self, tgid: u32, dir: &str, nr: i32, args: [u64; 3]) -> (SysInfo, SysDetail) {
         let mut sys = SysInfo { nr, ..no_syscall() };
-        if self.syscalls.flags(nr) & SYSF_FD0 != 0 {
+        let mut detail = SysDetail {
+            args,
+            ..no_detail()
+        };
+        let described = if self.syscalls.flags(nr) & SYSF_FD0 == 0 {
+            true
+        } else {
             // A negative descriptor fails before blocking, so only valid ones reach here.
-            sys.fd = i32::try_from(arg0).unwrap_or(-1);
-            self.describe(tgid, dir, &mut sys);
+            sys.fd = i32::try_from(args[0]).unwrap_or(-1);
+            self.describe(tgid, dir, &mut sys, &mut detail)
+        };
+        if described {
+            detail.flags = SYSD_DESCRIBED;
         }
-        sys
+        (sys, detail)
     }
 
     /// Fills inode type and identity, open flags and, for sockets, family and peer of
-    /// `sys.fd`.
-    fn describe(&mut self, tgid: u32, dir: &str, sys: &mut SysInfo) {
-        let Ok(meta) = fs::metadata(format!("{dir}/fd/{}", sys.fd)) else {
-            return;
+    /// `sys.fd`, and the filesystem magic (plus the name of an anonymous inode, which the
+    /// kernel's path walk would capture) into `detail`. False if the descriptor is gone.
+    fn describe(&mut self, tgid: u32, dir: &str, sys: &mut SysInfo, detail: &mut SysDetail) -> bool {
+        let link = format!("{dir}/fd/{}", sys.fd);
+        let Ok(meta) = fs::metadata(&link) else {
+            return false;
         };
         sys.mode = meta.mode() & S_IFMT;
         sys.ino = meta.ino();
@@ -207,6 +240,17 @@ impl<'a> Snapshot<'a> {
             sys.addr = peer.addr;
             sys.port = peer.port;
         }
+        detail.magic = fs_magic(&link).unwrap_or(0);
+        if detail.magic == ANON_INODE_FS_MAGIC
+            && let Ok(target) = fs::read_link(&link)
+            && let Some(name) = target.as_os_str().as_bytes().strip_prefix(b"anon_inode:")
+            && name.len() < detail.path.len()
+        {
+            // A pseudo-filesystem name, as the walk leaves it: no SYSD_PATH_* flag.
+            detail.path[..name.len()].copy_from_slice(name);
+            detail.path_len = u32::try_from(name.len() + 1).unwrap_or(0);
+        }
+        true
     }
 
     /// The socket with inode `ino` in `tgid`'s network namespace.
@@ -271,6 +315,33 @@ fn no_syscall() -> SysInfo {
     }
 }
 
+/// No syscall arguments, nothing described: a fresh kernel-side entry's detail.
+fn no_detail() -> SysDetail {
+    SysDetail {
+        args: [0; 3],
+        magic: 0,
+        flags: 0,
+        path_len: 0,
+        _pad: 0,
+        path: [0; PATH_BYTES as usize],
+    }
+}
+
+/// `f_type` (the superblock's `s_magic`, low 32 bits as the BPF program reads it) of the
+/// filesystem holding the file `path` names; for a `/proc` fd link, the descriptor's file.
+fn fs_magic(path: &str) -> Option<u32> {
+    let path = CString::new(path).ok()?;
+    // SAFETY: `statfs` is plain data; statfs fills it from a NUL-terminated path.
+    let st = unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(path.as_ptr(), &raw mut st) != 0 {
+            return None;
+        }
+        st
+    };
+    u32::try_from(st.f_type & 0xffff_ffff).ok()
+}
+
 /// `running`, `-1 SP PC` (outside syscalls), or `NR ARG0..ARG5 SP PC`.
 fn parse_syscall(text: &str) -> Option<SyscallLine> {
     let mut words = text.split_ascii_whitespace();
@@ -282,8 +353,11 @@ fn parse_syscall(text: &str) -> Option<SyscallLine> {
     if nr < 0 {
         return Some(SyscallLine::Outside);
     }
-    let arg0 = u64::from_str_radix(words.next()?.strip_prefix("0x")?, 16).ok()?;
-    Some(SyscallLine::In { nr, arg0 })
+    let mut args = [0; 3];
+    for arg in &mut args {
+        *arg = u64::from_str_radix(words.next()?.strip_prefix("0x")?, 16).ok()?;
+    }
+    Some(SyscallLine::In { nr, args })
 }
 
 /// The octal `flags:` line of `/proc/<pid>/fdinfo/<fd>` (`file->f_flags`).
@@ -371,7 +445,10 @@ mod tests {
         );
         assert_eq!(
             parse_syscall("0 0x3 0x7ffd 0x2000 0x0 0x0 0x0 0x7ffc 0x7f12\n"),
-            Some(SyscallLine::In { nr: 0, arg0: 3 })
+            Some(SyscallLine::In {
+                nr: 0,
+                args: [3, 0x7ffd, 0x2000]
+            })
         );
         assert_eq!(parse_syscall(""), None);
     }
@@ -445,14 +522,21 @@ mod tests {
         accepted.write_all(b"x").unwrap();
         reader.join().unwrap();
 
-        let Activity::Blocked { block_state, sys } = activity else {
+        let Activity::Blocked {
+            block_state,
+            sys,
+            detail,
+        } = activity
+        else {
             unreachable!()
         };
         assert_eq!(block_state, TASK_INTERRUPTIBLE);
         assert_eq!(sys.mode, S_IFSOCK);
+        assert_eq!(detail.flags, SYSD_DESCRIBED);
         let class = Classifier::new(SyscallTable::new(), None, Box::new(ProcFd)).classify(
             std::process::id(),
             &sys,
+            &detail,
             block_state,
         );
         assert_eq!(class.class, Class::Net);
@@ -487,15 +571,62 @@ mod tests {
             libc::close(fds[1]);
         }
 
-        let Activity::Blocked { block_state, sys } = activity else {
+        let Activity::Blocked {
+            block_state,
+            sys,
+            detail,
+        } = activity
+        else {
             unreachable!()
         };
         assert_eq!(sys.fd, read_end);
         let class = Classifier::new(SyscallTable::new(), None, Box::new(ProcFd)).classify(
             std::process::id(),
             &sys,
+            &detail,
             block_state,
         );
+        assert_eq!(class.class, Class::Ipc);
+    }
+
+    #[test]
+    fn a_thread_blocked_reading_an_eventfd_is_described_as_an_anonymous_inode() {
+        // SAFETY: eventfd has no preconditions.
+        let efd = unsafe { libc::eventfd(0, 0) };
+        assert!(efd >= 0);
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            tid_tx.send(gettid()).unwrap();
+            let mut count = 0_u64;
+            // SAFETY: reading the 8-byte counter of our eventfd into `count`.
+            unsafe { libc::read(efd, (&raw mut count).cast(), 8) };
+        });
+        let tid = tid_rx.recv().unwrap();
+        let syscalls = SyscallTable::new();
+        let activity = blocked(tid, &syscalls);
+        let one = 1_u64;
+        // SAFETY: adding `one` to our eventfd's counter, then closing it.
+        unsafe {
+            libc::write(efd, (&raw const one).cast(), 8);
+        }
+        reader.join().unwrap();
+        // SAFETY: closing our own descriptor.
+        unsafe { libc::close(efd) };
+
+        let Activity::Blocked {
+            block_state,
+            sys,
+            detail,
+        } = activity
+        else {
+            unreachable!()
+        };
+        assert_eq!(detail.magic, ANON_INODE_FS_MAGIC);
+        assert_eq!(&detail.path[..10], b"[eventfd]\0");
+        assert_eq!(detail.path_len, 10);
+        // A file the classifier cannot look up: the name alone classifies it.
+        let class = Classifier::new(SyscallTable::new(), None, Box::new(crate::testkit::NoFiles))
+            .classify(std::process::id(), &sys, &detail, block_state);
         assert_eq!(class.class, Class::Ipc);
     }
 }

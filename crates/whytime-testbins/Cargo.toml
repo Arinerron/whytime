@@ -46,5 +46,13 @@ path = "src/bin/wt-threads.rs"
 name = "wt-vfork"
 path = "src/bin/wt-vfork.rs"
 
+[[bin]]
+name = "wt-syscalls"
+path = "src/bin/wt-syscalls.rs"
+
+[[bin]]
+name = "wt-flock"
+path = "src/bin/wt-flock.rs"
+
 [lints]
 workspace = true

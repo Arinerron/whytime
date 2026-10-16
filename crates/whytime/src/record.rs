@@ -2,12 +2,13 @@
 //!
 //! A trace file holds every input the report is computed from, so replaying it through the
 //! same [`Trace`], attribution and report code prints the identical report offline, without
-//! BPF and without the traced processes: the raw ring buffer records in arrival order, the
-//! answer to every external lookup the pipeline made ([`FdTarget`], the classifier's
-//! `/proc/<pid>/fd/<fd>` resolution, keyed by `(dev, ino)` like its cache), the final sweep of
-//! the `tasks` map, and the run's context (command line, root pid, home directory for `~`,
-//! syscall probe availability, `AT_CLKTCK` for procctx, architecture for syscall numbers, how
-//! the window ended, dropped records). Attach mode (`-p`) adds what it read from `/proc`
+//! BPF and without the traced processes: the raw ring buffer records in arrival order (with
+//! the file paths the kernel captured), the answer to every external lookup the pipeline made
+//! ([`FdTarget`], the classifier's `/proc/<pid>/fd/<fd>` fallback for paths the kernel could
+//! not capture, keyed by `(dev, ino)` like its cache), the final sweep of the `tasks` map, and
+//! the run's context (command line, root pid, home directory for `~`, syscall probe
+//! availability, `AT_CLKTCK` for procctx, architecture for syscall numbers, how the window
+//! ended, dropped records). Attach mode (`-p`) adds what it read from `/proc`
 //! before the window: the [`ProcSeed`]s it fed [`Trace::seed`], the window start, and how
 //! many blocked threads had an unreadable syscall. procctx needs nothing else: whytime only
 //! calls its event handlers and `get_key`, which never read `/proc`.

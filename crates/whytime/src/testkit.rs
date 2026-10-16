@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use whytime_abi::{
     CpuSegment, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord, EvHeader, ExecRecord,
-    ExitRecord, ForkRecord, NR_NONE, SysInfo, TaskState,
+    ExitRecord, ForkRecord, NR_NONE, SYSD_DESCRIBED, SysInfo, TaskState,
 };
 use wire::Pod;
 
@@ -109,7 +109,9 @@ pub fn exec(ts: u64, tid: u32, tgid: u32, comm: &str, seg: CpuSegment) -> ExecRe
 }
 
 /// Thread `tid` of `tgid` ran `seg` until `block_ts`, blocked in `sys`, was woken at `wake_ts`
-/// (0 = unseen) and ran again at `run_ts`; `times` is `[block_ts, wake_ts, run_ts]`.
+/// (0 = unseen) and ran again at `run_ts`; `times` is `[block_ts, wake_ts, run_ts]`. Inside a
+/// syscall the detail is marked described (`sys` is this syscall's) without a captured path,
+/// so file subjects come from the trace's [`FdTarget`].
 pub fn episode(tid: u32, tgid: u32, seg: CpuSegment, sys: SysInfo, times: [u64; 3]) -> EpisodeRecord {
     let [block_ts, wake_ts, run_ts] = times;
     let mut r: EpisodeRecord = zeroed();
@@ -119,6 +121,9 @@ pub fn episode(tid: u32, tgid: u32, seg: CpuSegment, sys: SysInfo, times: [u64; 
     r.wake_ts = wake_ts;
     r.sys = sys;
     r.block_state = 1;
+    if sys.nr != NR_NONE {
+        r.detail.flags = SYSD_DESCRIBED;
+    }
     r
 }
 

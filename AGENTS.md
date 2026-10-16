@@ -62,7 +62,7 @@ crates/whytime/            the binary
   src/tracer.rs            aya loader: load, attach, maps, detach
   src/spawn.rs             fork, park-on-pipe, priv drop, exec with error pipe, pidfd
   src/timeline.rs          records → per-thread segments, procctx table, final sweep
-  src/classify.rs          (syscall, fd type, socket) → class + subject; FdTarget: /proc path lookup
+  src/classify.rs          (syscall, fd, kernel path) → class + subject; FdTarget: /proc path fallback
   src/sys.rs               syscall table (libc numbers) → kind + BPF sys_flags bits
   src/attribute.rs         critical-path walk (follows wakers) → spans that partition the window
   src/report.rs            whytime.report/1 JSON + human rendering
@@ -71,7 +71,7 @@ crates/whytime/            the binary
   src/doctor.rs            bpfdoctor Tool, probe.sched / probe.syscalls checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
 crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp,
-                           wt-attach, wt-threads, wt-vfork
+                           wt-attach, wt-threads, wt-vfork, wt-flock, wt-syscalls
 xtask/                     cargo xtask test-e2e
 ```
 
@@ -182,7 +182,7 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 | State | Entry | Fields set (all others zero, as in a fresh kernel entry) |
 |---|---|---|
 | `R` | `ST_RUNNING` | `seg.start`/`last_ts` = now, `sys` = none. A thread that was queued, not on a CPU, gets its first queue wait folded into the first mixed segment (split proportionally) |
-| `S` `D` `I` `P` ... | `ST_BLOCKED` | also `block_ts` = now, `block_state` (`S`→1, `D`→2, `I`→0x402, `P`→0x40), `sys` from `/proc/TID/syscall`: `nr`, and for `SYSF_FD0` syscalls `fd` = arg0 described like `describe_fd` (`stat` of `/proc/TGID/task/TID/fd/N` → `S_IFMT`, ino, dev re-encoded as `major << 20 \| minor`; `flags:` from `fdinfo`; sockets: family/peer from `/proc/TGID/net/{tcp,udp}{,6}` and `unix`, cached per network namespace). `running` there → `ST_RUNNING`; `-1` → no syscall; unreadable (no ptrace access) → `nr = NR_UNREADABLE` (-2, user space only) → `other` "blocked since attach, syscall unreadable", counted in a report note |
+| `S` `D` `I` `P` ... | `ST_BLOCKED` | also `block_ts` = now, `block_state` (`S`→1, `D`→2, `I`→0x402, `P`→0x40), `sys` from `/proc/TID/syscall`: `nr`, `detail.args` = its arguments 0–2, `detail.flags` = `SYSD_DESCRIBED`, and for `SYSF_FD0` syscalls `fd` = arg0 described like `describe_blocked` (`stat` of `/proc/TGID/task/TID/fd/N` → `S_IFMT`, ino, dev re-encoded as `major << 20 \| minor`; `flags:` from `fdinfo`; sockets: family/peer from `/proc/TGID/net/{tcp,udp}{,6}` and `unix`, cached per network namespace; `detail.magic` = `statfs` `f_type` of the link; anonymous inodes: `detail.path` = the name after `anon_inode:` in the link, no `SYSD_PATH_*` flag). No path is captured for files (no `SYSD_PATH_ROOTED`), so their subject comes from the classifier's `FdTarget` fallback when the record is processed; a descriptor `/proc` cannot stat stays undescribed (the kernel describes it if the syscall blocks again). `running` there → `ST_RUNNING`; `-1` → no syscall; unreadable (no ptrace access) → `nr = NR_UNREADABLE` (-2, user space only) → `other` "blocked since attach, syscall unreadable", counted in a report note |
 | `T` / `t` | `ST_BLOCKED` | `block_state` `TASK_STOPPED` / `TASK_TRACED`, `sys` = none (stops happen after `sys_exit`) → `other` "stopped" |
 | `Z` `X` | none | exited |
 
@@ -190,22 +190,36 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 
 | Program | Attach point | Prototype (`btf_trace_*`) | Does | Fallback |
 |---|---|---|---|---|
-| `on_switch` | `tp_btf/sched_switch` | `(void *, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)` | prev: add on-CPU time; `!preempt && prev_state != 0` → BLOCKED (record block ts + state), else RUNNABLE. next: RUNNABLE → add runqueue time; BLOCKED/WOKEN → emit EPISODE, open a new segment | required; needs ≥ 5.18 for `prev_state` (min_kernel) |
+| `on_switch` | `tp_btf/sched_switch` | `(void *, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)` | prev: add on-CPU time; `!preempt && prev_state != 0` → BLOCKED (record block ts + state) and, at the first block of a syscall, **describe** it (below), else RUNNABLE. next: RUNNABLE → add runqueue time; BLOCKED/WOKEN → emit EPISODE, open a new segment | required; needs ≥ 5.18 for `prev_state` (min_kernel) |
 | `on_waking` | `tp_btf/sched_waking` | `(void *, struct task_struct *p)` | BLOCKED → WOKEN, record wake ts and the waker (current) tid/tgid | required |
 | `on_fork` | `tp_btf/sched_process_fork` | `(void *, struct task_struct *parent, struct task_struct *child)` | parent tracked → add child tgid to `tracked` (in kernel: the child can never run untracked), create its task entry (RUNNABLE), emit FORK | required |
 | `on_exec` | `tp_btf/sched_process_exec` | `(void *, struct task_struct *p, pid_t old_pid, struct linux_binprm *)` | tracked tgid: create the root's task entry (window start) or flush the segment; migrate `old_pid`'s entry if a non-leader thread exec'd; emit EXEC with comm, argv (≤ 256 B from `mm->arg_start`), leader `start_boottime` | required |
 | `on_exit` | `tp_btf/sched_process_exit` | `(void *, struct task_struct *p, bool group_dead)` | close the segment, emit EXIT (exit_code, group_dead), delete the task entry; last thread → remove from `tracked` | `group_dead` is computed from `p->signal->live.counter == 0` instead of the argument, which older kernels lack |
-| `on_sys_enter` | `tp_btf/sys_enter` | `(void *, struct pt_regs *regs, long id)` | remember nr; per `sys_flags[nr]` describe arg0's fd (`task->files->fdt->fd[fd]` → `f_inode->i_mode & S_IFMT`, ino, `i_sb->s_dev`, `f_flags`; sockets: `private_data→sk→__sk_common` family, daddr/v6_daddr, dport) and for `connect` the user sockaddr | optional: if the pair fails, all blocked time is `other` and a note says so |
+| `on_sys_enter` | `tp_btf/sys_enter` | `(void *, struct pt_regs *regs, long id)` | remember nr and arguments 0–2 (`PT_REGS_PARMn_SYSCALL`: direct BTF loads, no helper calls), clear `detail.flags`; nothing else, it runs on every syscall | optional: if the pair fails, all blocked time is `other` and a note says so |
 | `on_sys_exit` | `tp_btf/sys_exit` | `(void *, struct pt_regs *regs, long ret)` | clear nr | attached before `sys_enter` so a half-attached pair is harmless |
+
+**Describe** (`describe_blocked`, once per syscall, guarded by `SYSD_DESCRIBED`): at
+`sched_switch` `current` is still `prev`, so its fd table and user memory are at hand. Per
+`sys_flags[nr]`: arg0's fd (`task->files->fdt->fd[fd]` → `describe_file`: `f_inode->i_mode &
+S_IFMT`, ino, `i_sb->s_dev`, `f_flags`; sockets: `private_data→sk→__sk_common` family,
+daddr/v6_daddr, dport), the filesystem (`i_sb->s_magic`), for regular files, directories,
+block devices and anonymous inodes the **path** (`capture_path`: `f_path.dentry→d_parent`
+names, crossing mounts through `container_of(vfsmount, struct mount, mnt)` →
+`mnt_mountpoint`/`mnt_parent`, until the mount whose parent is itself; ≤ 32 steps, names leaf
+first into 256 bytes, whole names only), and for `connect` the user sockaddr. Syscalls that
+never block cost only the `sys_enter`/`sys_exit` stores.
 
 Maps: `events` RINGBUF 4 MiB; `tasks` HASH tid → `task_state` (32768); `tracked` HASH tgid
 (16384); `sys_flags` ARRAY nr → `SYSF_*` (512, filled by user space from libc numbers, so the
 C code has no syscall numbers); `stats` PERCPU_ARRAY of loss counters (ring full, tasks
-full, tracked full) → `quality.dropped`.
+full, tracked full) → `quality.dropped`; `path_buf` PERCPU_ARRAY, one 512-byte buffer where
+`capture_path` assembles names (twice `PATH_BYTES` so variable-offset reads verify).
 
 CO-RE: `vmlinux_min.h` declares only the fields used, under
 `#pragma clang attribute push(preserve_access_index)`, with `__VMLINUX_H__` defined so
-`bpf_tracing.h` uses kernel `pt_regs` names. Field order there is irrelevant.
+`bpf_tracing.h` uses kernel `pt_regs` names. Field order there is irrelevant. `struct mount`
+is private to `fs/` but in vmlinux BTF; its `mnt` offset comes from
+`bpf_core_field_offset(struct mount, mnt)`.
 
 ## Wire records (`whytime-abi`)
 
@@ -218,10 +232,11 @@ boundary, so a thread's segments chain without gaps.
 |---|---|---|
 | `fork_record` (EV_FORK) | 40 | hdr (parent), child_tid, child_tgid, child_start (`start_boottime`) |
 | `exec_record` (EV_EXEC) | 344 | hdr, seg (up to exec), start (leader `start_boottime` = procctx key), ppid, old_tid, comm[16], argv_len, argv[256] |
-| `episode_record` (EV_EPISODE) | 128 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid, block_state (`prev_state`) |
+| `episode_record` (EV_EPISODE) | 424 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid, block_state (`prev_state`), sys_detail |
 | `exit_record` (EV_EXIT) | 64 | hdr, seg (up to exit), start, code (`task->exit_code`), group_dead |
-| `task_state` (map value) | 120 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid |
-| `sys_info` | 48 | nr (−1 = none), fd, mode (`S_IFMT` bits), f_flags, ino, dev (kernel `dev_t`), family, port (host order), addr[16] |
+| `task_state` (map value) | 416 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid, sys_detail |
+| `sys_info` | 48 | nr (−1 = none), fd, mode (`S_IFMT` bits), f_flags, ino, dev (kernel `dev_t`), family, port (host order), addr[16]; all but nr valid only with `SYSD_DESCRIBED` |
+| `sys_detail` | 296 | args[3] (raw, from `sys_enter`), magic (`s_magic`), flags (`SYSD_DESCRIBED`, `SYSD_PATH_ROOTED` = whole path, `SYSD_PATH_TRUNCATED` = tail only, neither = pseudo-fs name), path_len, path[256] (names leaf first, NUL-terminated: `lock\0app\0home\0` = `/home/app/lock`) |
 
 One EPISODE per block → wake → run cycle; on-CPU and preemption are accumulated in kernel,
 so a CPU-bound task emits nothing until it blocks or exits.
@@ -245,11 +260,17 @@ is "some span came from this process". The walk:
 - Blocked time goes to its class from the in-flight syscall and descriptor:
   `fsync` (fsync/fdatasync/sync_file_range/syncfs/msync and writes to `O_DSYNC`/`O_SYNC`
   files; subject = directory, `~`-abbreviated), `file` (other regular-file/blockdev I/O and
-  path syscalls), `net` (inet sockets; subject = peer `ip:port` from `connect`'s sockaddr or
-  the socket's `daddr:dport`; distinct socket inodes = "connections"), `ipc` (pipes, FIFOs,
-  unix sockets), `tty` (character devices), `futex`, `sleep` (nanosleep/clock_nanosleep),
-  `poll` (poll/select/epoll), `signal`, `other` (unknown syscall, page faults/no syscall,
-  stopped, or `untraced` gaps from lost records) — unless the block is **followed**:
+  path syscalls), `lock` (`flock`, `fcntl` with `F_SETLKW`/`F_OFD_SETLKW`; subject = the
+  file's directory), `aio` (`io_uring_enter`, `io_getevents`, `io_pgetevents`), `net` (inet
+  sockets; subject = peer `ip:port` from `connect`'s sockaddr or the socket's `daddr:dport`;
+  distinct socket inodes = "connections"), `ipc` (pipes, FIFOs, unix sockets, eventfds, SysV
+  semaphores/message queues, POSIX message queues), `tty` (character devices), `futex`,
+  `sleep` (nanosleep/clock_nanosleep, timerfd reads), `poll` (poll/select/epoll; inotify and
+  fanotify reads with subject `inotify`/`fanotify`), `signal` (incl. signalfd reads), `other`
+  (unknown syscall, page faults/no syscall, stopped, or `untraced` gaps from lost records).
+  Anonymous inodes are recognized by `s_magic == ANON_INODE_FS_MAGIC` and classified by the
+  file's dentry name (`[timerfd]`, `[eventfd]`, ...); other ones are `other`. All of this
+  holds unless the block is **followed**:
 - **Following**: a block explained by another tracked task is replaced by a walk of that
   task over the same interval, recursively with the same rules (its blocks keep their own
   class, so a lock held across a sleep is `sleep`, `sh -c 'sleep 1'` is `sleep`):
@@ -290,8 +311,15 @@ Honesty limits (state them when presenting results):
   visible as the resource COMMAND blocked on (`net`, `ipc`).
 - Network subjects are `ip:port`; DNS/hostname correlation is a later milestone (the report
   notes this whenever a `net` line exists).
-- `file`/`fsync` paths come from `/proc/<pid>/fd/<fd>` when the record is processed and are
-  checked against the kernel's dev:ino; otherwise the subject is `dev M:m ino N`.
+- `file`/`fsync`/`lock` paths are captured in kernel at the syscall's first block, so they
+  survive short-lived processes. They show the file as it was then (a later rename is not
+  seen; the first path seen per dev:ino is kept), relative to the root of the blocked task's
+  mount namespace: a process in a container shows the path inside the container, and a
+  chroot is not applied. Paths longer than 256 bytes or 32 dentries/mounts are truncated;
+  then `/proc/<pid>/fd/<fd>` (checked against the kernel's dev:ino) is tried when the record
+  is processed, then the captured tail (`…/a/b`), else the subject is `dev M:m ino N`.
+- A syscall is described at its first block only; one that blocks again on another
+  descriptor keeps the first description (none of the classified syscalls does).
 - A wake that races the switch-out (seen before the block is recorded) is not observed;
   that whole off-CPU gap counts as blocked (µs scale) with waker 0, so it is not followed
   (child waits fall back to the exit-time heuristic).
@@ -299,11 +327,13 @@ Honesty limits (state them when presenting results):
 - Attach mode does not see time before the attach. Each pre-existing thread's first
   interval is classified from `/proc` at attach (state letter, `/proc/TID/syscall`, fd
   description), sampled a few µs before its entry exists: a thread that changes state in
-  between has that first interval misread (µs-scale race). A thread running inside a
-  syscall at attach that then blocks in it shows that block as `other` (outside syscalls),
-  because its `sys_enter` predates the attach. Without ptrace access to the target
-  (`kernel.yama.ptrace_scope` ≥ 1 under file capabilities), `/proc/TID/syscall` is
-  unreadable and blocked threads' first interval is `other` (a note says so).
+  between has that first interval misread (µs-scale race). Its file subject has no kernel
+  path: it comes from `/proc/<pid>/fd/<fd>` when the record is processed (`dev M:m ino N` if
+  the descriptor is gone by then). A thread running inside a syscall at attach that then
+  blocks in it shows that block as `other` (outside syscalls), because its `sys_enter`
+  predates the attach. Without ptrace access to the target (`kernel.yama.ptrace_scope` ≥ 1
+  under file capabilities), `/proc/TID/syscall` is unreadable and blocked threads' first
+  interval is `other` (a note says so).
 - Attach-mode procctx keys are `/proc` start times (tick precision, see above), and a
   process forked by a not-yet-tracked member in the scan race, whose parent exits before
   the next scan, is not traced.
@@ -346,7 +376,9 @@ modes). Replay needs no BPF, no privileges and none of the traced processes. The
 - every ring buffer record verbatim, in arrival order (undecodable ones too: they count in
   `quality.events`);
 - every `FdTarget` answer (`/proc/<pid>/fd/<fd>` → path, keyed by `(dev, ino)` like the
-  classifier's cache), recorded by the `Logged` wrapper as lookups happen;
+  classifier's cache), recorded by the `Logged` wrapper as lookups happen. The classifier
+  asks only when the kernel's path walk did not reach the root (truncated walks, threads
+  seeded at attach); kernel paths travel inside the records;
 - the final `tasks` sweep, then the end frame: window start/end, ended by (exit, duration,
   interrupt), exit code, dropped count. A file without the end frame (whytime killed or
   failed, or the target exited during attach) is "truncated".
@@ -371,13 +403,16 @@ Rules that keep replay exact:
 
 `testkit.rs` (`#[cfg(test)]`) builds ring records from all-zero bytes and sets only named
 fields (`exec`, `fork`, `episode`, `exit`, `task`, `seg`, `sys`), so fields appended to the
-ABI keep a neutral 0 and tests survive layout growth; `testkit::trace(pid)` is a `Trace` with
-no `/proc` access. Timeline, attribution and attach-seeding tests feed records like the ring
-buffer would and assert on segments and lines; follow-the-waker tests in `attribute.rs` push
-`Proc`/`Thread`/`Seg`s into such a trace directly and check that the spans tile the window.
+ABI keep a neutral 0 and tests survive layout growth; an `episode` inside a syscall is
+`SYSD_DESCRIBED` without a captured path, so file subjects go through the trace's
+`FdTarget`. `testkit::trace(pid)` is a `Trace` with no `/proc` access. Timeline, attribution
+and attach-seeding tests feed records like the ring buffer would and assert on segments and
+lines; follow-the-waker tests in `attribute.rs` push `Proc`/`Thread`/`Seg`s into such a
+trace directly and check that the spans tile the window. `classify.rs` tests build
+`SysDetail`s (kernel paths rooted, truncated, anonymous inodes) with an in-memory `FdTarget`.
 `record.rs` tests round-trip a recorded run (wrap and attach) to the identical JSON report and
 reject damaged files. `snapshot.rs` tests read this process's own `/proc` (threads blocked on
-a socket and a pipe).
+a socket, a pipe and an eventfd).
 
 ## Privileges
 
@@ -389,7 +424,8 @@ Required: `CAP_BPF` + `CAP_PERFMON` (verified sufficient), or root. Two ways:
   caps are ignored on `nosuid` mounts (`/tmp` here): install to an ext4 path. Exec drops
   the caps for COMMAND (non-root exec without ambient caps).
 
-Optional: `CAP_SYS_PTRACE` to resolve file paths of descendants running as another user,
+Optional: `CAP_SYS_PTRACE` to resolve, through `/proc/<pid>/fd`, file paths the kernel's
+walk could not capture (see the `file` limit above) of descendants running as another user,
 and, in attach mode without root, to read `/proc/TID/syscall` of the target's threads
 under Yama `ptrace_scope` ≥ 1 (else their first interval is `other`) and to attach to
 processes of other users. Without root or it, attach mode only accepts the invoking
@@ -412,15 +448,33 @@ and after a load failure re-run `ids_for_errno(errno)` and print the non-passing
 
 ## Performance budget
 
-Targets, to be measured (not yet benchmarked):
+Measured (7.2.6, x86-64, other agents' load around 10 on 22 cores; CPU and wall agree):
+`dd if=/dev/zero of=/dev/null bs=1 count=3000000` (6 M syscalls), best of 3, interleaved:
+
+| Run | Wall | Extra per syscall |
+|---|---|---|
+| untraced | 1.42 s | — |
+| traced, describing at every `sys_enter` (before lazy description) | 2.84 s | ~238 ns |
+| traced, lazy description at block time (now) | 1.99 s | ~95 ns |
+| traced, `sys_enter`/`sys_exit` programs that only `return 0` (floor) | 1.70 s | ~46 ns |
+
+So the syscall programs themselves now cost ~50 ns per syscall (two hash lookups, three
+argument loads, a few stores); the rest is the `raw_syscalls` tracepoint machinery, which
+puts every task on the system on the syscall slow path while whytime runs. The `overhead`
+e2e scenario guards this (`wt-syscalls`: 1.4–1.8× on-CPU time traced vs untraced, limit
+2.5). Measure with `bpftool prog show` after `sysctl kernel.bpf_stats_enabled=1` only for
+per-program cost; the programs fire for every task, so averages mix tracked and untracked.
+
+Targets (not benchmarked unless noted):
 
 - `sched_switch` with untracked prev and next: two hash lookups (skipped for the idle task),
-  no clock read, ≤ ~150 ns.
-- `sys_enter`/`sys_exit` for untracked tasks: one hash lookup, ≤ ~100 ns. Tracked tasks
-  additionally do an array lookup and, for fd syscalls, ~6–10 probe reads.
+  no clock read, ≤ ~150 ns. A tracked thread's first block in a described syscall adds
+  ~10 probe reads plus up to 32 dentry/mount steps for the path.
+- `sys_enter`/`sys_exit` for untracked tasks: one hash lookup, ≤ ~100 ns.
 - `sched_waking`, fork/exec/exit: one lookup for untracked tasks.
-- Ring traffic: one 128-byte record per block cycle of a tracked thread; CPU-bound threads
-  emit nothing (on-CPU accumulates in kernel).
+- Ring traffic: one 424-byte record per block cycle of a tracked thread; CPU-bound threads
+  emit nothing (on-CPU accumulates in kernel). Measured: a pipe ping-pong (~200 k episodes
+  in 1.8 s) loses none with the 4 MiB ring.
 
 ## e2e suite
 
@@ -448,7 +502,16 @@ Targets, to be measured (not yet benchmarked):
     waits, most of which time out) → `cpu` subject `wt-threads` ≥ 0.8 (retried waits)
 12. `vfork`: `wt-vfork 600` (`clone(CLONE_VM|CLONE_VFORK)` child spins 600 ms, then execs
     `wt-sleep 0`) → `child` subject `wt-vfork` ≥ 0.8
-13. `record-replay`: `--json --record F -- wt-child 300`, then unprivileged
+13. `flock-path`: `wt-flock DIR 600` (fresh DIR in the scratch dir): a holder child keeps a
+    `flock` for 600 ms; a waiter child blocks on it; once `/proc/<waiter>/syscall` shows it
+    asleep in `flock`, the parent renames DIR, then waits for the waiter, which exits right
+    after getting the lock → `lock` subject = DIR (`~`-abbreviated, the pre-rename name, so
+    only the in-kernel path passes) ≥ 0.6, and no `dev M:m ino N` subject
+14. `overhead`: `wt-syscalls 2000000` (one-byte `/dev/zero` reads), 5 traced runs (on-CPU
+    time from the report's `processes[].cpu_ns`) interleaved with 5 untraced ones (rusage);
+    least traced / least untraced ≤ 2.5 (measured 1.4–1.8 under parallel load; CPU time,
+    unlike wall time, ignores waits for a CPU on a loaded machine)
+15. `record-replay`: `--json --record F -- wt-child 300`, then unprivileged
     `whytime report F --json` → JSON identical to the live report (every field), human
     replay exits 0, F belongs to the invoking user; F cut in half → exit 2, "truncated"
 
@@ -457,21 +520,21 @@ wait 0.3 s, `sudo -n whytime --json -p $!` with the scenario's flags, then print
 alive` if the target still runs (it must, unless it exited by itself), stop it, and exit
 with whytime's status (must be 0):
 
-14. `attach-blocked`: `wt-sleep 30000`, `--duration 1s` → `ended_by` duration, `sleep` ≥
+16. `attach-blocked`: `wt-sleep 30000`, `--duration 1s` → `ended_by` duration, `sleep` ≥
     0.9 (classified from `/proc` at attach), wall 1.0 s ± 10%, target alive
-15. `attach-running`: `wt-burn 30000`, `--duration 1s` → `cpu` ≥ 0.9, target alive
-16. `attach-threads`: `wt-futex 30000` (two threads), `--duration 1s` → `futex` ≥ 0.9 (the
+17. `attach-running`: `wt-burn 30000`, `--duration 1s` → `cpu` ≥ 0.9, target alive
+18. `attach-threads`: `wt-futex 30000` (two threads), `--duration 1s` → `futex` ≥ 0.9 (the
     holder never releases in the window, so there is no waker to follow)
-17. `attach-exit`: `sh -c '"$0" 1200; exit 3' wt-sleep` (pre-existing child) → `ended_by`
+19. `attach-exit`: `sh -c '"$0" 1200; exit 3' wt-sleep` (pre-existing child) → `ended_by`
     exit, `exit_code` 3, `wt-sleep` in `processes[]` with ppid = target, `sleep` ≥ 0.9
-18. `attach-spawn`: `wt-attach 1500 800` (sleeps, then forks `wt-burn 800` after the
+20. `attach-spawn`: `wt-attach 1500 800` (sleeps, then forks `wt-burn 800` after the
     attach) → `ended_by` exit, `wt-burn` in `processes[]`, `child` subject `wt-burn` ≥ 0.3
-19. `attach-interrupt`: `wt-sleep 30000`, `sudo -n pkill -INT -P <sudo pid>` after 1 s
+21. `attach-interrupt`: `wt-sleep 30000`, `sudo -n pkill -INT -P <sudo pid>` after 1 s
     (whytime inherits SIGINT ignored from the background job) → `ended_by` interrupt,
     `sleep` ≥ 0.9, target alive
-20. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
+22. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
     process"
-21. `attach-record`: `sh -c 'while :; do "$0" "$1" 20; done' wt-fsync DIR` (seeds, then
+23. `attach-record`: `sh -c 'while :; do "$0" "$1" 20; done' wt-fsync DIR` (seeds, then
     fork/exec/exit, fsync records and file lookups in the window), `--duration 1s --record
     F` → `ended_by` duration, target alive, `quality.events` > 0, then the `record-replay`
     checks: unprivileged `whytime report F --json` identical to the live report, human
@@ -510,3 +573,16 @@ with whytime's status (must be 0):
   SIGINT into a signalfd, and blocked signals are queued even when ignored, so it still
   sees Ctrl-C/`kill -INT`; never switch that to a handler-based approach without resetting
   the disposition.
+- Anonymous inodes (eventfd, timerfd, signalfd, inotify, epoll, ...) carry no usable file
+  type in `i_mode` (`i_mode & S_IFMT` is 0 on 7.2); recognize them by `i_sb->s_magic`
+  (`ANON_INODE_FS_MAGIC`), whatever the mode. They all share one inode, so never key anything
+  about them by dev:ino; their identity is the dentry name.
+- A helper writing at a variable offset into a buffer (`bpf_probe_read_kernel_str(buf + off,
+  PATH_BYTES - off, ...)`) only verifies if `off_max + size_max` fits: the verifier does not
+  relate the two registers. Mask `off` below `PATH_BYTES` and give the buffer `2 *
+  PATH_BYTES` (the per-CPU `path_buf` map), then copy the used part out.
+- At `sched_switch`, `current` is `prev` (the switch has not happened), so the blocking task's
+  fd table and user memory can be read there with `bpf_get_current_task_btf()` and
+  `bpf_probe_read_user`.
+- `task_state` is 416 bytes: `on_fork`/`on_exec` building one on the 512-byte BPF stack is
+  close to the limit; anything appended must move those to a map-backed template.

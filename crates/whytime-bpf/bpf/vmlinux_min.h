@@ -69,6 +69,32 @@ struct pt_regs {
 
 struct super_block {
 	dev_t s_dev;
+	unsigned long s_magic;
+};
+
+struct qstr {
+	const unsigned char *name;
+};
+
+struct dentry {
+	struct dentry *d_parent;
+	struct qstr d_name;
+};
+
+struct vfsmount {
+	struct dentry *mnt_root;
+};
+
+/* fs/mount.h: wraps every vfsmount; reached with container_of on `mnt`. */
+struct mount {
+	struct mount *mnt_parent;
+	struct dentry *mnt_mountpoint;
+	struct vfsmount mnt;
+};
+
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
 };
 
 struct inode {
@@ -81,6 +107,7 @@ struct file {
 	struct inode *f_inode;
 	unsigned int f_flags;
 	void *private_data;
+	struct path f_path;
 };
 
 struct fdtable {

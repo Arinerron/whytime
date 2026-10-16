@@ -21,6 +21,13 @@ const SERVER_DELAY: Duration = Duration::from_millis(300);
 const ATTACH_DELAY: &str = "0.3";
 /// A pid above any `pid_max`, so no process has it.
 const NO_PID: &str = "4194304";
+/// One-byte reads `wt-syscalls` does in the overhead scenario.
+const OVERHEAD_READS: &str = "2000000";
+/// Runs of each side (traced, untraced) in the overhead scenario; the fastest counts.
+const OVERHEAD_RUNS: usize = 5;
+/// Highest accepted traced/untraced on-CPU time ratio of `wt-syscalls`: measured 1.4–1.8
+/// under parallel load (describing every syscall at `sys_enter`, as before, measured 2.2).
+const MAX_OVERHEAD: f64 = 2.5;
 
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -55,16 +62,22 @@ fn test_e2e() -> anyhow::Result<()> {
     let server = slow_server()?;
     let whytime = &bins["whytime"];
     let bin = |name: &str| bins[name].display().to_string();
-    let sudo = |args: &[&str]| {
-        let mut cmd = Command::new("sudo");
-        cmd.arg("-n").arg(whytime).args(["--json", "--"]).args(args);
-        cmd
-    };
+    let sudo = |args: &[&str]| traced(whytime, args);
 
     let fsync_dir = work.display().to_string();
     let server_arg = server.to_string();
     let trace_file = work.join("replay.wt");
     let attach_trace = work.join("attach.wt");
+    // A fresh directory per run; wt-flock creates it and removes it (renamed) on success.
+    let lock_dir = work.join(format!("flock-{}", std::process::id()));
+    let mut lock_moved = lock_dir.clone().into_os_string();
+    lock_moved.push(".moved");
+    let _ = std::fs::remove_dir_all(&lock_dir);
+    let _ = std::fs::remove_dir_all(&lock_moved);
+    let lock_subject = home_relative(&lock_dir);
+    let lock_arg = lock_dir.display().to_string();
+    let overhead_whytime = whytime.clone();
+    let syscalls = bin("wt-syscalls");
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -129,6 +142,16 @@ fn test_e2e() -> anyhow::Result<()> {
             "vfork",
             sudo(&[&bin("wt-vfork"), "600"]),
             Box::new(check_vfork),
+        ),
+        (
+            "flock-path",
+            sudo(&[&bin("wt-flock"), &lock_arg, "600"]),
+            Box::new(move |out: &Output| check_flock(out, &lock_subject)),
+        ),
+        (
+            "overhead",
+            sudo(&[&syscalls, OVERHEAD_READS]),
+            Box::new(move |out: &Output| check_overhead(out, &overhead_whytime, &syscalls)),
         ),
         (
             "record-replay",
@@ -273,6 +296,8 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         "wt-attach",
         "wt-threads",
         "wt-vfork",
+        "wt-syscalls",
+        "wt-flock",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -284,6 +309,22 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
 
 fn run(cmd: &mut Command) -> anyhow::Result<Output> {
     cmd.output().with_context(|| format!("running {cmd:?}"))
+}
+
+/// `sudo -n whytime --json -- ARGS`.
+fn traced(whytime: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("-n").arg(whytime).args(["--json", "--"]).args(args);
+    cmd
+}
+
+/// `path` as whytime prints it for the invoking user: a leading `$HOME` becomes `~`.
+fn home_relative(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// A TCP server outside the traced tree: accepts, waits [`SERVER_DELAY`], replies, closes.
@@ -741,4 +782,82 @@ fn check_attach_record(
     let events = live["quality"]["events"].as_u64().unwrap_or(0);
     ensure!(events > 0, "no records in the window: nothing to replay but the seeds");
     check_replay(out, whytime, trace, work).map(|summary| format!("attached: {summary}"))
+}
+
+fn check_flock(out: &Output, dir: &str) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let unresolved: Vec<&str> = lines(&report)
+        .into_iter()
+        .filter_map(|l| l["subject"].as_str())
+        .filter(|s| s.starts_with("dev "))
+        .collect();
+    ensure!(unresolved.is_empty(), "unresolved file subjects {unresolved:?}");
+    let lock = class_share(&report, "lock", |s| s == dir);
+    ensure!(lock >= 0.6, "lock share on {dir} {lock:.3} < 0.6");
+    Ok(format!(
+        "wall {:.3}s, file lock wait on {dir} {:.1}%",
+        wall_secs(&report),
+        lock * 100.0
+    ))
+}
+
+/// Compares the least on-CPU time of `wt-syscalls` over [`OVERHEAD_RUNS`] traced runs
+/// (`processes[].cpu_ns` in the report; `out` is the first) with the least over as many
+/// untraced ones (rusage), interleaved. CPU time, unlike wall time, ignores waits for a CPU on
+/// a loaded machine; whytime's in-kernel work runs in the traced task's context and counts.
+fn check_overhead(out: &Output, whytime: &Path, syscalls: &str) -> anyhow::Result<String> {
+    let cpu_secs = |out: &Output| -> anyhow::Result<f64> {
+        exited(out, 0)?;
+        let report = report(out)?;
+        let ns = report["processes"]
+            .as_array()
+            .and_then(|procs| procs.iter().find(|p| p["comm"] == "wt-syscalls"))
+            .and_then(|p| p["cpu_ns"].as_u64())
+            .context("no wt-syscalls process in the report")?;
+        Ok(Duration::from_nanos(ns).as_secs_f64())
+    };
+    let mut traced_secs = cpu_secs(out)?;
+    let mut untraced_secs = f64::INFINITY;
+    for round in 0..OVERHEAD_RUNS {
+        let before = children_cpu();
+        let status = Command::new(syscalls)
+            .arg(OVERHEAD_READS)
+            .stdin(Stdio::null())
+            .status()
+            .with_context(|| format!("running {syscalls}"))?;
+        ensure!(status.success(), "untraced {syscalls} failed: {status}");
+        untraced_secs = untraced_secs.min((children_cpu() - before).as_secs_f64());
+        if round + 1 < OVERHEAD_RUNS {
+            let again = run(traced(whytime, &[syscalls, OVERHEAD_READS]).stdin(Stdio::null()))?;
+            traced_secs = traced_secs.min(cpu_secs(&again)?);
+        }
+    }
+    let ratio = traced_secs / untraced_secs;
+    ensure!(
+        ratio <= MAX_OVERHEAD,
+        "traced/untraced CPU {ratio:.2} > {MAX_OVERHEAD} (traced {traced_secs:.3}s, untraced \
+         {untraced_secs:.3}s)"
+    );
+    Ok(format!(
+        "{OVERHEAD_READS} reads: CPU untraced {untraced_secs:.3}s, traced {traced_secs:.3}s, \
+         ratio {ratio:.2} (max {MAX_OVERHEAD})"
+    ))
+}
+
+/// User + system CPU time of this process's reaped children so far.
+fn children_cpu() -> Duration {
+    // SAFETY: `rusage` is plain data; getrusage fills it and cannot fail for RUSAGE_CHILDREN.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_CHILDREN, &raw mut usage);
+        usage
+    };
+    let time = |t: libc::timeval| {
+        Duration::new(
+            u64::try_from(t.tv_sec).unwrap_or(0),
+            u32::try_from(t.tv_usec).unwrap_or(0) * 1000,
+        )
+    };
+    time(usage.ru_utime) + time(usage.ru_stime)
 }
