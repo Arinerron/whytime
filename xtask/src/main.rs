@@ -118,6 +118,12 @@ fn test_e2e() -> anyhow::Result<()> {
     ensure!(made.status.success(), "mkfifo {} failed", fifo.display());
     let watched = work.join("waker.watched");
     std::fs::write(&watched, b"").with_context(|| format!("creating {}", watched.display()))?;
+    // Flamegraph files, fresh per run so a stale one cannot pass.
+    let flame = work.join("flame");
+    let _ = std::fs::remove_dir_all(&flame);
+    std::fs::create_dir_all(&flame).with_context(|| format!("creating {}", flame.display()))?;
+    let in_flame = |name: &str| flame.join(name);
+    let path = |name: &str| in_flame(name).display().to_string();
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -300,6 +306,56 @@ fn test_e2e() -> anyhow::Result<()> {
                 move |out: &Output| check_attach_record(out, &whytime, &trace, &work)
             }),
         ),
+        (
+            "flamegraph",
+            traced_with(
+                whytime,
+                &["--folded", &path("burn.folded"), "--flamegraph", &path("burn.svg")],
+                &[&bin("wt-flame"), "600", "400"],
+            ),
+            Box::new({
+                let (folded, svg) = (in_flame("burn.folded"), in_flame("burn.svg"));
+                let work = work.clone();
+                move |out: &Output| check_flamegraph(out, &folded, &svg, &work)
+            }),
+        ),
+        (
+            "flame-kernel",
+            traced_with(
+                whytime,
+                &["--folded", &path("fsync.folded")],
+                &[&bin("wt-fsync"), &fsync_dir, "50"],
+            ),
+            Box::new({
+                let folded = in_flame("fsync.folded");
+                move |out: &Output| check_flame_kernel(out, &folded)
+            }),
+        ),
+        (
+            "flame-replay",
+            traced_with(
+                whytime,
+                &["--record", &path("flame.wt"), "--folded", &path("live.folded")],
+                &[&bin("wt-flame"), "300", "200"],
+            ),
+            Box::new({
+                let (whytime, dir, plain) = (whytime.clone(), flame.clone(), trace_file.clone());
+                move |out: &Output| check_flame_replay(out, &whytime, &dir, &plain)
+            }),
+        ),
+        (
+            "attach-flame",
+            attach_cmd(
+                whytime,
+                &[&bin("wt-flame"), "30000", "0"],
+                &["--duration", "1s", "--folded", &path("attach.folded")],
+                None,
+            ),
+            Box::new({
+                let folded = in_flame("attach.folded");
+                move |out: &Output| check_attach_flame(out, &folded)
+            }),
+        ),
     ];
 
     let mut failed = 0;
@@ -323,37 +379,22 @@ fn test_e2e() -> anyhow::Result<()> {
 
 type Check = Box<dyn Fn(&Output) -> anyhow::Result<String>>;
 
-/// Builds the release binaries; returns executable name → path.
+/// Builds the release `whytime` and the testbins; returns executable name → path. The
+/// testbins get frame pointers and keep their symbols (profile `e2e`), so flamegraph checks
+/// can unwind and name their functions; RUSTFLAGS apply to the whole build, so they build in
+/// a target directory of their own, leaving `whytime` as shipped.
 fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .context("workspace root")?;
-    let out = Command::new(cargo)
-        .current_dir(root)
-        .args([
-            "build",
-            "--release",
-            "--package",
-            "whytime",
-            "--package",
-            "whytime-testbins",
-            "--message-format=json-render-diagnostics",
-        ])
-        .stderr(Stdio::inherit())
-        .output()
-        .context("running cargo build")?;
-    ensure!(out.status.success(), "cargo build failed");
-    let mut bins = HashMap::new();
-    for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-        let msg: Value = serde_json::from_slice(line)?;
-        if msg["reason"] == "compiler-artifact"
-            && let Some(exe) = msg["executable"].as_str()
-            && let Some(name) = msg["target"]["name"].as_str()
-        {
-            bins.insert(name.to_owned(), PathBuf::from(exe));
-        }
-    }
+    let mut bins = cargo_build(root, &["--release", "--package", "whytime"], None)?;
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root.join("target"), PathBuf::from)
+        .join("e2e-testbins");
+    let mut testbins = vec!["--profile", "e2e", "--package", "whytime-testbins", "--target-dir"];
+    let target = target.to_str().context("target directory is not UTF-8")?;
+    testbins.push(target);
+    bins.extend(cargo_build(root, &testbins, Some("-C force-frame-pointers=yes"))?);
     for name in [
         "whytime",
         "wt-sleep",
@@ -370,11 +411,44 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         "wt-poll",
         "wt-fault",
         "wt-fifo",
+        "wt-flame",
     ] {
         ensure!(
             bins.contains_key(name),
             "cargo did not report the {name} binary"
         );
+    }
+    Ok(bins)
+}
+
+/// `cargo build ARGS` in `root` (with `rustflags` as RUSTFLAGS); returns the executables
+/// cargo reports.
+fn cargo_build(
+    root: &Path,
+    args: &[&str],
+    rustflags: Option<&str>,
+) -> anyhow::Result<HashMap<String, PathBuf>> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    cmd.current_dir(root)
+        .arg("build")
+        .args(args)
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(Stdio::inherit());
+    if let Some(flags) = rustflags {
+        cmd.env("RUSTFLAGS", flags).env_remove("CARGO_ENCODED_RUSTFLAGS");
+    }
+    let out = cmd.output().context("running cargo build")?;
+    ensure!(out.status.success(), "cargo build failed");
+    let mut bins = HashMap::new();
+    for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let msg: Value = serde_json::from_slice(line)?;
+        if msg["reason"] == "compiler-artifact"
+            && let Some(exe) = msg["executable"].as_str()
+            && let Some(name) = msg["target"]["name"].as_str()
+        {
+            bins.insert(name.to_owned(), PathBuf::from(exe));
+        }
     }
     Ok(bins)
 }
@@ -385,8 +459,18 @@ fn run(cmd: &mut Command) -> anyhow::Result<Output> {
 
 /// `sudo -n whytime --json -- ARGS`.
 fn traced(whytime: &Path, args: &[&str]) -> Command {
+    traced_with(whytime, &[], args)
+}
+
+/// `sudo -n whytime --json FLAGS -- ARGS`.
+fn traced_with(whytime: &Path, flags: &[&str], args: &[&str]) -> Command {
     let mut cmd = Command::new("sudo");
-    cmd.arg("-n").arg(whytime).args(["--json", "--"]).args(args);
+    cmd.arg("-n")
+        .arg(whytime)
+        .arg("--json")
+        .args(flags)
+        .arg("--")
+        .args(args);
     cmd
 }
 
@@ -976,5 +1060,161 @@ fn check_waker(out: &Output) -> anyhow::Result<String> {
         wall_secs(&report),
         poll * 100.0,
         ipc * 100.0
+    ))
+}
+
+/// The stacks of a folded file: frames and microseconds per line.
+fn folded(path: &Path) -> anyhow::Result<Vec<(Vec<String>, u64)>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    text.lines()
+        .map(|line| {
+            let (stack, count) = line.rsplit_once(' ').context("a folded line without count")?;
+            let count = count.parse().context("a folded count")?;
+            Ok((stack.split(';').map(str::to_owned).collect(), count))
+        })
+        .collect()
+}
+
+/// Microseconds of the stacks with a frame satisfying `frame`.
+fn stacks_us(stacks: &[(Vec<String>, u64)], frame: impl Fn(&str) -> bool) -> u64 {
+    stacks
+        .iter()
+        .filter(|(frames, _)| frames.iter().any(|f| frame(f)))
+        .map(|(_, us)| us)
+        .sum()
+}
+
+/// `--folded`/`--flamegraph` on `wt-flame 600 400`: the folded stacks add up to the wall
+/// time, the ones through `burn_cpu_here` and `sleep_here` to the report's `cpu` and `sleep`
+/// lines (within 5% of wall); the SVG names them; both files belong to the invoking user.
+#[allow(clippy::cast_precision_loss)]
+fn check_flamegraph(out: &Output, folded_path: &Path, svg: &Path, work: &Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    exited(out, 0)?;
+    let report = report(out)?;
+    let wall_us = report["wall_ns"].as_u64().unwrap_or(0) as f64 / 1e3;
+    let stacks = folded(folded_path)?;
+    let total = stacks_us(&stacks, |_| true) as f64;
+    ensure!(
+        (total - wall_us).abs() <= wall_us * 0.01,
+        "the folded stacks sum to {total:.0} µs, the wall time is {wall_us:.0} µs"
+    );
+    let mut summary = Vec::new();
+    for (function, class) in [("burn_cpu_here", "cpu"), ("sleep_here", "sleep")] {
+        let us = stacks_us(&stacks, |f| f.ends_with(function)) as f64;
+        let line = class_share(&report, class, |_| true) * wall_us;
+        ensure!(
+            (us - line).abs() <= wall_us * 0.05,
+            "stacks through {function}: {us:.0} µs, but the {class} line is {line:.0} µs"
+        );
+        summary.push(format!(
+            "{function} {:.1}% ({class} line {:.1}%)",
+            us / wall_us * 100.0,
+            line / wall_us * 100.0
+        ));
+    }
+    let drawn = std::fs::read_to_string(svg).with_context(|| format!("reading {}", svg.display()))?;
+    ensure!(
+        drawn.starts_with("<?xml") && drawn.contains("burn_cpu_here"),
+        "{} is not an SVG flamegraph with burn_cpu_here",
+        svg.display()
+    );
+    let owner = std::fs::metadata(work)?.uid();
+    for file in [folded_path, svg] {
+        ensure!(
+            std::fs::metadata(file)?.uid() == owner,
+            "{} does not belong to the invoking user",
+            file.display()
+        );
+    }
+    Ok(format!(
+        "wall {:.3}s, folded total {:.1}%: {}",
+        wall_us / 1e6,
+        total / wall_us * 100.0,
+        summary.join(", ")
+    ))
+}
+
+/// `--folded` on `wt-fsync`: some stack has a kernel frame (`_[k]`) naming fsync, unless the
+/// kernel hides its addresses even from root (then skipped, saying so).
+fn check_flame_kernel(out: &Output, folded_path: &Path) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    report(out)?;
+    let head = run(Command::new("sudo").args(["-n", "head", "-n1", "/proc/kallsyms"]))?;
+    let address = String::from_utf8_lossy(&head.stdout)
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|address| u64::from_str_radix(address, 16).ok());
+    if address.is_none_or(|address| address == 0) {
+        return Ok("skipped: /proc/kallsyms hides kernel addresses even from root".to_owned());
+    }
+    let stacks = folded(folded_path)?;
+    let kernel_fsync = |f: &str| f.ends_with("_[k]") && f.contains("fsync");
+    let us = stacks_us(&stacks, kernel_fsync);
+    ensure!(us > 0, "no stack has a kernel frame naming fsync");
+    let frames: Vec<&str> = stacks
+        .iter()
+        .flat_map(|(frames, _)| frames.iter().map(String::as_str))
+        .filter(|f| kernel_fsync(f))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(format!("{us} µs under kernel frames {}", frames.join(", ")))
+}
+
+/// `--record F --folded A`, then unprivileged `whytime report F --folded B --flamegraph S`:
+/// B is A byte for byte, S is drawn; a trace recorded without stacks (`plain`) exits 2.
+fn check_flame_replay(out: &Output, whytime: &Path, dir: &Path, plain: &Path) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    report(out)?;
+    let live = std::fs::read(dir.join("live.folded")).context("reading the live folded stacks")?;
+    ensure!(!live.is_empty(), "the live folded stacks are empty");
+    let replay = run(Command::new(whytime)
+        .arg("report")
+        .arg(dir.join("flame.wt"))
+        .arg("--folded")
+        .arg(dir.join("replay.folded"))
+        .arg("--flamegraph")
+        .arg(dir.join("replay.svg")))?;
+    exited(&replay, 0)?;
+    let replayed =
+        std::fs::read(dir.join("replay.folded")).context("reading the replayed folded stacks")?;
+    ensure!(replayed == live, "the replayed folded stacks differ from the live ones");
+    let drawn = std::fs::read_to_string(dir.join("replay.svg"))?;
+    ensure!(drawn.contains("burn_cpu_here"), "the replayed SVG lacks burn_cpu_here");
+    let without = run(Command::new(whytime)
+        .arg("report")
+        .arg(plain)
+        .arg("--folded")
+        .arg(dir.join("none.folded")))?;
+    exited(&without, 2)?;
+    ensure!(
+        String::from_utf8_lossy(&without.stderr).contains("recorded without stack capture"),
+        "replaying a trace without stacks into --folded does not say why it fails"
+    );
+    Ok(format!(
+        "{} folded lines replayed byte for byte; a trace without stacks exits 2",
+        live.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count()
+    ))
+}
+
+/// `-p PID --folded` on a spinning `wt-flame`: the stacks are mostly `burn_cpu_here`.
+#[allow(clippy::cast_precision_loss)]
+fn check_attach_flame(out: &Output, folded_path: &Path) -> anyhow::Result<String> {
+    attached(out, "duration")?;
+    ensure!(target_alive(out), "the target did not survive whytime");
+    let stacks = folded(folded_path)?;
+    let total = stacks_us(&stacks, |_| true) as f64;
+    let burn = stacks_us(&stacks, |f| f.ends_with("burn_cpu_here")) as f64;
+    ensure!(
+        burn >= total * 0.8,
+        "burn_cpu_here stacks {burn:.0} µs of {total:.0} µs (< 80%)"
+    );
+    Ok(format!(
+        "running at attach: burn_cpu_here {:.1}% of {:.3}s of stacks",
+        burn / total * 100.0,
+        total / 1e6
     ))
 }

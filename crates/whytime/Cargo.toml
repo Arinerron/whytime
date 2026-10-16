@@ -20,6 +20,10 @@ libc.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+object.workspace = true
+rustc-demangle.workspace = true
+cpp_demangle.workspace = true
+inferno.workspace = true
 
 [lints]
 workspace = true

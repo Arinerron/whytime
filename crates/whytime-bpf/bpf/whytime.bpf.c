@@ -15,6 +15,11 @@
  * Optional fentry programs refine that: pollwake/ep_poll_callback record which file ended a
  * poll/select/epoll wait, and handle_mm_fault entry/exit mark blocks inside page faults.
  *
+ * Stack capture (flamegraphs) is off unless user space sets `stacks_enabled` at load: then
+ * sched_switch also records the user and kernel stack of every voluntary switch-out of a
+ * tracked thread, and a perf_event CPU-clock sampler emits SAMPLE records with the stacks
+ * of tracked threads it finds on a CPU. Off, the verifier drops that code.
+ *
  * Untracked tasks cost one hash lookup per handler (two in sched_switch).
  */
 #include "vmlinux_min.h"
@@ -100,6 +105,18 @@ struct {
 	__type(value, struct task_state);
 } task_zero SEC(".maps");
 
+/* Stack id -> STACK_DEPTH addresses, leaf first. User space sizes it to STACKS_MAX entries
+ * when stack capture is on and to one entry otherwise. */
+struct {
+	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
+	__uint(max_entries, STACKS_MAX);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, STACK_DEPTH * sizeof(u64));
+} stacks SEC(".maps");
+
+/* 1 when stack capture is on (set by user space at load); 0 lets the verifier drop it. */
+const volatile u32 stacks_enabled = 0;
+
 static __always_inline void stat_inc(u32 slot)
 {
 	u64 *v = bpf_map_lookup_elem(&stats, &slot);
@@ -115,6 +132,25 @@ static __always_inline void *reserve(u64 size)
 	if (!e)
 		stat_inc(STAT_RING_FULL);
 	return e;
+}
+
+/* bpf_get_stackid errors that lose a stack (-EFAULT, an empty stack, is not a loss). */
+#define EEXIST 17
+#define ENOMEM 12
+
+/* The current task's user (`flags` BPF_F_USER_STACK) or kernel stack as a task_state stack
+ * field: id + 1, or the negative errno (collisions and a full map are counted). */
+static __always_inline s32 stack_ref(void *ctx, u64 flags)
+{
+	long id = bpf_get_stackid(ctx, &stacks, flags);
+
+	if (id >= 0)
+		return id + 1;
+	if (id == -EEXIST)
+		stat_inc(STAT_STACK_COLLISION);
+	else if (id == -ENOMEM)
+		stat_inc(STAT_STACK_FULL);
+	return id;
 }
 
 static __always_inline void fill_hdr(struct ev_header *h, u32 kind, u32 tid, u32 tgid, u64 ts)
@@ -403,6 +439,11 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 			note_block(p);
 			if (p->sys.nr != NR_NONE && !(p->detail.flags & SYSD_DESCRIBED))
 				describe_blocked(p);
+			/* `current` is still `prev`: its stacks are where it blocked. */
+			if (stacks_enabled) {
+				p->user_stack = stack_ref(ctx, BPF_F_USER_STACK);
+				p->kernel_stack = stack_ref(ctx, 0);
+			}
 		} else {
 			p->state = ST_RUNNABLE;
 			/* `next` holds the CPU while this thread waits for it. */
@@ -436,6 +477,9 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 				__builtin_memcpy(e->waker_comm, n->waker_comm, sizeof(e->waker_comm));
 				e->ready = n->ready;
 				e->fault = n->fault;
+				e->user_stack = n->user_stack;
+				e->kernel_stack = n->kernel_stack;
+				__builtin_memcpy(e->comm, next->comm, sizeof(e->comm));
 				bpf_ringbuf_submit(e, 0);
 			}
 			close_segment(n, 0, now);
@@ -761,5 +805,34 @@ int BPF_PROG(on_fault_exit)
 
 	if (t)
 		t->in_fault = 0;
+	return 0;
+}
+
+/* ---- on-CPU stack sampling ---------------------------------------------------------- */
+
+/* CPU-clock sampler, one perf event per CPU (SAMPLE_HZ), attached only with stack capture
+ * on. Runs in the timer interrupt: `current` is the interrupted task, and its user stack
+ * comes from the registers saved at its last kernel entry. */
+SEC("perf_event")
+int on_sample(void *ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	u32 tid = (u32)id;
+	struct task_state *t;
+	struct sample_record *e;
+
+	if (!stacks_enabled || !tid)
+		return 0;
+	t = bpf_map_lookup_elem(&tasks, &tid);
+	if (!t)
+		return 0;
+	e = reserve(sizeof(*e));
+	if (!e)
+		return 0;
+	fill_hdr(&e->hdr, EV_SAMPLE, tid, t->tgid, bpf_ktime_get_ns());
+	e->user_stack = stack_ref(ctx, BPF_F_USER_STACK);
+	e->kernel_stack = stack_ref(ctx, 0);
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	bpf_ringbuf_submit(e, 0);
 	return 0;
 }

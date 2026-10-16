@@ -11,7 +11,9 @@ crate name is taken on crates.io. Use `whytime` everywhere in code, docs and out
 
 **Status: MVP.** Wrap mode and attach mode (`-p PID`), plus trace files for both:
 `--record FILE` saves a run and `whytime report FILE` replays it offline into the identical
-report. Flamegraphs and hostname/DNS correlation for network subjects are later milestones.
+report. `--flamegraph FILE` / `--folded FILE` draw the critical path as a wall-clock
+flamegraph (all three paths). Hostname/DNS correlation for network subjects is a later
+milestone.
 
 ## Commands
 
@@ -35,6 +37,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | Attach | `sudo whytime -p PID [--duration 30s] [--record t.wt]` (report on exit, deadline or Ctrl-C; exit 0) |
 | Doctor | `whytime doctor [--json]` (exit 0 ready, 3 cannot run) |
 | Record / replay | `sudo whytime --record t.wt -- CMD` (or `-p PID --record t.wt`), then `whytime report t.wt [--json]` (no privileges; exit 0, or 2 if the file cannot be replayed) |
+| Flamegraph | `sudo whytime --flamegraph out.svg [--folded out.folded] -- CMD` (or `-p PID ...`); from a trace recorded with either flag: `whytime report t.wt --flamegraph out.svg` (exit 2 if it has no stacks) |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (prints the verifier log on load failures) |
 
 Toolchain: `rust-toolchain.toml` pins **stable** with the `x86_64-unknown-linux-musl` and
@@ -86,12 +89,16 @@ crates/whytime/            the binary
   src/attribute.rs         critical-path walk (follows wakers) → spans that partition the window
   src/report.rs            whytime.report/1 JSON + human rendering
   src/record.rs            trace files: Recorder (--record), format, parse + replay
+  src/stacks.rs            stack capture: live normalization of user stacks (maps, files),
+                           ELF/kallsyms symbolization → Symbols (recorded in trace files)
+  src/flame.rs             spans + samples + block stacks → folded stacks; folded/SVG writers
   src/testkit.rs           #[cfg(test)] synthetic records and traces for unit tests
-  src/doctor.rs            bpfdoctor Tool, probe.sched / syscalls / readiness / faults checks
+  src/doctor.rs            bpfdoctor Tool, probe.sched / syscalls / readiness / faults / stacks,
+                           kernel.kallsyms checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
 crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp,
                            wt-attach, wt-threads, wt-vfork, wt-flock, wt-syscalls, wt-poll,
-                           wt-fault, wt-fifo
+                           wt-fault, wt-fifo, wt-flame
 xtask/                     cargo xtask test-e2e | man [DIR]
 .github/                   workflows ci.yml, release.yml; actions/setup (tracekit checkout, clang, rustup)
 LICENSE                    MIT
@@ -133,10 +140,15 @@ flowchart LR
     EX[tp_btf/sched_process_exec/exit] --> TS
     SW -- episode --> RB[(ringbuf events)]
     FK & EX -- fork/exec/exit --> RB
+    SW -. stacks at block .-> SM[(stacks: stack id → addresses)]
+    PE[perf_event cpu-clock sampler] -. sample .-> RB
+    PE -.-> SM
   end
   RB --> TL[timeline.rs: segments + classify + procctx]
   TS -- final sweep --> TL
   TL --> AT[attribute.rs: critical path] --> RP[report.rs → stderr]
+  SM -. stacks.rs: normalize, symbolize .-> FL[flame.rs → folded / SVG]
+  AT -. spans .-> FL
 ```
 
 Wrap-mode startup (`main.rs`, `spawn.rs`):
@@ -146,8 +158,12 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
    the syscall, readiness and page-fault sets are optional: if one fails, continue with a
    warning and a report note (`record::Probes`, in the trace header). Before loading,
    `percpu.rs` reads `/sys/kernel/btf/vmlinux` and sets the `.rodata` global
-   `preempt_count_from_rq` (see `on_waking`). With `--record`, create the trace file now
-   (before COMMAND runs, so a bad path fails fast with 125).
+   `preempt_count_from_rq` (see `on_waking`). With `--flamegraph`/`--folded`, the `.rodata`
+   global `stacks_enabled` is 1, the `stacks` map gets `STACKS_MAX` entries (else 1), and
+   the `perf_event` sampler is attached to every online CPU (optional set "stacks": if the
+   scheduler programs fail with capture on, the load is retried without it). With
+   `--record`, create the trace file now, and the flamegraph files too (before COMMAND
+   runs, so a bad path fails fast with 125; under sudo they are `fchown`ed to the user).
 3. Under sudo (`euid 0` + `SUDO_UID`/`SUDO_GID`), compute the invoking user's credentials
    and groups, and restore `HOME`/`USER`/`LOGNAME` to that user.
 4. Ignore SIGINT/SIGQUIT (the TTY delivers them to COMMAND's process group, which whytime
@@ -160,11 +176,14 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
 6. The window starts at the child's `sched_process_exec` record (the root's first task
    entry is created there) and ends at the root thread group's exit record (or
    `--duration` after the start). The loop polls ring buffer, pidfd and signalfd with epoll.
-7. On window end: drop the `Ebpf` (detaches every program; the maps were taken out and stay
-   alive), wait 2 ms for in-flight programs, drain the ring, then **sweep** the `tasks` map
-   to close every still-open interval at the window end. With `--record`, write the sweep
-   and the end frame. Attribute, report, return COMMAND's code (with `--duration`, keep
-   forwarding signals until it exits).
+7. On window end: with stack capture, read `/proc/kallsyms` (while whytime's programs are
+   loaded: see `stacks.rs`); drop the `Ebpf` (detaches every program; the maps were taken
+   out and stay alive), wait 2 ms for in-flight programs, drain the ring, then **sweep** the
+   `tasks` map to close every still-open interval at the window end. With stack capture,
+   symbolize (`Collector::finish`). With `--record`, write the stack frames, the sweep and
+   the end frame. Write the flamegraph files, then attribute and report (the report stays
+   last on stderr), return COMMAND's code (with `--duration`, keep forwarding signals until
+   it exits).
 
 Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 
@@ -230,6 +249,7 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 | `on_pollwake` | `fentry/pollwake` | `int (struct wait_queue_entry *wait, unsigned mode, int sync, void *key)` | poll/select: `container_of(wait, poll_table_entry, wait)->filp` is the ready file, `((poll_wqueues *)wait->private)->polling_task` the poller; tracked + BLOCKED + key matches `entry->key` → the first source claims `ready` (`describe_file`, fd −1) | optional (with `on_ep_poll_callback`: `probe.readiness`); without them poll waits stay `poll` |
 | `on_ep_poll_callback` | `fentry/ep_poll_callback` | same | epoll: `container_of(wait, eppoll_entry, wait)->base` is the epitem, its `ffd.file`/`ffd.fd` the ready file; the thread woken is the first entry of `epi->ep->wq` (exclusive waiters), `->private` its task; skipped when the item is disabled (`event.events` only `EP_PRIVATE_BITS`) or the key misses its events | optional |
 | `on_fault_exit` / `on_fault_enter` | `fexit` / `fentry` `handle_mm_fault` | `vm_fault_t (struct vm_area_struct *vma, unsigned long address, unsigned int flags, struct pt_regs *regs)` | entry: `in_fault = 1`, `fault_file = vma->vm_file`; exit: `in_fault = 0`. Covers faults inside syscalls (copy_to_user) too | optional (`probe.faults`); fexit attaches first |
+| `on_sample` | `perf_event`, `PERF_COUNT_SW_CPU_CLOCK` at `SAMPLE_HZ` (199 Hz) on every online CPU (`PerfEventScope::AllProcessesOneCpu`), only with `--flamegraph`/`--folded` | `(void *ctx)` | current tracked (`tasks` lookup) → emit SAMPLE: user (`BPF_F_USER_STACK`) and kernel `bpf_get_stackid` into `stacks`, thread comm | optional (`probe.stacks`): failure → warning, report note, no flamegraph |
 
 **Describe** (`describe_blocked`, once per syscall, guarded by `SYSD_DESCRIBED`): at
 `sched_switch` `current` is still `prev`, so its fd table and user memory are at hand. Per
@@ -242,12 +262,28 @@ names, crossing mounts through `container_of(vfsmount, struct mount, mnt)` →
 first into 256 bytes, whole names only), and for `connect` the user sockaddr. Syscalls that
 never block cost only the `sys_enter`/`sys_exit` stores.
 
+**Stack capture** (`stacks_enabled`, a `.rodata` global set at load only for
+`--flamegraph`/`--folded`; 0 lets the verifier drop the code, so default runs pay nothing
+but a 1-entry map): at every voluntary switch-out of a tracked thread, `on_switch` stores
+`bpf_get_stackid(ctx, &stacks, BPF_F_USER_STACK)` and `(…, 0)` in `task_state.user_stack`
+/`kernel_stack` (`current` is still `prev`, so these are where it blocked), and the next
+EPISODE (or the sweep) carries them with the thread's comm. Stack references are `id + 1`,
+0 = none captured (zeroed entries, seeded threads), `< 0` = `-errno` (`-EEXIST` collision,
+`-ENOMEM` full: counted in `stats`; `-EFAULT` empty, e.g. no kernel stack for a sample
+taken in user mode). 199 Hz: a prime rate, off the 100/250/1000 Hz timer ticks; 5 ms
+resolution; 48 bytes of ring/trace per sample, 24 in memory.
+
 Maps: `events` RINGBUF 4 MiB; `tasks` HASH tid → `task_state` (32768); `task_zero` ARRAY of
 one zeroed `task_state`, the template `new_task()` copies (task_state exceeds the 512-byte BPF
 stack, so no program may hold one on its stack); `tracked` HASH tgid (16384); `sys_flags` ARRAY nr → `SYSF_*` (512, filled by user space from libc numbers, so the
 C code has no syscall numbers); `stats` PERCPU_ARRAY of loss counters (ring full, tasks
-full, tracked full) → `quality.dropped`; `path_buf` PERCPU_ARRAY, one 512-byte buffer where
-`capture_path` assembles names (twice `PATH_BYTES` so variable-offset reads verify).
+full, tracked full → `quality.dropped`; stack collisions, stack map full → a warning, not
+`dropped`: the records are intact); `path_buf` PERCPU_ARRAY, one 512-byte buffer where
+`capture_path` assembles names (twice `PATH_BYTES` so variable-offset reads verify);
+`stacks` STACK_TRACE id → `STACK_DEPTH` (127) addresses, `STACKS_MAX` (16384) entries with
+capture on (~16 MiB, preallocated), 1 entry otherwise (`EbpfLoader::map_max_entries`). Ids
+are `hash & (buckets - 1)` without `BPF_F_REUSE_STACKID`, so an id never changes meaning:
+a different stack hashing to a taken bucket is lost (`-EEXIST`), not overwritten.
 
 CO-RE: `vmlinux_min.h` declares only the fields used, under
 `#pragma clang attribute push(preserve_access_index)`, with `__VMLINUX_H__` defined so
@@ -268,9 +304,10 @@ appended at the end of a struct, 8-byte aligned.
 |---|---|---|
 | `fork_record` (EV_FORK) | 40 | hdr (parent), child_tid, child_tgid, child_start (`start_boottime`) |
 | `exec_record` (EV_EXEC) | 376 | hdr, seg (up to exec), start (leader `start_boottime` = procctx key), ppid, old_tid, comm[16], argv_len, argv[256] |
-| `episode_record` (EV_EPISODE) | 592 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid (0/0 = unknown or interrupt context), block_state (`prev_state`), sys_detail, flags (`EPF_FAULT`, `EPF_READY`), run_holder_tgid/comm (ran just before the switch-in), waker_comm (out-of-tree waker, else empty), ready (sys_info of the file that ended a poll), fault (sys_info of the faulting vma's file; mode 0 = anonymous) |
+| `episode_record` (EV_EPISODE) | 616 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid (0/0 = unknown or interrupt context), block_state (`prev_state`), sys_detail, flags (`EPF_FAULT`, `EPF_READY`), run_holder_tgid/comm (ran just before the switch-in), waker_comm (out-of-tree waker, else empty), ready (sys_info of the file that ended a poll), fault (sys_info of the faulting vma's file; mode 0 = anonymous), user_stack/kernel_stack (at the block; see Stack capture), comm (the thread's own name) |
 | `exit_record` (EV_EXIT) | 96 | hdr, seg (up to exit), start, code (`task->exit_code`), group_dead |
-| `task_state` (map value) | 600 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid, sys_detail, ready, fault, fault_file (kernel `struct file *`), in_fault, has_ready, pend_tgid/comm (took the CPU at the last preemption), waker_comm |
+| `task_state` (map value) | 608 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid, sys_detail, ready, fault, fault_file (kernel `struct file *`), in_fault, has_ready, pend_tgid/comm (took the CPU at the last preemption), waker_comm, user_stack/kernel_stack (last block's) |
+| `sample_record` (EV_SAMPLE = 6) | 48 | hdr (sampled thread, ts = sample time), user_stack, kernel_stack, comm[16] (thread name) |
 | `sys_info` | 48 | nr (−1 = none), fd, mode (`S_IFMT` bits), f_flags, ino, dev (kernel `dev_t`), family, port (host order), addr[16]; for the syscall all but nr valid only with `SYSD_DESCRIBED`; `ready`/`fault` are complete when set (user space classifies them as described, without a path) |
 | `sys_detail` | 296 | args[3] (raw, from `sys_enter`), magic (`s_magic`), flags (`SYSD_DESCRIBED`, `SYSD_PATH_ROOTED` = whole path, `SYSD_PATH_TRUNCATED` = tail only, neither = pseudo-fs name), path_len, path[256] (names leaf first, NUL-terminated: `lock\0app\0home\0` = `/home/app/lock`) |
 
@@ -428,10 +465,87 @@ unknown fields and treat an unknown `class` as `other`. Every new field or class
 this table.
 
 Exit codes: COMMAND's (128 + signal if killed); 125 whytime failed before/at start (with
-doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run;
-`report`: 0, or 2 if the trace file cannot be replayed. Attach mode: 0 after the report, 1
-PID cannot be attached to (missing, thread, zombie, whytime, pid 1, another user's), 125 as
-above.
+doctor diagnostics, or a trace/flamegraph file that cannot be created); 126 not executable;
+127 not found; `doctor`: 0 ready / 3 cannot run; `report`: 0, or 2 if the trace file cannot
+be replayed (or `--flamegraph`/`--folded` cannot be drawn from it). Attach mode: 0 after the
+report, 1 PID cannot be attached to (missing, thread, zombie, whytime, pid 1, another
+user's), 125 as above. A flamegraph that cannot be written (stack capture unavailable, write
+error) is reported on stderr before the report; the exit code stays COMMAND's (attach: 0).
+
+## Flamegraphs (`--flamegraph FILE`, `--folded FILE`)
+
+A wall-clock flamegraph of the critical path (`flame.rs`): the spans tile the window, so
+every attributed nanosecond is in exactly one stack and the total width is the wall time.
+Each stack, outermost first: the report line's label (`on-CPU (xz)`, `fsync on ~/.cache`,
+`waiting on child: cc1`), the comm of the span's process, the thread's own name when it
+differs (from SAMPLE/EPISODE records), then the stack:
+
+- **on-CPU** (`cpu`/`child` spans over a mixed segment): split evenly over the thread's
+  samples in the stretch of the segment the span stands for. A mixed segment's on-CPU and
+  preempted time interleave, and the attribution puts the on-CPU part first, so a span
+  `[x, y)` stands for `[x, x + (y−x)·(run+rq)/run)` of the segment. No sample there: the
+  nearest sample of the thread within one period (`NEAREST_NS`, 5 ms) carries it all, else
+  `[no sample]` (on-CPU stretches far shorter than 5 ms between blocks are typical);
+- **blocked**: the user then kernel stack captured when that block began (the episode, or
+  the sweep for threads blocked at the end); `[no stack]` when none was captured (threads
+  blocked since before an attach);
+- **runqueue** (`[runqueue]` leaf), and `other (untraced)` (the line alone).
+
+Frames: user frames root → leaf, then kernel frames root → leaf with `_[k]` (the
+FlameGraph/inferno convention). `[stack lost]` / `[stack lost]_[k]`: the kernel could not
+store the stack (map collision/full) or user space could not read it. `[unknown]`: an
+address in no executable mapping (JIT code, or a broken frame-pointer chain; runs of them
+collapse into one). `[libfoo.so]`: in a mapped file without a covering symbol (stripped).
+`[vdso]`. `[kernel]_[k]`: the kernel stack when `/proc/kallsyms` hides addresses. `;` in a
+name becomes `:`, control characters spaces.
+
+**Symbolization** (`stacks.rs`, live only): the `Collector` follows the records as they
+arrive. User addresses only mean something in their process image, so each new user stack
+(key: procctx key, image = index into `Proc::comms`, stack id) is read from `stacks` at once
+and normalized against a per-pid cache of `/proc/PID/maps` (read at each EXEC, copied to a
+child at FORK, re-read on a miss while the image is current, dropped at group exit): address
+(return addresses − 1) → mapping → (file, file offset). Each mapped file is opened then,
+through `/proc/PID/map_files/START-END` (root; works for deleted files), else
+`/proc/PID/root/PATH` checked against the mapping's dev:ino, and kept open: identity by the
+inode itself (stronger than a build-id; a rebuilt binary does not mislead). At the window's
+end the stacks no record carried (the sweep) are read too, `/proc/kallsyms` is read *before*
+the programs are detached (whytime's own BPF frames are named only while loaded; they and
+`bpf_trace_run*`/`__traceiter_*` are cut from the inner end of `sched_switch` stacks, which
+thus end in `__schedule`), and every file's `.symtab` (else `.dynsym`) is read with
+`object` (no DWARF: no inlined frames, no separate debug files or debuginfod). Rust names are
+demangled without the hash, C++ with `cpp_demangle`. The result, `Symbols`, is everything
+the graph takes from outside the trace; `--record` writes it (frame 8), so
+`whytime report F --folded` reproduces the live folded file byte for byte.
+
+Output: `--folded` is Brendan Gregg's folded format (`frame;frame;... count`, sorted, one
+line per distinct stack) in **microseconds** (rounded; stacks under 0.5 µs are omitted), for
+inferno, `flamegraph.pl` or speedscope. `--flamegraph` is inferno's SVG: title
+`whytime: COMMAND`, subtitle with the wall time, `µs` counts, colors hashed from names
+(deterministic: a replay draws the same SVG), root frames colored by class (on-CPU warm,
+runqueue yellow, sleep grey, storage blue, network green, waits on other tasks purple).
+inferno is CDDL-1.0 (file-level copyleft; its source is on crates.io), without its CLI and
+threading features.
+
+Limits (state them with flamegraphs):
+
+- User stacks unwind by **frame pointers** only. Code without them (most distributions'
+  packages before Arch/Fedora/Ubuntu turned them on, musl, many language runtimes) truncates
+  or garbles the chain: frames whose return addresses are not in an executable mapping show
+  as `[unknown]`; a leaf function without a frame pointer hides its caller (the frame record
+  found belongs to the caller's caller); a tail call hides the caller. Stacks deeper than
+  127 frames lose their outermost frames.
+- One stack per block: a block's whole duration gets the stack at its start.
+- Samples (199 Hz) stand for evenly split time; short on-CPU stretches take the nearest
+  sample within 5 ms, which may be from a neighbouring stretch.
+- The stack map has 16384 buckets and no chaining: with thousands of distinct stacks some
+  collide (`[stack lost]`, counted, warned about at the end).
+- A process that exits before its records are processed (µs to ms) cannot be normalized past
+  what its maps showed at exec: libraries it mapped later are `[unknown]`.
+- Symbol tables only: stripped binaries show exported symbols or `[file]`; no inline frames.
+  Interpreters (Python, Node) show the interpreter's C frames, not script functions.
+- Kernel frames need `/proc/kallsyms` addresses (root, `CAP_SYSLOG`, or `kptr_restrict=0`
+  with `perf_event_paranoid ≤ 1`); else one `[kernel]_[k]` frame (doctor `kernel.kallsyms`).
+- Only the critical path is drawn; `processes[].cpu_ns` still shows all CPU.
 
 ## Trace files (`--record` / `report`)
 
@@ -444,7 +558,8 @@ modes). Replay needs no BPF, no privileges and none of the traced processes. The
 
 - preamble: magic `WHYTRACE`, format version, `whytime_bpf::ABI_HASH`;
 - header frame: arch (syscall numbers), command line, root pid, home dir for `~`, optional
-  probe sets attached (syscalls, readiness, faults), `AT_CLKTCK` (procctx start clock); attach mode also the count of blocked
+  probe sets attached (syscalls, readiness, faults, stack capture: not requested / on /
+  unavailable), `AT_CLKTCK` (procctx start clock); attach mode also the count of blocked
   threads whose syscall was unreadable (its presence marks an attached trace: root pid =
   target, command line = the target's);
 - attach mode only, before any record: the seed frame, `Trace::seed`'s input (window start,
@@ -458,6 +573,8 @@ modes). Replay needs no BPF, no privileges and none of the traced processes. The
   only when the kernel's path walk did not reach the root: truncated walks, threads seeded at
   attach; kernel paths travel inside the records) and `/proc/<pid>/maps` → a page fault's
   mapped file (mapping frames);
+- with stack capture, the symbolized stacks (`Symbols`: one stack frame per user or kernel
+  stack, its frame names);
 - the final `tasks` sweep, then the end frame: window start/end, ended by (exit, duration,
   interrupt), exit code, dropped count. A file without the end frame (whytime killed or
   failed, or the target exited during attach) is "truncated".
@@ -481,17 +598,20 @@ Rules that keep replay exact:
 ## Unit tests
 
 `testkit.rs` (`#[cfg(test)]`) builds ring records from all-zero bytes and sets only named
-fields (`exec`, `fork`, `episode`, `exit`, `task`, `seg`, `sys`), so fields appended to the
-ABI keep a neutral 0 and tests survive layout growth; an `episode` inside a syscall is
+fields (`exec`, `fork`, `episode`, `exit`, `sample`, `task`, `seg`, `sys`), so fields appended
+to the ABI keep a neutral 0 and tests survive layout growth; an `episode` inside a syscall is
 `SYSD_DESCRIBED` without a captured path, so file subjects go through the trace's
 `FdTarget`. `testkit::trace(pid)` is a `Trace` with no `/proc` access. Timeline, attribution
 and attach-seeding tests feed records like the ring buffer would and assert on segments and
 lines; follow-the-waker tests in `attribute.rs` push `Proc`/`Thread`/`Seg`s into such a
 trace directly and check that the spans tile the window. `classify.rs` tests build
 `SysDetail`s (kernel paths rooted, truncated, anonymous inodes) with an in-memory `FdTarget`.
-`record.rs` tests round-trip a recorded run (wrap and attach) to the identical JSON report and
-reject damaged files. `snapshot.rs` tests read this process's own `/proc` (threads blocked on
-a socket, a pipe and an eventfd).
+`record.rs` tests round-trip a recorded run (wrap and attach) to the identical JSON report,
+and its stacks to the identical folded output, and reject damaged files. `flame.rs` tests
+fold testkit traces with synthetic samples and `Symbols` (sample weighting across a
+preempted segment, nearest sample, `[no sample]`/`[no stack]`/`[stack lost]`, untraced time,
+thread names) and check the folded writer's rounding. `snapshot.rs` tests read this
+process's own `/proc` (threads blocked on a socket, a pipe and an eventfd).
 
 ## Privileges
 
@@ -522,10 +642,11 @@ memcg) plus:
 | `probe.syscalls` | no | attaches `sys_exit` then `sys_enter`; WARN impact "blocked time is reported as other"; SKIP if the scheduler probe failed |
 | `probe.readiness` | no | attaches `fentry/pollwake` and `fentry/ep_poll_callback`; WARN impact "poll/select/epoll waits are reported as poll"; fixes: BPF trampolines (x86-64 ≥ 5.5, arm64 ≥ 6.0) + BTF, or the verifier log; SKIP if the scheduler probe failed |
 | `probe.faults` | no | attaches `fexit` then `fentry` on `handle_mm_fault`; WARN impact "page-fault time is reported as other or as the interrupted syscall"; same fixes; SKIP if the scheduler probe failed |
+| `probe.stacks` | no | loads with stack capture on (stack map, `on_switch` capture, `perf_event` sampler on every CPU); WARN impact "no flamegraph"; fixes: EPERM → caps/sudo, EINVAL → `sysctl kernel.perf_event_max_stack=127`, else `CONFIG_PERF_EVENTS` + verifier log |
+| `kernel.kallsyms` | no | first `/proc/kallsyms` address non-zero; WARN impact "kernel frames collapse into one [kernel] frame"; fixes: sudo, or setcap with `cap_syslog` |
 
-`kernel.kptr_restrict` is not checked: the MVP reads no kernel addresses (relevant once
-flamegraphs symbolize kernel stacks). Wrap and attach mode run `Doctor::preflight()` first,
-and after a load failure re-run `ids_for_errno(errno)` and print the non-passing checks.
+Wrap and attach mode run `Doctor::preflight()` first, and after a load failure re-run
+`ids_for_errno(errno)` and print the non-passing checks.
 
 ## Performance budget
 
@@ -545,6 +666,20 @@ puts every task on the system on the syscall slow path while whytime runs. The `
 e2e scenario guards this (`wt-syscalls`: 1.4–1.8× on-CPU time traced vs untraced, limit
 2.5). Measure with `bpftool prog show` after `sysctl kernel.bpf_stats_enabled=1` only for
 per-program cost; the programs fire for every task, so averages mix tracked and untracked.
+
+Flamegraphs (`--folded`; best of 3 interleaved, load ~11 on 22 cores; wall and CPU of the
+whole run, whytime's load, verification, kallsyms read and symbolization included, so the
+ratios are higher than the `overhead` scenario's command-only CPU):
+
+| Workload | untraced | traced | traced `--folded` |
+|---|---|---|---|
+| `wt-syscalls 2000000` (syscalls) | 0.43 s | 0.93 s (2.2×) | 1.51 s (3.6×) |
+| `perf bench sched pipe -l 100000` (context switches) | 0.52 s | 1.14 s (2.2×) | 2.49 s (4.8×) |
+
+Default runs pay nothing for flamegraphs: `stacks_enabled` = 0 lets the verifier drop the
+capture code, the sampler is not loaded, the stack map has one entry. With capture on, every
+block of a tracked thread costs two `bpf_get_stackid` walks, the 16 MiB map is preallocated,
+and user space reads each new stack and `/proc/PID/maps` per process image as records come.
 
 Targets (not benchmarked unless noted):
 
@@ -638,6 +773,21 @@ with whytime's status (must be 0):
     checks: unprivileged `whytime report F --json` identical to the live report, human
     replay exits 0, F owned by the invoking user, F cut in half → exit 2, "truncated"
 
+xtask builds the testbins with `RUSTFLAGS=-C force-frame-pointers=yes`, profile `e2e`
+(release, symbols kept), in `$CARGO_TARGET_DIR/e2e-testbins` (whytime stays as shipped).
+Flamegraph scenarios (files in `$WORK/flame`, cleared per run):
+
+27. `flamegraph`: `--folded --flamegraph -- wt-flame 600 400` → folded total = wall ± 1%;
+    stacks through `burn_cpu_here` = `cpu` line, through `sleep_here` = `sleep` line (± 5%
+    of wall); SVG names `burn_cpu_here`; both files owned by the invoking user
+28. `flame-kernel`: `--folded -- wt-fsync DIR 50` → a kernel frame naming fsync
+    (`do_fsync_[k]`); skipped, saying so, if `/proc/kallsyms` hides addresses from root
+29. `flame-replay`: `--record F --folded A -- wt-flame 300 200`, then unprivileged
+    `report F --folded B --flamegraph S` → B = A byte for byte; scenario 18's trace (no
+    stacks) with `--folded` → exit 2
+30. `attach-flame`: `-p` on `wt-flame 30000 0`, `--duration 1s --folded` → target alive,
+    `burn_cpu_here` ≥ 80% of the stacks
+
 ## Gotchas
 
 - clang folds `if (!p && !n)` on two map-value pointers into `p | n`; the verifier rejects
@@ -700,3 +850,15 @@ with whytime's status (must be 0):
   `PATH` inlined) hangs the guest with no output; the guest's default PATH finds a system
   cargo without the musl target; the guest root is read-only virtiofs, so put
   `WHYTIME_E2E_DIR` on a mounted ext4 image (`/dev/vda`). vng returns the guest's exit code.
+- `bpf_get_stackid` from `tp_btf/sched_switch` unwinds from inside whytime's program: the
+  innermost kernel frames are `bpf_prog_*_on_switch`, `bpf_trace_run4`,
+  `__traceiter_sched_switch`. Read `/proc/kallsyms` before detaching and cut through them.
+- The stack map's 127-frame value must not exceed `kernel.perf_event_max_stack`, else map
+  creation fails with EINVAL and whytime does not load at all.
+- Stack references are `id + 1`, so zeroed entries and testkit records mean "none".
+- Frame pointers show the callers of the innermost function with a frame record: a leaf
+  without them (musl's syscall wrappers) hides its caller, a tail call hides the caller
+  (`wt-flame` keeps code after its calls).
+- The single stack map fills up over long CPU-heavy runs (each distinct leaf address is a
+  distinct stack; 16384 buckets, no chaining): xz -T4 for 16 s lost 66 stacks. Emptying
+  it safely needs double-buffered maps with an epoch in each record (not done yet).

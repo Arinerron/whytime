@@ -4,11 +4,15 @@ use std::io;
 use std::os::fd::{AsRawFd as _, RawFd};
 
 use anyhow::Context as _;
-use aya::maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf};
+use aya::maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf, StackTraceMap};
+use aya::programs::perf_event::{PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent};
 use aya::programs::{Program, ProgramError};
 use aya::sys::SyscallError;
 use aya::{Btf, Ebpf, EbpfLoader, Pod};
-use whytime_abi::{STAT_NR, TaskState};
+use whytime_abi::{
+    SAMPLE_HZ, STACKS_MAX, STAT_RING_FULL, STAT_STACK_COLLISION, STAT_STACK_FULL,
+    STAT_TASKS_FULL, STAT_TRACKED_FULL, TaskState,
+};
 
 use crate::sys::SyscallTable;
 
@@ -40,6 +44,10 @@ pub const FAULTS: [(&str, &str); 2] = [
     ("on_fault_enter", "handle_mm_fault"),
 ];
 
+/// The on-CPU stack sampler (`perf_event`), attached to a CPU-clock event on every online
+/// CPU when stack capture is on.
+pub const SAMPLER: &str = "on_sample";
+
 /// `bpf_map_update_elem` flag: fail with `EEXIST` instead of replacing an entry.
 const BPF_NOEXIST: u64 = 1;
 
@@ -55,6 +63,8 @@ pub struct Maps {
     tasks: HashMap<MapData, u32, TaskState>,
     tracked: HashMap<MapData, u32, u32>,
     stats: PerCpuArray<MapData, u64>,
+    /// The `stacks` map, when stack capture is on.
+    stacks: Option<StackTraceMap<MapData>>,
 }
 
 impl std::fmt::Debug for Tracer {
@@ -80,13 +90,17 @@ pub struct Loaded {
     pub readiness: Result<(), anyhow::Error>,
     /// Why the page-fault programs could not be attached, if they could not.
     pub faults: Result<(), anyhow::Error>,
+    /// Stack capture, when requested: why it is unavailable, if it is.
+    pub stacks: Option<Result<(), anyhow::Error>>,
 }
 
 impl Tracer {
-    /// Loads the object, fills the syscall table and attaches every program. Fails only if
+    /// Loads the object, fills the syscall table and attaches every program; with `stacks`,
+    /// also turns on stack capture at blocks and attaches the on-CPU sampler. Fails only if
     /// the object or a scheduler program cannot be loaded or attached; the optional sets
-    /// report their own outcome.
-    pub fn load(syscalls: &SyscallTable) -> anyhow::Result<Loaded> {
+    /// (stack capture included) report their own outcome. If the scheduler programs fail
+    /// with stack capture on, the load is retried without it.
+    pub fn load(syscalls: &SyscallTable, stacks: bool) -> anyhow::Result<Loaded> {
         raise_memlock();
         let btf = Btf::from_sys_fs().context("reading kernel BTF (/sys/kernel/btf/vmlinux)")?;
         log::debug!(
@@ -100,9 +114,33 @@ impl Tracer {
             .and_then(|raw| crate::percpu::preempt_count_from_rq(&raw))
             .unwrap_or(0);
         log::debug!("preempt_count is {preempt_count_from_rq:+} bytes from runqueues");
+        if !stacks {
+            return Self::load_with(&btf, syscalls, preempt_count_from_rq, false);
+        }
+        match Self::load_with(&btf, syscalls, preempt_count_from_rq, true) {
+            Ok(loaded) => Ok(loaded),
+            Err(err) => {
+                log::debug!("loading with stack capture failed ({err:#}); retrying without");
+                let mut loaded = Self::load_with(&btf, syscalls, preempt_count_from_rq, false)?;
+                loaded.stacks = Some(Err(err));
+                Ok(loaded)
+            }
+        }
+    }
+
+    fn load_with(
+        btf: &Btf,
+        syscalls: &SyscallTable,
+        preempt_count_from_rq: i64,
+        stacks: bool,
+    ) -> anyhow::Result<Loaded> {
+        let stacks_enabled = u32::from(stacks);
         let mut ebpf = EbpfLoader::new()
-            .btf(Some(&btf))
+            .btf(Some(btf))
             .override_global("preempt_count_from_rq", &preempt_count_from_rq, true)
+            .override_global("stacks_enabled", &stacks_enabled, true)
+            // Without capture the map is never written: one entry instead of ~16 MiB.
+            .map_max_entries("stacks", if stacks { STACKS_MAX } else { 1 })
             .load(whytime_bpf::OBJECT)
             .context("creating BPF maps")?;
 
@@ -111,22 +149,28 @@ impl Tracer {
             flags.set(nr, bits, 0).context("filling sys_flags")?;
         }
 
-        attach_all(&mut ebpf, &btf, &SCHED)?;
-        let syscalls = attach_all(&mut ebpf, &btf, &SYSCALLS);
-        let readiness = attach_all(&mut ebpf, &btf, &READINESS);
-        let faults = attach_all(&mut ebpf, &btf, &FAULTS);
+        attach_all(&mut ebpf, btf, &SCHED)?;
+        let syscalls = attach_all(&mut ebpf, btf, &SYSCALLS);
+        let readiness = attach_all(&mut ebpf, btf, &READINESS);
+        let faults = attach_all(&mut ebpf, btf, &FAULTS);
+        let sampler = stacks.then(|| attach_sampler(&mut ebpf));
 
         let maps = Maps {
             ring: RingBuf::try_from(take(&mut ebpf, "events")?)?,
             tasks: HashMap::try_from(take(&mut ebpf, "tasks")?)?,
             tracked: HashMap::try_from(take(&mut ebpf, "tracked")?)?,
             stats: PerCpuArray::try_from(take(&mut ebpf, "stats")?)?,
+            stacks: match sampler {
+                Some(Ok(())) => Some(StackTraceMap::try_from(take(&mut ebpf, "stacks")?)?),
+                _ => None,
+            },
         };
         Ok(Loaded {
             tracer: Self { ebpf, maps },
             syscalls,
             readiness,
             faults,
+            stacks: sampler,
         })
     }
 
@@ -177,6 +221,12 @@ impl Tracer {
         self.maps.drain(f);
     }
 
+    /// The `stacks` map, when stack capture is on (once): stacks are read from it while the
+    /// run goes and after the programs are detached.
+    pub fn take_stacks(&mut self) -> Option<StackTraceMap<MapData>> {
+        self.maps.stacks.take()
+    }
+
     /// Detaches and unloads every program, keeping the maps for a final drain and sweep.
     pub fn detach(self) -> Maps {
         let Self { ebpf, maps } = self;
@@ -215,10 +265,21 @@ impl Maps {
         self.tasks.iter().filter_map(Result::ok).collect()
     }
 
-    /// Records and tasks lost in kernel (all `stats` slots, all CPUs).
+    /// Records and tasks lost in kernel (the loss slots of `stats`, all CPUs).
     pub fn dropped(&self) -> u64 {
-        (0..STAT_NR)
-            .filter_map(|slot| self.stats.get(&slot, 0).ok())
+        self.stat_sum(&[STAT_RING_FULL, STAT_TASKS_FULL, STAT_TRACKED_FULL])
+    }
+
+    /// Stacks lost to `stacks` map collisions or a full map (all CPUs); the records that
+    /// referred to them carry the error instead.
+    pub fn lost_stacks(&self) -> u64 {
+        self.stat_sum(&[STAT_STACK_COLLISION, STAT_STACK_FULL])
+    }
+
+    fn stat_sum(&self, slots: &[u32]) -> u64 {
+        slots
+            .iter()
+            .filter_map(|slot| self.stats.get(slot, 0).ok())
             .map(|per_cpu| per_cpu.iter().sum::<u64>())
             .sum()
     }
@@ -239,6 +300,36 @@ fn attach_all(ebpf: &mut Ebpf, btf: &Btf, programs: &[(&str, &str)]) -> anyhow::
     programs
         .iter()
         .try_for_each(|&(prog, target)| attach(ebpf, btf, prog, target))
+}
+
+/// Loads the on-CPU sampler and attaches it to a CPU-clock event of [`SAMPLE_HZ`] on every
+/// online CPU.
+fn attach_sampler(ebpf: &mut Ebpf) -> anyhow::Result<()> {
+    let Program::PerfEvent(program) = ebpf
+        .program_mut(SAMPLER)
+        .with_context(|| format!("BPF object has no program {SAMPLER}"))?
+    else {
+        anyhow::bail!("BPF program {SAMPLER} has an unsupported type");
+    };
+    if let Err(err) = program.load() {
+        if let ProgramError::LoadError { verifier_log, .. } = &err {
+            log::debug!("verifier log for {SAMPLER}:\n{verifier_log}");
+        }
+        return Err(err).context("loading perf_event/cpu-clock");
+    }
+    let cpus = aya::util::online_cpus()
+        .map_err(|(path, err)| anyhow::Error::new(err).context(format!("reading {path}")))?;
+    for cpu in cpus {
+        program
+            .attach(
+                PerfEventConfig::Software(SoftwareEvent::CpuClock),
+                PerfEventScope::AllProcessesOneCpu { cpu },
+                SamplePolicy::Frequency(u64::from(SAMPLE_HZ)),
+                false,
+            )
+            .with_context(|| format!("attaching perf_event/cpu-clock on CPU {cpu}"))?;
+    }
+    Ok(())
 }
 
 /// Loads `prog` against `target` (a tracepoint for `tp_btf`, a kernel function for

@@ -34,9 +34,8 @@ pub struct Cli {
 /// Wrap and attach mode.
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Print the report as JSON (schema whytime.report/1).
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub output: OutputArgs,
 
     /// Stop observing after D (e.g. 500ms, 30s, 2m) and report; COMMAND (or PID) keeps
     /// running, and whytime still exits with COMMAND's code.
@@ -68,6 +67,33 @@ pub struct RunArgs {
     pub command: Vec<OsString>,
 }
 
+/// What to produce from a run or a trace file: shared by wrap mode, attach mode and
+/// `whytime report`.
+#[derive(Clone, Debug, Default, Args)]
+pub struct OutputArgs {
+    /// Print the report as JSON (schema whytime.report/1).
+    #[arg(long)]
+    pub json: bool,
+
+    /// Write a wall-clock flamegraph of the critical path to FILE (SVG): its width is the
+    /// window, each stack a report line, process and call stack. Samples stacks while
+    /// tracing; `report` draws one only from a trace recorded with it (or --folded).
+    #[arg(long, value_name = "FILE")]
+    pub flamegraph: Option<PathBuf>,
+
+    /// Write the flamegraph's stacks to FILE in folded format (`frame;frame;... count`,
+    /// counts in microseconds), for inferno, flamegraph.pl or speedscope.
+    #[arg(long, value_name = "FILE")]
+    pub folded: Option<PathBuf>,
+}
+
+impl OutputArgs {
+    /// Whether stacks are needed (`--flamegraph` or `--folded`).
+    pub fn stacks(&self) -> bool {
+        self.flamegraph.is_some() || self.folded.is_some()
+    }
+}
+
 /// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Sub {
@@ -83,9 +109,8 @@ pub enum Sub {
         /// The trace file.
         #[arg(value_name = "FILE")]
         file: PathBuf,
-        /// Print the report as JSON (schema whytime.report/1).
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Print a shell completion script to stdout.
     Completions {
@@ -135,7 +160,7 @@ mod tests {
     fn command_words_after_the_command_belong_to_it() {
         let cli = Cli::try_parse_from(["whytime", "--json", "ls", "--json", "-l"]).unwrap();
         assert!(cli.sub.is_none());
-        assert!(cli.run.json);
+        assert!(cli.run.output.json);
         assert_eq!(cli.run.command, ["ls", "--json", "-l"]);
 
         let cli = Cli::try_parse_from(["whytime", "--", "doctor"]).unwrap();
@@ -161,7 +186,7 @@ mod tests {
         let cli = Cli::try_parse_from(["whytime", "report", "t.wt", "--json"]).unwrap();
         assert!(matches!(
             cli.sub,
-            Some(Sub::Report { ref file, json: true }) if file.as_os_str() == "t.wt"
+            Some(Sub::Report { ref file, ref output }) if file.as_os_str() == "t.wt" && output.json
         ));
     }
 
@@ -169,7 +194,7 @@ mod tests {
     fn pid_replaces_the_command_and_excludes_it() {
         let cli = Cli::try_parse_from(["whytime", "-p", "42", "--json"]).unwrap();
         assert_eq!(cli.run.pid, Some(42));
-        assert!(cli.run.json);
+        assert!(cli.run.output.json);
         assert!(cli.run.command.is_empty());
         let cli = Cli::try_parse_from(["whytime", "-p", "42", "--record", "t.wt"]).unwrap();
         assert_eq!(cli.run.record, Some(PathBuf::from("t.wt")));

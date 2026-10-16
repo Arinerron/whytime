@@ -527,7 +527,7 @@ mod tests {
     use super::*;
     use crate::classify::Blocked;
     use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
-    use crate::timeline::{Proc, Thread};
+    use crate::timeline::{Proc, StackIds, Thread};
 
     /// Adds process `pid` alive over `life`, `[birth, death)`.
     fn proc(
@@ -562,6 +562,8 @@ mod tests {
             birth: segs[0].start,
             death: segs.last().map(|s| s.end),
             segs,
+            samples: Vec::new(),
+            names: Vec::new(),
         });
         t.procs[proc].threads.push(id);
         id
@@ -591,6 +593,7 @@ mod tests {
             waker_tid: waker.0,
             waker_tgid: waker.1,
             waker_comm: None,
+            stacks: StackIds::default(),
         };
         let kind = SegKind::Blocked(Box::new(block));
         Seg { start, end, kind }

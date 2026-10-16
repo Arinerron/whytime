@@ -122,6 +122,8 @@ pub struct Meta {
     pub readiness: bool,
     /// Page-fault probes attached.
     pub faults: bool,
+    /// Stack capture for a flamegraph: `None` when not requested, else whether it worked.
+    pub stacks: Option<bool>,
     /// Attach mode: the target and how it was seeded.
     pub attached: Option<Attached>,
 }
@@ -232,6 +234,12 @@ impl Report {
                     .to_owned(),
             );
         }
+        if meta.stacks == Some(false) {
+            notes.push(
+                "stack capture unavailable: no flamegraph (see `whytime doctor`, probe.stacks)"
+                    .to_owned(),
+            );
+        }
         match meta.ended_by {
             EndedBy::Duration => {
                 notes.push("--duration elapsed; the command was still running".to_owned());
@@ -287,7 +295,12 @@ impl Report {
                 continue;
             }
             shown += 1;
-            writeln!(w, "{:>5}  {}", percent(line.share), label(line))?;
+            writeln!(
+                w,
+                "{:>5}  {}",
+                percent(line.share),
+                line_label(line.class, &line.subject, line.connections)
+            )?;
         }
         if rest > 0 {
             #[allow(clippy::cast_precision_loss)]
@@ -325,8 +338,8 @@ fn percent(share: f64) -> String {
     }
 }
 
-fn label(line: &ReportLine) -> String {
-    let subject = line.subject.as_str();
+/// How the human report (and a flamegraph's root frames) names a line.
+pub fn line_label(class: Class, subject: &str, connections: Option<usize>) -> String {
     // Subjects naming a syscall ("in openat") read as a phrase, not a location.
     let at = |verb: &str| {
         if subject.starts_with("in ") {
@@ -335,7 +348,7 @@ fn label(line: &ReportLine) -> String {
             format!("{verb} on {subject}")
         }
     };
-    match line.class {
+    match class {
         Class::Cpu => format!("on-CPU ({subject})"),
         Class::Child => format!("waiting on child: {subject}"),
         Class::Runqueue => format!("waiting for a CPU ({subject})"),
@@ -343,7 +356,7 @@ fn label(line: &ReportLine) -> String {
         Class::Fsync => at("fsync"),
         Class::File => at("file I/O"),
         Class::Aio => format!("async I/O completion ({subject})"),
-        Class::Net => match line.connections {
+        Class::Net => match connections {
             Some(n) => format!(
                 "blocked on network: {subject} ({n} connection{})",
                 if n == 1 { "" } else { "s" }
@@ -363,7 +376,7 @@ fn label(line: &ReportLine) -> String {
 
 /// `41.2s`, `1.03s`, `512ms`, `830µs`.
 #[allow(clippy::cast_precision_loss)]
-fn format_duration(ns: u64) -> String {
+pub fn format_duration(ns: u64) -> String {
     let secs = ns as f64 / 1e9;
     if secs >= 100.0 {
         format!("{secs:.0}s")

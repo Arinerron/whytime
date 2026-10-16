@@ -167,6 +167,12 @@ wire::wire! {
         /// With `EPF_FAULT`: the file mapped at the page fault the thread blocked in (`nr` is
         /// `NR_NONE`, `fd` -1); `mode` 0 means anonymous memory.
         pub fault: SysInfo,
+        /// User stack at the switch-out, in the `stacks` map (see [`TaskState::user_stack`]).
+        pub user_stack: i32,
+        /// Kernel stack at the switch-out (see [`TaskState::user_stack`]).
+        pub kernel_stack: i32,
+        /// `comm` of the thread itself (its name, which may differ from the process's).
+        pub comm: [u8; 16],
     }
 
     /// A tracked thread exited (`sched_process_exit`).
@@ -229,6 +235,26 @@ wire::wire! {
         pub pend_comm: [u8; 16],
         /// `comm` of the waker of the current block when it is outside the traced tree.
         pub waker_comm: [u8; 16],
+        /// User stack captured at the last voluntary switch-out when stack capture is on:
+        /// 0 = none captured, > 0 = stack id + 1 in the `stacks` map, < 0 = the negative errno
+        /// of `bpf_get_stackid` (`-EEXIST`: hash collision, `-ENOMEM`: map full, `-EFAULT`:
+        /// empty stack).
+        pub user_stack: i32,
+        /// Kernel stack captured at the same switch-out, encoded like `user_stack`.
+        pub kernel_stack: i32,
+    }
+
+    /// An on-CPU sample of a tracked thread (`perf_event` CPU-clock sampler, only when stack
+    /// capture is on).
+    pub struct SampleRecord {
+        /// The sampled thread; `ts` is the sample time.
+        pub hdr: EvHeader,
+        /// User stack, encoded like [`TaskState::user_stack`].
+        pub user_stack: i32,
+        /// Kernel stack (`-EFAULT`, empty, when the sample hit user mode).
+        pub kernel_stack: i32,
+        /// `comm` of the thread.
+        pub comm: [u8; 16],
     }
 }
 
@@ -243,6 +269,8 @@ wire::wire_consts! {
     pub const EV_EPISODE: u32 = 3;
     /// [`ExitRecord`].
     pub const EV_EXIT: u32 = 4;
+    /// [`SampleRecord`].
+    pub const EV_SAMPLE: u32 = 6;
 
     /// [`TaskState::state`]: on a CPU.
     pub const ST_RUNNING: u32 = 1;
@@ -289,8 +317,13 @@ wire::wire_consts! {
     pub const STAT_TASKS_FULL: u32 = 1;
     /// `stats` slot: processes that could not be added to the `tracked` map.
     pub const STAT_TRACKED_FULL: u32 = 2;
+    /// `stats` slot: stacks lost to a `stacks` hash-bucket collision (not records: the
+    /// record carries `-EEXIST` instead of the stack).
+    pub const STAT_STACK_COLLISION: u32 = 3;
+    /// `stats` slot: stacks lost because the `stacks` map was full (`-ENOMEM`).
+    pub const STAT_STACK_FULL: u32 = 4;
     /// Number of `stats` slots.
-    pub const STAT_NR: u32 = 3;
+    pub const STAT_NR: u32 = 5;
 
     /// Capacity of the `tasks` map (tracked threads alive at once).
     pub const TASKS_MAX: u32 = 32768;
@@ -298,6 +331,16 @@ wire::wire_consts! {
     pub const TRACKED_MAX: u32 = 16384;
     /// Size of the `events` ring buffer in bytes.
     pub const RINGBUF_BYTES: u32 = 4 << 20;
+    /// Frames kept per stack (`stacks` map value: this many `u64` addresses). Equal to the
+    /// default `kernel.perf_event_max_stack`, which bounds it: a lower sysctl makes the map
+    /// fail to create.
+    pub const STACK_DEPTH: u32 = 127;
+    /// Capacity of the `stacks` map when stack capture is on (distinct stacks; each entry
+    /// holds `STACK_DEPTH` addresses, ~16 MiB in all). Without capture it is created with
+    /// one entry.
+    pub const STACKS_MAX: u32 = 16384;
+    /// Sampling frequency (Hz) of the on-CPU stack sampler, per CPU.
+    pub const SAMPLE_HZ: u32 = 199;
 }
 
 /// The C header for the BPF program: every record, then [`CONSTS`].
@@ -314,6 +357,7 @@ pub fn header() -> wire::HeaderBuilder {
         .structs::<EpisodeRecord>()
         .structs::<ExitRecord>()
         .structs::<TaskState>()
+        .structs::<SampleRecord>()
         .consts(&CONSTS);
     header
 }

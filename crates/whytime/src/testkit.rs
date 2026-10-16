@@ -8,8 +8,9 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use whytime_abi::{
-    CpuSegment, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord, EvHeader, ExecRecord,
-    ExitRecord, ForkRecord, NR_NONE, SYSD_DESCRIBED, SysInfo, TaskState,
+    CpuSegment, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EV_SAMPLE, EpisodeRecord, EvHeader,
+    ExecRecord, ExitRecord, ForkRecord, NR_NONE, SYSD_DESCRIBED, SampleRecord, SysInfo,
+    TaskState,
 };
 use wire::Pod;
 
@@ -147,6 +148,15 @@ pub fn exit(
     r.start = u64::from(tgid);
     r.code = code;
     r.group_dead = u32::from(group_dead);
+    r
+}
+
+/// An on-CPU sample of thread `tid` of `tgid` at `ts` with stack references `stacks`
+/// (`[user, kernel]`, encoded as in `TaskState::user_stack`: id + 1).
+pub fn sample(ts: u64, tid: u32, tgid: u32, stacks: [i32; 2]) -> SampleRecord {
+    let mut r: SampleRecord = zeroed();
+    r.hdr = hdr(EV_SAMPLE, ts, tid, tgid);
+    [r.user_stack, r.kernel_stack] = stacks;
     r
 }
 

@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use procctx::{Config, ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable, StartClock};
 use whytime_abi::{
-    CpuSegment, EPF_FAULT, EPF_READY, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord,
-    EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE, ST_RUNNING, ST_WOKEN,
-    TaskState,
+    CpuSegment, EPF_FAULT, EPF_READY, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EV_SAMPLE,
+    EpisodeRecord, EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE,
+    ST_RUNNING, ST_WOKEN, SampleRecord, TaskState,
 };
 
 use crate::classify::{BlockInfo, Blocked, Classifier};
@@ -68,6 +68,30 @@ pub struct Block {
     pub waker_tgid: u32,
     /// `comm` of the waker when it is a process-context task outside the traced tree.
     pub waker_comm: Option<Arc<str>>,
+    /// Where the thread blocked (stack capture on).
+    pub stacks: StackIds,
+}
+
+/// The stacks of one moment of a thread, as references into the kernel's `stacks` map
+/// (encoded like `TaskState::user_stack`: 0 none, > 0 id + 1, < 0 `-errno`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StackIds {
+    /// User stack.
+    pub user: i32,
+    /// Kernel stack.
+    pub kernel: i32,
+    /// The process image the user stack's addresses belong to: the index into
+    /// [`Proc::comms`] current when it was taken (each exec adds an entry).
+    pub image: u32,
+}
+
+/// An on-CPU stack sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// Sample time.
+    pub ts: u64,
+    /// The stacks.
+    pub stacks: StackIds,
 }
 
 /// A half-open interval `[start, end)` of `CLOCK_MONOTONIC` nanoseconds on one thread.
@@ -94,6 +118,18 @@ pub struct Thread {
     pub death: Option<u64>,
     /// Segments in time order, non-overlapping.
     pub segs: Vec<Seg>,
+    /// On-CPU stack samples in arrival (time) order; empty without stack capture.
+    pub samples: Vec<Sample>,
+    /// Thread name (`comm`) history from episodes and samples: each holds from its time on.
+    pub names: Vec<(u64, Arc<str>)>,
+}
+
+impl Thread {
+    /// The thread's own name at `ts` (the earliest one known if none was seen by then).
+    pub fn name_at(&self, ts: u64) -> Option<&Arc<str>> {
+        let i = self.names.partition_point(|(from, _)| *from <= ts);
+        self.names.get(i.saturating_sub(1)).map(|(_, name)| name)
+    }
 }
 
 /// One process lifetime in the traced tree.
@@ -238,11 +274,18 @@ impl Trace {
             EV_EXEC => wire::from_bytes::<ExecRecord>(bytes).map(|r| self.on_exec(r)),
             EV_EPISODE => wire::from_bytes::<EpisodeRecord>(bytes).map(|r| self.on_episode(r)),
             EV_EXIT => wire::from_bytes::<ExitRecord>(bytes).map(|r| self.on_exit(r)),
+            EV_SAMPLE => wire::from_bytes::<SampleRecord>(bytes).map(|r| self.on_sample(r)),
             _ => None,
         });
         if applied.is_none() {
             self.malformed += 1;
         }
+    }
+
+    /// The live process `tgid`'s identity and current image (see [`StackIds::image`]).
+    pub fn current_image(&self, tgid: u32) -> Option<(ProcKey, u32)> {
+        let proc = &self.procs[*self.live_procs.get(&tgid)?];
+        Some((proc.key, u32::try_from(proc.comms.len() - 1).unwrap_or(u32::MAX)))
     }
 
     fn on_fork(&mut self, r: &ForkRecord) {
@@ -354,9 +397,53 @@ impl Trace {
             waker_tid: r.waker_tid,
             waker_tgid: r.waker_tgid,
             waker_comm,
+            stacks: self.stack_ids(proc, r.user_stack, r.kernel_stack),
         };
+        self.name(thread, block_ts, &r.comm);
         self.push_block(thread, block_ts, wake_ts, block);
         self.push(thread, wake_ts, run_ts, SegKind::Runq);
+    }
+
+    /// An on-CPU sample of a known thread (one whose records were seen: samples never
+    /// create threads, so stack capture cannot change the report).
+    fn on_sample(&mut self, r: &SampleRecord) {
+        let Some(&thread) = self.live_threads.get(&r.hdr.tid) else {
+            return;
+        };
+        let proc = self.threads[thread].proc;
+        let stacks = self.stack_ids(proc, r.user_stack, r.kernel_stack);
+        self.name(thread, r.hdr.ts, &r.comm);
+        let samples = &mut self.threads[thread].samples;
+        // Arrival order is time order; a straggler is put in its place.
+        let at = samples.partition_point(|s| s.ts <= r.hdr.ts);
+        samples.insert(
+            at,
+            Sample {
+                ts: r.hdr.ts,
+                stacks,
+            },
+        );
+    }
+
+    /// Stack references taken now in process `proc`, in its current image.
+    fn stack_ids(&self, proc: ProcId, user: i32, kernel: i32) -> StackIds {
+        StackIds {
+            user,
+            kernel,
+            image: u32::try_from(self.procs[proc].comms.len() - 1).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Notes that `thread` was named `raw` (a kernel `comm`) at `ts`.
+    fn name(&mut self, thread: ThreadId, ts: u64, raw: &[u8; 16]) {
+        let Some(name) = self.intern_comm(raw) else {
+            return;
+        };
+        let names = &mut self.threads[thread].names;
+        match names.last() {
+            Some((from, last)) if *from > ts || *last == name => {}
+            _ => names.push((ts, name)),
+        }
     }
 
     fn on_exit(&mut self, r: &ExitRecord) {
@@ -426,6 +513,7 @@ impl Trace {
                         waker_tid: state.waker_tid,
                         waker_tgid: state.waker_tgid,
                         waker_comm,
+                        stacks: self.stack_ids(proc, state.user_stack, state.kernel_stack),
                     };
                     self.push_block(thread, state.block_ts, wake, block);
                     self.push(thread, wake, end, SegKind::Runq);
@@ -466,6 +554,8 @@ impl Trace {
             proc,
             birth,
             death: None,
+            samples: Vec::new(),
+            names: Vec::new(),
             segs: Vec::new(),
         });
         self.procs[proc].threads.push(id);

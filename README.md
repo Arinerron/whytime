@@ -35,6 +35,8 @@ $ whytime -p 4242 --duration 10s   # ... or after 10 s
 $ whytime doctor                   # can it run here? exact fixes if not
 $ whytime --record ci.wt -- make   # also save a trace file...
 $ whytime report ci.wt [--json]    # ...and print the same report from it later, offline
+$ whytime --flamegraph out.svg -- make    # wall-clock flamegraph of the critical path
+$ whytime --folded out.folded -p 4242     # same stacks, folded format (µs), for other tools
 ```
 
 whytime exits with the command's exit code (125 if tracing could not start, 126/127 if the
@@ -45,6 +47,14 @@ what whytime read from `/proc` when it attached), so `whytime report` reproduces
 exactly, offline and without privileges (attach it to a bug report or a CI artifact). It
 exits 2 if the file is damaged or was recorded by a whytime with a different record layout.
 Under `sudo`, the file belongs to you.
+
+`--flamegraph FILE` (SVG) and `--folded FILE` draw the critical path with call stacks: the
+width is the wall time, the root frames are the report lines (`on-CPU (xz)`, `fsync on
+~/.cache`), then the process, then user frames and kernel frames (`_[k]`). On-CPU time comes
+from a 199 Hz sampler, blocked time from the stack where the thread blocked. They also work
+with `-p` and with `whytime report` on a trace recorded with either flag. User stacks
+unwind by frame pointers; stripped binaries show only exported symbols (`[libfoo.so]`
+otherwise); kernel frames need root (or `cap_syslog`). See [AGENTS.md](AGENTS.md#flamegraphs---flamegraph-file---folded-file).
 
 ## Attaching to a running process
 
@@ -120,10 +130,12 @@ MIT, see [LICENSE](LICENSE). The BPF object declares `Dual MIT/GPL` at load time
 kernel only grants GPL-only helpers to programs with a GPL-compatible license string (MIT
 code may be distributed under the GPL). The vendored libbpf headers in
 `crates/whytime-bpf/bpf/include/bpf/` keep their own license, `LGPL-2.1 OR BSD-2-Clause`.
+The SVG flamegraph renderer, [inferno](https://github.com/jonhoo/inferno), is CDDL-1.0
+(file-level copyleft; linked as a library from crates.io).
 
 ## Status: MVP
 
-Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, and trace
-files for both (`--record`, `whytime report`). Not yet: flamegraphs, hostnames for network
-peers (DNS correlation). The attribution model, its limits, and the developer guide are in
-[AGENTS.md](AGENTS.md).
+Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, trace files
+for both (`--record`, `whytime report`), and wall-clock flamegraphs. Not yet: hostnames for
+network peers (DNS correlation). The attribution model, its limits, and the developer guide
+are in [AGENTS.md](AGENTS.md).

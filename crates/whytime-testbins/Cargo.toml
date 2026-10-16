@@ -66,5 +66,9 @@ path = "src/bin/wt-fault.rs"
 name = "wt-fifo"
 path = "src/bin/wt-fifo.rs"
 
+[[bin]]
+name = "wt-flame"
+path = "src/bin/wt-flame.rs"
+
 [lints]
 workspace = true

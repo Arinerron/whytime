@@ -30,9 +30,11 @@ use procctx::{ProcFs, ProcKey, ProcSource as _, StartClock, StatLine};
 
 use crate::classify::Classifier;
 use crate::cli::RunArgs;
+use crate::flame::Outputs;
 use crate::record::{self, Header, Recorder};
 use crate::report::{self, Attached, EndedBy};
 use crate::snapshot::{self, Snapshot};
+use crate::stacks::Collector;
 use crate::sys::SyscallTable;
 use crate::timeline::{ProcSeed, Trace, proc_table};
 use crate::tracer::Tracer;
@@ -242,6 +244,10 @@ struct Session {
     signals: OwnedFd,
     trace: Trace,
     recorder: Option<Recorder>,
+    /// Stack capture, when on.
+    stacks: Option<Collector>,
+    /// `--flamegraph`/`--folded` files.
+    outputs: Outputs,
 }
 
 /// How the observation ended.
@@ -261,9 +267,11 @@ impl Session {
         let creds = crate::sudo_credentials()?;
         let home = crate::home_dir(creds.as_ref().map(|creds| creds.uid));
         let syscalls = SyscallTable::new();
-        let (mut tracer, probes) = crate::load(&syscalls)?;
+        let (mut tracer, probes) = crate::load(&syscalls, args.output.stacks())?;
         let ticks_per_sec = crate::ticks_per_sec()?;
         let recorder = crate::recorder(args, creds.as_ref())?;
+        let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
+        let stacks = tracer.take_stacks().map(Collector::new);
         // From here on, Ctrl-C ends the observation instead of killing whytime.
         let signals = take_signals().context("setting up signal handling")?;
 
@@ -305,6 +313,8 @@ impl Session {
             signals,
             trace,
             recorder,
+            stacks,
+            outputs,
         }))
     }
 
@@ -322,9 +332,11 @@ impl Session {
             header,
             mut trace,
             recorder,
+            mut stacks,
+            outputs,
             ..
         } = self;
-        let maps = crate::collect(tracer, &mut trace, recorder.as_ref());
+        let maps = crate::collect(tracer, &mut trace, recorder.as_ref(), stacks.as_mut());
         let (end, ended_by) = match (end, trace.window.exit) {
             // The target exited first; its record was still in flight.
             (End::Deadline(at) | End::Interrupt(at), Some(exit)) if exit <= at => {
@@ -336,6 +348,7 @@ impl Session {
         };
         let tasks = maps.tasks();
         trace.sweep(&tasks, end);
+        let symbols = crate::symbolize(stacks, &trace, &maps);
         let exit_code = trace
             .root
             .filter(|_| ended_by == EndedBy::Exit)
@@ -350,8 +363,9 @@ impl Session {
             dropped: maps.dropped(),
         };
         drop(maps);
-        crate::save(recorder.as_ref(), args, &tasks, &end);
-        crate::report(&trace, end.end, crate::meta(&header, &end), args.json);
+        crate::save(recorder.as_ref(), args, &tasks, symbols.as_ref(), &end);
+        outputs.write(&trace, end.end, &header.command, symbols.as_ref());
+        crate::report(&trace, end.end, crate::meta(&header, &end), args.output.json);
         0
     }
 
@@ -371,7 +385,9 @@ impl Session {
         loop {
             let trace = &mut self.trace;
             let recorder = self.recorder.as_ref();
-            self.tracer.drain(|record| crate::ingest(trace, recorder, record));
+            let stacks = &mut self.stacks;
+            self.tracer
+                .drain(|record| crate::ingest(trace, recorder, stacks.as_mut(), record));
             let now = monotonic_ns();
             if trace.window.exit.is_some() {
                 return Ok(End::Exit(now));
