@@ -113,7 +113,8 @@ pub struct Attribution {
     /// The critical path in time order: each span starts where the previous one ends, from
     /// the window's start to its end. Adjacent stretches with equal fields are one span.
     /// Within a mixed segment, whose on-CPU and preempted time interleave in unknown order,
-    /// the on-CPU part comes first.
+    /// the on-CPU part comes first. Empty when the root process has no thread at all (its
+    /// records lost, or a damaged trace file): then the one line is `untraced`.
     pub spans: Vec<Span>,
 }
 
@@ -126,6 +127,23 @@ impl Attribution {
 
 /// Attributes `[start, end)` of the root process `root`.
 pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attribution {
+    if trace.procs[root].threads.is_empty() {
+        // Every record of the command lost, or a damaged trace: no thread to walk or to name
+        // a span after, so the whole window is one `untraced` line and there are no spans.
+        let untraced = Line {
+            class: Class::Other,
+            subject: "untraced".to_owned(),
+            ns: end - start,
+            connections: None,
+            addr: None,
+            held_by: Vec::new(),
+        };
+        let lines = (end > start).then_some(untraced).into_iter().collect();
+        return Attribution {
+            lines,
+            spans: Vec::new(),
+        };
+    }
     let mut walker = Walker {
         trace,
         root,
@@ -831,7 +849,7 @@ mod tests {
     use super::*;
     use crate::classify::Blocked;
     use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
-    use crate::timeline::{Image, Proc, StackIds, Thread};
+    use crate::timeline::{Image, Proc, ProcSeed, StackIds, Thread};
 
     /// A program `comm` with arguments `argv` (space-separated; none when empty), exec'd at
     /// `from`.
@@ -1139,6 +1157,27 @@ mod tests {
         assert_eq!(tiled(&a, 0, end), [(Class::Cpu, "app", end)]);
         let walked: Vec<ThreadId> = a.spans.iter().map(|span| span.thread).collect();
         assert_eq!(walked, chain);
+    }
+
+    #[test]
+    fn a_root_without_a_thread_is_untraced() {
+        // A damaged trace file: the attach target's seed lists no thread, and no record adds
+        // one.
+        let mut t = trace(100);
+        let seed = ProcSeed {
+            key: ProcKey { pid: 100, start: 1 },
+            ppid: 1,
+            comm: "app".to_owned(),
+            argv: b"app\0".to_vec(),
+            birth: 1_000,
+            threads: Vec::new(),
+        };
+        t.seed(&[seed], 1_000);
+
+        let a = attribute(&t, t.root.unwrap(), 1_000, 3_000);
+        assert!(a.spans.is_empty());
+        let lines: Vec<_> = a.lines.iter().map(|l| (l.class, l.subject.as_str(), l.ns)).collect();
+        assert_eq!(lines, [(Class::Other, "untraced", 2_000)]);
     }
 
     #[test]
