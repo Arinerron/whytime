@@ -288,7 +288,7 @@ bytes of ring/trace per sample, 40 in memory.
 
 **Generations** (`Collector` in `stacks.rs`): the kernel never frees stack map entries, and
 a map without chaining loses a growing share of new stacks as it fills (one 16384-bucket
-map lost 66 stacks in 16 s of `xz -T4`, 218 in 55 s). So the two maps alternate. Every
+map lost 66 stacks in 16 s of `xz -T4`, 291 in 77 s). So the two maps alternate. Every
 second (`FLIP_NS`), or 10 ms after the last flip once the current generation has read a
 quarter of a map's capacity in distinct ids, the event loop flips:
 
@@ -307,8 +307,8 @@ A failed barrier skips the emptying (stale entries only cause collisions: ids ar
 addressed and never overwritten); a gen-g id is read from its map only while that slot still
 holds g. Kept and copied stacks are keyed by `StackKey` (`Map {generation, id}` or
 `Inline {tid, at, kernel}`). The loop wakes for due flips even when the ring is quiet, so a
-thread blocked across flips is always kept. 55 s of `xz -T4`: 55 flips emptied 7858
-entries, 113 stacks kept across flips, 42 copied, 0 lost.
+thread blocked across flips is always kept. 76 s of `xz -T4`: 76 flips emptied 11230
+entries, 161 stacks kept across flips, 113 copied, 0 lost.
 
 Maps: `events` RINGBUF 4 MiB; `tasks` HASH tid → `task_state` (32768); `task_zero` ARRAY of
 one zeroed `task_state`, the template `new_task()` copies (task_state exceeds the 512-byte BPF
@@ -589,7 +589,7 @@ Limits (state them with flamegraphs):
   sample within 5 ms, which may be from a neighbouring stretch.
 - `kernel.perf_event_max_stack` must be at least 127, the maps' depth (else
   `--flamegraph`/`--folded` exit 125 with the fix; plain runs do not care).
-- Stack copies cost a 1 KB ring record each; generations keep them rare (42 in 55 s of
+- Stack copies cost a 1 KB ring record each; generations keep them rare (113 in 76 s of
   `xz -T4`), but a flood of distinct stacks within one generation (thousands of short-lived
   processes) copies more, and a full ring loses records (`quality.dropped`) and stacks.
 - A process that exits before its records are processed (µs to ms) cannot be normalized past
