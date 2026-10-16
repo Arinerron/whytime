@@ -110,7 +110,8 @@ crates/whytime/            the binary
   src/cli.rs               clap derive CLI, --duration parser
   src/tracer.rs            aya loader: load, attach (required + optional sets), maps, detach
   src/percpu.rs            vmlinux BTF reader: __preempt_count's distance from runqueues
-  src/spawn.rs             fork, park-on-pipe, priv drop, exec with error pipe, pidfd
+  src/spawn.rs             fork, park-on-pipe, priv drop, exec with error pipe, pidfd;
+                           create_as: output files opened by a child running as the user
   src/timeline.rs          records → per-thread segments, procctx table, final sweep
   src/classify.rs          (syscall, fd, kernel path, ready fd, fault, waker) → class + subject;
                            FdTarget: /proc fd link and maps fallback; peers named via dns.rs
@@ -130,7 +131,8 @@ crates/whytime/            the binary
   src/testkit.rs           #[cfg(test)] synthetic records and traces for unit tests
   src/doctor.rs            bpfdoctor Tool, probe.sched / syscalls / dns / readiness / faults /
                            stacks, kernel.kallsyms checks
-  src/logger.rs            tiny stderr logger (WHYTIME_LOG)
+  src/logger.rs            tiny stderr logger (WHYTIME_LOG); stderr! (eprintln! that ignores
+                           write errors), used for every stderr write
   tests/fixtures.rs        replay fixtures: each recorded trace must still replay to its
                            expected report (and folded / Perfetto output)
   tests/fixtures/          NAME.wt + NAME.report.json [+ NAME.folded, NAME.perfetto.json]
@@ -221,17 +223,26 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
    below 127 is checked first, EINVAL), the plain object is loaded to finish the probe, then
    whytime prints the `probe.stacks` diagnosis (observed, impact, fix) and exits 125 before
    running COMMAND, without creating the output files. With `--record`, create the trace
-   file now, and the flamegraph files too (before COMMAND runs, so a bad path fails fast
-   with 125; under sudo they are `fchown`ed to the user).
+   file now, and the `--perfetto`, `--flamegraph` and `--folded` files too
+   (`main.rs::OutputFiles`; before COMMAND runs, so a bad path fails fast with 125). Under
+   sudo the invoking user creates them (`spawn::create_as`: a forked child drops to the
+   user, opens the file and passes the descriptor back over `SCM_RIGHTS`), so the user's
+   permissions apply (a symlink to a file only root may write is refused) and a new file
+   is theirs; whytime never opens an output as root.
 3. Under sudo (`euid 0` + `SUDO_UID`/`SUDO_GID`), compute the invoking user's credentials
    and groups, and restore `HOME`/`USER`/`LOGNAME` to that user.
 4. Ignore SIGINT/SIGQUIT (the TTY delivers them to COMMAND's process group, which whytime
    shares; whytime must survive to report). Route SIGTERM/SIGHUP to a signalfd; they are
-   forwarded to COMMAND with `pidfd_send_signal`.
+   forwarded to COMMAND with `pidfd_send_signal`. A signal whytime inherited ignored
+   (`nohup`, a non-interactive shell's background job) stays ignored by both: an ignored
+   SIGTERM/SIGHUP is not routed, and COMMAND gets SIGINT/SIGQUIT back as inherited.
 5. `fork`; the child blocks reading a CLOEXEC "go" pipe. The parent inserts the child's tgid
-   into `tracked`, then writes "go". The child drops to the invoking user, resets signal
-   dispositions and mask, and `execvp`s. A second CLOEXEC pipe returns `(stage, errno)` on
-   failure: exec ENOENT → 127, other exec errors → 126, privilege drop failure → 125.
+   into `tracked`, then writes "go". The child drops to the invoking user, restores
+   SIGINT/SIGQUIT as inherited and SIGPIPE to default (Rust's runtime ignores it before
+   `main`), clears the mask, and `execvp`s. A second CLOEXEC pipe returns `(stage, errno)`
+   on failure: exec ENOENT → 127, other exec errors → 126, privilege drop failure → 125.
+   whytime changes no rlimit (BPF memory is charged to memcg on every supported kernel),
+   so COMMAND keeps the caller's `RLIMIT_MEMLOCK`.
 6. The window starts at the child's `sched_process_exec` record (the root's first task
    entry is created there) and ends at the root thread group's exit record (or
    `--duration` after the start). The loop polls ring buffer, pidfd and signalfd with epoll;
@@ -244,11 +255,12 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
    symbolize (`Collector::finish`). With `--record`, write the stack frames, the sweep and
    the end frame. Attribute, report, return COMMAND's code (with `--duration`, keep
    forwarding signals until it exits). The report step is one function for all three paths
-   (`main.rs::report(trace, end, meta, &OutputArgs, flame, symbols)`): attribute once, write
-   the `--perfetto` file and the `--flamegraph`/`--folded` files (`flame::Outputs`, created
+   (`main.rs::report(trace, end, meta, &OutputArgs, files, symbols)`): attribute once, write
+   the `--perfetto` file and the `--flamegraph`/`--folded` files (`OutputFiles`, created
    before the run like the trace file) if asked (a failure is printed first: the report
    stays last on stderr), then the report, human or `--json`, with the `--timeline` slices
-   if asked.
+   if asked. Every stderr write goes through `logger::stderr!`, which ignores write errors:
+   a closed stderr (EPIPE) neither aborts whytime nor changes its exit code.
 
 Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 
@@ -258,9 +270,12 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
    descends from init: a whole-system trace with init's event loop as the critical path).
    Without root, the target's real/effective/saved uid and gid must all be the invoking
    user's (the ptrace rule; file capabilities must not let users watch each other), unless
-   whytime has `CAP_SYS_PTRACE`. Then `pidfd_open` the target.
-2. Preflight and load as in wrap mode (exit 125 on failure); with `--record`, create the
-   trace file. Block SIGINT/SIGTERM/SIGHUP into a signalfd: from here on they end the
+   whytime has `CAP_SYS_PTRACE`. The pidfd is opened before these checks read `/proc/PID`,
+   and `pidfd_send_signal(pidfd, 0)` then confirms the held process is not reaped (so the
+   pid was not recycled in between and the checks saw it); `track_tree`'s scan gets the
+   same confirmation before seeding.
+2. Preflight and load as in wrap mode (exit 125 on failure); create the output files as in
+   wrap mode. Block SIGINT/SIGTERM/SIGHUP into a signalfd: from here on they end the
    observation; the target is never signalled.
 3. **Membership** (`track_tree`): scan `/proc/*/stat`, walk parent links from the target
    (skipping whytime), insert each live process into `tracked` with `BPF_NOEXIST`; repeat
@@ -662,8 +677,8 @@ code stays COMMAND's (attach: 0; `report`: 2).
 
 Chrome Trace Event JSON (`{"displayTimeUnit":"ms","traceEvents":[…]}`), written after the
 window from the same `Trace` and `Attribution` as the report (so `report FILE --perfetto`
-writes the identical file), created like the trace file (`main.rs::create_owned`: truncated,
-`fchown`ed to `SUDO_UID`/`SUDO_GID` under sudo):
+writes the identical file), into the file created before the window like the trace file
+(`main.rs::OutputFiles`, by the invoking user under sudo):
 
 - `critical path`: a synthetic process and thread, pid = tid = 4194304 (`PID_MAX_LIMIT`,
   never a real id; `process_sort_index` −1), one `X` slice per span: name `class subject`,
@@ -827,8 +842,8 @@ Rules that keep replay exact:
   changes and old files are refused with both hashes named (re-record them).
 - Files are rejected, never half-replayed: preamble, frame structure and every payload are
   checked before the first record is ingested. Exit 2 with `FILE: <reason>`.
-- Under sudo the file is created by root and then `fchown`ed to the invoking user (regular
-  files only: never `--record /dev/null`'s owner).
+- Under sudo the invoking user creates the file (`spawn::create_as`), never root: their
+  permissions decide where whytime may write, and a new file is theirs (no `chown`).
 
 ## Unit tests
 
@@ -851,18 +866,20 @@ untraced time, thread names, one id meaning different stacks in two generations,
 kernel copies found by thread and capture time, a copy that never came) and check the folded
 writer's rounding. `svg.rs` tests check the layout (root widths sum to the drawing width,
 children contiguous within their parent, siblings by name, repeats merged), elision under
-0.1 px, escaping of `<`, `&`, quotes (with a small well-formedness checker), label
-truncation, root colors and byte-identical output. `snapshot.rs` tests read this process's
-own `/proc` (threads blocked on a socket, a pipe and an eventfd). `dns.rs` tests build DNS
+0.1 px, escaping of `<`, `&`, quotes and U+FFFD for characters XML forbids (with a small
+well-formedness checker), label truncation, root colors and byte-identical output.
+`snapshot.rs` tests read this process's own `/proc` (threads blocked on a socket, a pipe and
+an eventfd). `dns.rs` tests build DNS
 messages (CNAME chains, compression pointers, errors) and varlink JSON and feed every
 truncation and single-byte corruption of them to the parsers (no panic; complete records
 kept). `timeline.rs` checks that `net` lines take the resolved name (per socket, with `addr`
 and per-socket connection counts) and that holders reach segments (idle CPUs merged, the
 sweep's pending holder). `attribute.rs` also tests process naming (`tell_apart`: suffix
 length, elision, cut and unknown arguments, the variant cap) and runqueue `held_by` from
-records carrying holders; `report.rs` the timeline slicing and rendering and the `mostly
-HOLDER` threshold; `perfetto.rs` writes a testkit trace and checks the JSON (disjoint slices
-per track, the critical path summing to the window, names, instants, holders).
+records carrying holders; `report.rs` the timeline slicing and rendering, the `mostly
+HOLDER` threshold and escaped control characters; `perfetto.rs` writes a testkit trace and
+checks the JSON (disjoint slices per track, the critical path summing to the window, names,
+instants, holders).
 
 **Replay fixtures** (`crates/whytime/tests/fixtures.rs`, run by `cargo test --workspace`, so
 by CI; no root, x86_64 only: the traces carry x86_64 syscall numbers): real traces of the
@@ -1138,6 +1155,20 @@ Flamegraph scenarios (files in `$WORK/flame`, cleared per run):
     test-only, at most `STACKS_MAX`) → ≥ 1 stack copied into a STACK record (`N stacks
     copied into STACK records`), no `[stack lost]`, same line checks
 
+Runtime behaviour around the run (xtask first makes `$WORK/root-owned`, 0644 root, holding
+`root`, and the user's symlink `$WORK/root-link` to it):
+
+39. `output-as-user`: `sudo whytime --record LINK -- true`, then `--perfetto LINK -- true`,
+    then `--perfetto $WORK/no-such-dir/t.json -- sh -c 'echo COMMAND RAN'` → each exits 125
+    (two "Permission denied", one "No such file or directory"), COMMAND never ran, and
+    `root-owned` still holds `root`, uid 0, mode 0644
+40. `closed-stderr`: as root, `{ whytime -- sh -c 'sleep 0.2; exit 3'; whytime report
+    F; } 2>&1 | true` (F: scenario 18's trace; `true` has exited, so every stderr write is
+    EPIPE) → wrap exits 3, `report` 2 (no abort, 134)
+41. `inherited`: `sh` as root runs `trap '' INT HUP; ulimit -S -l 64` and execs `whytime
+    --json -- sh -c 'kill -INT $$; kill -HUP $$; ulimit -S -l'` → COMMAND survives both
+    signals (exit 0) and prints `64`
+
 ## Gotchas
 
 - clang folds `if (!p && !n)` on two map-value pointers into `p | n`; the verifier rejects
@@ -1210,9 +1241,15 @@ Flamegraph scenarios (files in `$WORK/flame`, cleared per run):
   cargo without the musl target; the guest root is read-only virtiofs, so put
   `WHYTIME_E2E_DIR` on a mounted ext4 image (`/dev/vda`). vng returns the guest's exit code.
 - Report options live in `cli::OutputArgs`, flattened into `RunArgs` and `Sub::Report`, and
-  reach `main.rs::report` as one `&OutputArgs` (`--flamegraph`/`--folded` too, with their
-  pre-created `flame::Outputs` and the run's `Symbols`): an option that changes the output goes there,
-  so wrap, attach and replay all take it (and clap keeps it out of COMMAND's words).
+  reach `main.rs::report` as one `&OutputArgs` (the files they name too, pre-created as
+  `OutputFiles`, and the run's `Symbols`): an option that changes the output goes there,
+  so wrap, attach and replay all take it (and clap keeps it out of COMMAND's words). An
+  option before COMMAND that clap does not know is an error, not COMMAND (no
+  `allow_hyphen_values`): a command starting with `-` needs `--`.
+- The human report escapes control characters in subjects and notes (`report::visible`,
+  `\x1b`): comms, paths, arguments and peer names come from the traced processes or a
+  received trace file and must not reach the terminal as escape sequences. The SVG
+  escaper replaces characters XML forbids with U+FFFD; folded frames map them to spaces.
 - Spans name process **images**, not processes: a fork's first image is a copy of its
   parent's current one (`exec: false`, same comm, same `argv` `Arc`), so a child before its
   exec carries the parent's comm and arguments, and naming groups it with the parent.

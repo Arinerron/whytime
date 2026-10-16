@@ -30,7 +30,7 @@ use procctx::{ProcFs, ProcKey, ProcSource as _, StartClock, StatLine};
 
 use crate::classify::Classifier;
 use crate::cli::RunArgs;
-use crate::flame::Outputs;
+use crate::logger::stderr;
 use crate::record::{self, Header, Recorder};
 use crate::report::{self, Attached, EndedBy};
 use crate::snapshot::{self, Snapshot};
@@ -38,7 +38,7 @@ use crate::stacks::Collector;
 use crate::sys::SyscallTable;
 use crate::timeline::{ProcSeed, Trace, proc_table};
 use crate::tracer::Tracer;
-use crate::{EXIT_SETUP, Epoll, monotonic_ns};
+use crate::{EXIT_SETUP, Epoll, OutputFiles, monotonic_ns};
 
 /// PID cannot be attached to: it does not exist, is a thread, whytime itself, ...
 const EXIT_ATTACH: i32 = 1;
@@ -63,7 +63,7 @@ pub fn run(pid: u32, args: &RunArgs) -> i32 {
     match Session::start(target, args) {
         Ok(Some(session)) => session.finish(args),
         Ok(None) => {
-            eprintln!("whytime: process {pid} exited while whytime attached to it");
+            stderr!("whytime: process {pid} exited while whytime attached to it");
             EXIT_ATTACH
         }
         Err(err) => crate::start_failed(&err, &tool),
@@ -92,9 +92,9 @@ impl Refusal {
 
     /// Prints it like a doctor diagnosis.
     fn print(&self) {
-        eprintln!("whytime: {}", self.why);
+        stderr!("whytime: {}", self.why);
         if let Some(fix) = &self.fix {
-            eprintln!("      fix:    {fix}");
+            stderr!("      fix:    {fix}");
         }
     }
 }
@@ -116,6 +116,10 @@ impl Target {
     /// invoking user (all of real, effective and saved uid and gid), as for ptrace, unless
     /// whytime has `CAP_SYS_PTRACE`: file capabilities must not let users observe each
     /// other's processes.
+    ///
+    /// The pidfd is opened before the checks read `/proc/PID`, and the process it holds is
+    /// confirmed alive after them ([`alive`]): so the pid cannot have been recycled in
+    /// between, and the process checked is the one held.
     fn open(pid: u32) -> Result<Self, Refusal> {
         if pid == std::process::id() {
             return Err(Refusal::new(format!("pid {pid} is whytime itself")));
@@ -127,11 +131,11 @@ impl Target {
             )
             .fix("whytime -p \"$(systemctl show -p MainPID --value UNIT)\""));
         }
+        let pidfd = pidfd_open(pid);
+        let gone = || Refusal::new(format!("no process {pid}"));
         let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
             Ok(status) => status,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(Refusal::new(format!("no process {pid}")));
-            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(gone()),
             Err(err) => return Err(Refusal::new(format!("reading /proc/{pid}/status: {err}"))),
         };
         let field = |name: &str| {
@@ -173,17 +177,21 @@ impl Target {
             .ok()
             .and_then(|line| StatLine::parse(pid, &line).ok());
         let Some(stat) = stat else {
-            return Err(Refusal::new(format!("no process {pid}")));
+            return Err(gone());
         };
         if snapshot::exited(&stat) {
             return Err(Refusal::new(format!(
                 "process {pid} has already exited (a zombie waiting for its parent)"
             )));
         }
-        let pidfd = pidfd_open(pid).map_err(|err| match err.raw_os_error() {
-            Some(libc::ESRCH) => Refusal::new(format!("no process {pid}")),
+        // Last, so a thread id (EINVAL) or a zombie gets its own refusal first.
+        let pidfd = pidfd.map_err(|err| match err.raw_os_error() {
+            Some(libc::ESRCH) => gone(),
             _ => Refusal::new(format!("pidfd_open({pid}): {err}")),
         })?;
+        if !alive(&pidfd) {
+            return Err(gone());
+        }
         Ok(Self { pid, pidfd })
     }
 }
@@ -208,6 +216,22 @@ fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let raw = RawFd::try_from(raw).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     // SAFETY: `raw` is a fresh descriptor we own.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Whether the process `pidfd` holds is not yet reaped (a zombie counts), so it still owns
+/// its pid and `/proc/PID` is that process. Signal 0 only checks; EPERM means it exists.
+fn alive(pidfd: &OwnedFd) -> bool {
+    // SAFETY: pidfd_send_signal on our own pidfd with signal 0 and no siginfo.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// A process of the target's tree that attach added to `tracked`.
@@ -246,8 +270,8 @@ struct Session {
     recorder: Option<Recorder>,
     /// Stack capture, when on.
     stacks: Option<Collector>,
-    /// `--flamegraph`/`--folded` files.
-    outputs: Outputs,
+    /// `--perfetto`, `--flamegraph` and `--folded` files.
+    outputs: OutputFiles,
 }
 
 /// How the observation ended.
@@ -270,7 +294,7 @@ impl Session {
         let (mut tracer, probes) = crate::load(&syscalls, args.output.stacks())?;
         let ticks_per_sec = crate::ticks_per_sec()?;
         let recorder = crate::recorder(args, creds.as_ref())?;
-        let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
+        let outputs = OutputFiles::create(&args.output, creds.as_ref())?;
         let stacks = tracer
             .take_stacks()
             .map(|maps| Collector::new(maps, monotonic_ns()));
@@ -278,6 +302,11 @@ impl Session {
         let signals = take_signals().context("setting up signal handling")?;
 
         let members = track_tree(&mut tracer, target.pid)?;
+        // The scan walked /proc from the bare pid: it was the target's only if the target
+        // still holds it.
+        if !alive(&target.pidfd) {
+            return Ok(None);
+        }
         let mut snapshot = Snapshot::new(&syscalls);
         let clock = StartClock::BootNs { ticks_per_sec };
         let seeds = seed_threads(&mut tracer, members, &mut snapshot, clock)?;
@@ -325,7 +354,7 @@ impl Session {
         let end = match self.observe(args.duration) {
             Ok(end) => end,
             Err(err) => {
-                eprintln!("whytime: tracing failed: {err:#}");
+                stderr!("whytime: tracing failed: {err:#}");
                 return EXIT_SETUP;
             }
         };

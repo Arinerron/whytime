@@ -185,6 +185,18 @@ fn test_e2e() -> anyhow::Result<()> {
     std::fs::create_dir_all(&flame).with_context(|| format!("creating {}", flame.display()))?;
     let in_flame = |name: &str| flame.join(name);
     let path = |name: &str| in_flame(name).display().to_string();
+    // A root-owned file the user may read but not write, and the user's symlink to it.
+    let root_file = work.join("root-owned");
+    let root_link = work.join("root-link");
+    let made = run(Command::new("sudo")
+        .args(["-n", "sh", "-c", "printf root > \"$1\" && chmod 644 \"$1\"", "sh"])
+        .arg(&root_file))?;
+    ensure!(made.status.success(), "creating {} as root failed", root_file.display());
+    let _ = std::fs::remove_file(&root_link);
+    std::os::unix::fs::symlink(&root_file, &root_link)
+        .with_context(|| format!("linking {}", root_link.display()))?;
+    let no_dir = work.join("no-such-dir");
+    let _ = std::fs::remove_dir_all(&no_dir);
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -545,6 +557,69 @@ fn test_e2e() -> anyhow::Result<()> {
                 let folded = in_flame("copy.folded");
                 move |out: &Output| check_flame_flip(out, &folded, Need::Copied)
             }),
+        ),
+        (
+            // Under sudo, output files are created as the invoking user: a symlink to a file
+            // only root may write is refused (it used to be truncated and handed to the
+            // user), and --perfetto into a missing directory fails before COMMAND runs.
+            "output-as-user",
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args([
+                    "-c",
+                    "sudo -n \"$0\" --record \"$1\" -- true; echo \"record $?\"\n\
+                     sudo -n \"$0\" --perfetto \"$1\" -- true; echo \"perfetto $?\"\n\
+                     sudo -n \"$0\" --perfetto \"$2\" -- sh -c 'echo COMMAND RAN'\n\
+                     echo \"missing $?\"",
+                ])
+                .arg(whytime)
+                .arg(&root_link)
+                .arg(no_dir.join("t.json"));
+                cmd
+            },
+            Box::new({
+                let root_file = root_file.clone();
+                move |out: &Output| check_output_as_user(out, &root_file)
+            }),
+        ),
+        (
+            // A closed stderr (EPIPE) must not abort whytime: wrap mode still exits with
+            // COMMAND's code, `report` with 2 (the report was not written).
+            "closed-stderr",
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.args([
+                    "-n",
+                    "sh",
+                    "-c",
+                    "exec 3>&1\n\
+                     { \"$0\" -- sh -c 'sleep 0.2; exit 3'; echo \"wrap $?\" >&3\n\
+                     sleep 0.1; \"$0\" report \"$1\"; echo \"report $?\" >&3\n\
+                     } 2>&1 | true",
+                ])
+                .arg(whytime)
+                .arg(&trace_file);
+                cmd
+            },
+            Box::new(check_closed_stderr),
+        ),
+        (
+            // What the shell left ignored stays ignored for COMMAND (nohup, background jobs),
+            // and COMMAND keeps the shell's RLIMIT_MEMLOCK.
+            "inherited",
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.args([
+                    "-n",
+                    "sh",
+                    "-c",
+                    "trap '' INT HUP; ulimit -S -l 64\n\
+                     exec \"$0\" --json -- sh -c 'kill -INT $$; kill -HUP $$; ulimit -S -l'",
+                ])
+                .arg(whytime);
+                cmd
+            },
+            Box::new(check_inherited),
         ),
     ];
 
@@ -2167,4 +2242,52 @@ fn check_attach_flame(out: &Output, folded_path: &Path) -> anyhow::Result<String
         burn / total * 100.0,
         total / 1e6
     ))
+}
+
+/// `output-as-user`: both outputs aimed at the symlink are refused with 125 and the root
+/// file is untouched; the Perfetto file in a missing directory stops whytime before COMMAND.
+fn check_output_as_user(out: &Output, root_file: &Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    exited(out, 0)?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    ensure!(
+        stdout == "record 125\nperfetto 125\nmissing 125\n",
+        "stdout {stdout:?}, want each run refused with 125 and COMMAND not run"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let denied = stderr.matches("Permission denied").count();
+    ensure!(denied == 2, "{denied} \"Permission denied\" on stderr, want 2");
+    ensure!(stderr.contains("No such file or directory"), "no ENOENT for the missing directory");
+    let content = std::fs::read(root_file)?;
+    let meta = std::fs::metadata(root_file)?;
+    ensure!(
+        content == b"root" && meta.uid() == 0 && meta.mode() & 0o777 == 0o644,
+        "{} changed: {:?}, uid {}, mode {:o}",
+        root_file.display(),
+        String::from_utf8_lossy(&content),
+        meta.uid(),
+        meta.mode() & 0o777
+    );
+    Ok("symlinked root file refused for --record and --perfetto, untouched; bad --perfetto path \
+        refused before COMMAND"
+        .to_owned())
+}
+
+/// `closed-stderr`: no abort (134) when whytime's stderr is a pipe nobody reads.
+fn check_closed_stderr(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    ensure!(stdout == "wrap 3\nreport 2\n", "stdout {stdout:?}, want \"wrap 3\\nreport 2\\n\"");
+    Ok("wrap exits 3 (COMMAND's), report 2".to_owned())
+}
+
+/// `inherited`: COMMAND survived its own SIGINT and SIGHUP and saw the 64 KiB memlock limit.
+fn check_inherited(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    ensure!(report["exit_code"] == 0, "exit_code {}", report["exit_code"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    ensure!(stdout == "64\n", "COMMAND printed {stdout:?}, want its shell's memlock limit 64");
+    Ok("SIGINT/SIGHUP stayed ignored, RLIMIT_MEMLOCK 64 KiB kept".to_owned())
 }

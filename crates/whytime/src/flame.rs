@@ -27,7 +27,6 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
-use anyhow::Context as _;
 use procctx::ProcKey;
 use whytime_abi::SAMPLE_HZ;
 
@@ -35,6 +34,7 @@ use crate::attribute::{Attribution, Span};
 use crate::classify::Class;
 use crate::cli::OutputArgs;
 use crate::report::{format_duration, line_label};
+use crate::spawn::Credentials;
 use crate::stacks::{StackKey, Symbols, UserKey};
 use crate::svg;
 use crate::timeline::{Sample, Seg, SegKind, StackIds, Thread, Trace};
@@ -44,7 +44,7 @@ use crate::timeline::{Sample, Seg, SegKind, StackIds, Thread, Trace};
 const NEAREST_NS: u64 = 1_000_000_000 / SAMPLE_HZ as u64;
 
 /// The files `--flamegraph` and `--folded` name: created before the run, so a bad path fails
-/// fast (and under sudo they belong to the invoking user), written when the window ends.
+/// fast (and under sudo the invoking user creates them), written when the window ends.
 #[derive(Debug, Default)]
 pub struct Outputs {
     svg: Option<(PathBuf, File)>,
@@ -52,20 +52,11 @@ pub struct Outputs {
 }
 
 impl Outputs {
-    /// Creates (truncates) the files `output` names, handing regular files to `owner`.
-    pub fn create(output: &OutputArgs, owner: Option<(u32, u32)>) -> anyhow::Result<Self> {
-        let create = |path: &Option<PathBuf>| {
-            path.as_ref()
-                .map(|path| {
-                    crate::create_owned(path, owner)
-                        .map(|file| (path.clone(), file))
-                        .with_context(|| format!("creating {}", path.display()))
-                })
-                .transpose()
-        };
+    /// Creates (truncates) the files `output` names, as `user` under sudo.
+    pub fn create(output: &OutputArgs, user: Option<&Credentials>) -> anyhow::Result<Self> {
         Ok(Self {
-            svg: create(&output.flamegraph)?,
-            folded: create(&output.folded)?,
+            svg: crate::create_output(output.flamegraph.as_deref(), user)?,
+            folded: crate::create_output(output.folded.as_deref(), user)?,
         })
     }
 
