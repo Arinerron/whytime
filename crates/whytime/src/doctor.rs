@@ -6,7 +6,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use bpfdoctor::{Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name};
+use bpfdoctor::{
+    Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name,
+};
 
 use crate::sys::SyscallTable;
 use crate::tracer::{self, SCHED, SYSCALLS, Tracer};
@@ -75,37 +77,38 @@ struct Outcome {
 
 impl Probe {
     fn get(&self) -> &Outcome {
-        self.outcome.get_or_init(|| match Tracer::load(&SyscallTable::new()) {
-            Ok(loaded) => {
-                let sizes = loaded.tracer.program_sizes();
-                let insns = |names: &[(&str, &str)]| -> u32 {
-                    sizes
-                        .iter()
-                        .filter(|(name, _)| names.iter().any(|(prog, _)| prog == name))
-                        .map(|(_, n)| n)
-                        .sum()
-                };
-                let sched = format!(
-                    "{} tp_btf programs loaded and attached ({} verified insns)",
-                    SCHED.len(),
-                    insns(&SCHED)
-                );
-                let syscalls = loaded.syscalls.map(|()| {
-                    format!(
-                        "tp_btf/sys_enter and sys_exit loaded and attached ({} verified insns)",
-                        insns(&SYSCALLS)
-                    )
-                });
-                Outcome {
-                    sched: Ok(sched),
-                    syscalls: Some(syscalls),
+        self.outcome
+            .get_or_init(|| match Tracer::load(&SyscallTable::new()) {
+                Ok(loaded) => {
+                    let sizes = loaded.tracer.program_sizes();
+                    let insns = |names: &[(&str, &str)]| -> u32 {
+                        sizes
+                            .iter()
+                            .filter(|(name, _)| names.iter().any(|(prog, _)| prog == name))
+                            .map(|(_, n)| n)
+                            .sum()
+                    };
+                    let sched = format!(
+                        "{} tp_btf programs loaded and attached ({} verified insns)",
+                        SCHED.len(),
+                        insns(&SCHED)
+                    );
+                    let syscalls = loaded.syscalls.map(|()| {
+                        format!(
+                            "tp_btf/sys_enter and sys_exit loaded and attached ({} verified insns)",
+                            insns(&SYSCALLS)
+                        )
+                    });
+                    Outcome {
+                        sched: Ok(sched),
+                        syscalls: Some(syscalls),
+                    }
                 }
-            }
-            Err(err) => Outcome {
-                sched: Err(err),
-                syscalls: None,
-            },
-        })
+                Err(err) => Outcome {
+                    sched: Err(err),
+                    syscalls: None,
+                },
+            })
     }
 }
 
@@ -118,7 +121,7 @@ pub fn describe(err: &anyhow::Error) -> String {
             errno_name(errno).unwrap_or("errno"),
             io::Error::from_raw_os_error(errno)
         ),
-        None => format!("{what}: {:#}", err),
+        None => format!("{what}: {err:#}"),
     }
 }
 
@@ -126,7 +129,10 @@ pub fn describe(err: &anyhow::Error) -> String {
 fn fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
     match tracer::errno(err) {
         Some(libc::EPERM | libc::EACCES) => vec![
-            Fix::new(tool.setcap_command(&[], &tool.exe), "one-time; re-run after every reinstall"),
+            Fix::new(
+                tool.setcap_command(&[], &tool.exe),
+                "one-time; re-run after every reinstall",
+            ),
             Fix::new(format!("sudo {}", tool.exe.display()), "run with root"),
         ],
         Some(libc::ENOENT | libc::EINVAL | libc::E2BIG | libc::EOPNOTSUPP) => vec![Fix::new(
@@ -150,7 +156,9 @@ impl Check for SchedCheck {
     fn run(&self, _env: &dyn Env, tool: &Tool) -> Diagnostic {
         const TITLE: &str = "Scheduler tracepoints";
         match &self.0.get().sched {
-            Ok(observed) => Diagnostic::new(self.id(), TITLE, true, Status::Pass, observed.as_str()),
+            Ok(observed) => {
+                Diagnostic::new(self.id(), TITLE, true, Status::Pass, observed.as_str())
+            }
             Err(err) => {
                 let mut diag = Diagnostic::new(self.id(), TITLE, true, Status::Fail, describe(err))
                     .with_impact("whytime cannot observe scheduling and will not run")
@@ -184,17 +192,20 @@ impl Check for SyscallsCheck {
                 Status::Skip,
                 "not probed: the scheduler probe failed",
             ),
-            Some(Ok(observed)) => Diagnostic::new(self.id(), TITLE, false, Status::Pass, observed.as_str()),
+            Some(Ok(observed)) => {
+                Diagnostic::new(self.id(), TITLE, false, Status::Pass, observed.as_str())
+            }
             Some(Err(err)) => {
-                let mut diag = Diagnostic::new(self.id(), TITLE, false, Status::Warn, describe(err))
-                    .with_impact(
-                        "blocked time is reported as \"other\" instead of by resource \
+                let mut diag =
+                    Diagnostic::new(self.id(), TITLE, false, Status::Warn, describe(err))
+                        .with_impact(
+                            "blocked time is reported as \"other\" instead of by resource \
                          (fsync, network peer, futex, ...)",
-                    )
-                    .with_explain(
-                        "the syscall in flight when a thread blocks says what it waited for; \
+                        )
+                        .with_explain(
+                            "the syscall in flight when a thread blocks says what it waited for; \
                          tp_btf/sys_enter and sys_exit record it",
-                    );
+                        );
                 for fix in fixes(err, tool) {
                     diag = diag.with_fix(fix);
                 }

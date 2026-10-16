@@ -61,11 +61,19 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
     }
     walker.walk(root, start, end, 0);
 
-    let Walker { acc, sockets, critical, .. } = walker;
+    let Walker {
+        acc,
+        sockets,
+        critical,
+        ..
+    } = walker;
     let mut lines: Vec<Line> = acc
         .into_iter()
         .map(|((class, subject), ns)| {
-            let connections = sockets.get(&subject).map(HashSet::len).filter(|_| class == Class::Net);
+            let connections = sockets
+                .get(&subject)
+                .map(HashSet::len)
+                .filter(|_| class == Class::Net);
             Line {
                 class,
                 subject,
@@ -74,7 +82,10 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
             }
         })
         .collect();
-    lines.sort_by(|a, b| b.ns.cmp(&a.ns).then_with(|| (a.class, &a.subject).cmp(&(b.class, &b.subject))));
+    lines.sort_by(|a, b| {
+        b.ns.cmp(&a.ns)
+            .then_with(|| (a.class, &a.subject).cmp(&(b.class, &b.subject)))
+    });
     Attribution { lines, critical }
 }
 
@@ -189,14 +200,17 @@ impl Walker<'_> {
             SegKind::Runq => self.add(Class::Runqueue, comm(), len),
             SegKind::Blocked(block) => match block.what.class {
                 Class::Child => match self.child_for(p, seg, block.waker_tgid) {
-                    Some(child) if depth < MAX_DEPTH => self.descend(child, s0, s1, depth, Class::Child),
+                    Some(child) if depth < MAX_DEPTH => {
+                        self.descend(child, s0, s1, depth, Class::Child);
+                    }
                     Some(child) => {
                         let subject = trace.procs[child].comm().to_string();
                         self.add(Class::Child, subject, len);
                     }
                     None => self.add(Class::Child, "unknown child".to_owned(), len),
                 },
-                Class::Ipc if depth < MAX_DEPTH => match self.process_at(block.waker_tgid, seg.end) {
+                Class::Ipc if depth < MAX_DEPTH => match self.process_at(block.waker_tgid, seg.end)
+                {
                     Some(waker) if waker != p => self.descend(waker, s0, s1, depth, Class::Ipc),
                     _ => self.add(Class::Ipc, comm(), len),
                 },
@@ -206,7 +220,10 @@ impl Walker<'_> {
                         other => other.to_string(),
                     };
                     if let Some(socket) = block.what.socket {
-                        self.sockets.entry(subject.clone()).or_default().insert(socket);
+                        self.sockets
+                            .entry(subject.clone())
+                            .or_default()
+                            .insert(socket);
                     }
                     self.add(class, subject, len);
                 }
@@ -241,13 +258,19 @@ impl Walker<'_> {
         let exited = children
             .iter()
             .copied()
-            .filter(|&c| procs[c].death.is_some_and(|d| d >= seg.start && d <= seg.end))
+            .filter(|&c| {
+                procs[c]
+                    .death
+                    .is_some_and(|d| d >= seg.start && d <= seg.end)
+            })
             .max_by_key(|&c| procs[c].death);
         exited.or_else(|| {
             children
                 .iter()
                 .copied()
-                .filter(|&c| procs[c].birth <= seg.end && procs[c].death.is_none_or(|d| d > seg.end))
+                .filter(|&c| {
+                    procs[c].birth <= seg.end && procs[c].death.is_none_or(|d| d > seg.end)
+                })
                 .max_by_key(|&c| procs[c].birth)
         })
     }

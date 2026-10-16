@@ -299,7 +299,9 @@ impl Trace {
                 ST_BLOCKED | ST_WOKEN => {
                     self.push_mixed(thread, &state.seg, state.block_ts);
                     let tgid = self.procs[proc].key.pid;
-                    let what = self.classifier.classify(tgid, &state.sys, state.block_state);
+                    let what = self
+                        .classifier
+                        .classify(tgid, &state.sys, state.block_state);
                     let wake = if state.state == ST_WOKEN {
                         state.wake_ts.clamp(state.block_ts, end.max(state.block_ts))
                     } else {
@@ -313,7 +315,13 @@ impl Trace {
         }
     }
 
-    fn new_proc(&mut self, key: ProcKey, parent: Option<ProcId>, birth: u64, comm: Arc<str>) -> ProcId {
+    fn new_proc(
+        &mut self,
+        key: ProcKey,
+        parent: Option<ProcId>,
+        birth: u64,
+        comm: Arc<str>,
+    ) -> ProcId {
         let id = self.procs.len();
         self.procs.push(Proc {
             key,
@@ -367,7 +375,14 @@ impl Trace {
         );
     }
 
-    fn push_block(&mut self, thread: ThreadId, start: u64, end: u64, what: Blocked, waker_tgid: u32) {
+    fn push_block(
+        &mut self,
+        thread: ThreadId,
+        start: u64,
+        end: u64,
+        what: Blocked,
+        waker_tgid: u32,
+    ) {
         let block = Block { what, waker_tgid };
         self.push(thread, start, end, SegKind::Blocked(Box::new(block)));
     }

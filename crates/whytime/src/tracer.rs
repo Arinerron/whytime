@@ -22,7 +22,8 @@ pub const SCHED: [(&str, &str); 5] = [
 
 /// Syscall programs; without them blocks are not classified. `sys_exit` attaches first: on
 /// its own it only clears state, while `sys_enter` alone would leave stale syscalls behind.
-pub const SYSCALLS: [(&str, &str); 2] = [("on_sys_exit", "sys_exit"), ("on_sys_enter", "sys_enter")];
+pub const SYSCALLS: [(&str, &str); 2] =
+    [("on_sys_exit", "sys_exit"), ("on_sys_enter", "sys_enter")];
 
 /// The loaded, attached BPF object.
 pub struct Tracer {
@@ -79,7 +80,6 @@ impl Tracer {
         for (nr, bits) in syscalls.bpf_flags() {
             flags.set(nr, bits, 0).context("filling sys_flags")?;
         }
-        drop(flags);
 
         for (prog, tracepoint) in SCHED {
             attach(&mut ebpf, &btf, prog, tracepoint)?;
@@ -132,7 +132,10 @@ impl Tracer {
             .programs()
             .filter_map(|(name, prog)| {
                 let info = prog.info().ok()?;
-                Some((name.to_owned(), info.verified_instruction_count().unwrap_or(0)))
+                Some((
+                    name.to_owned(),
+                    info.verified_instruction_count().unwrap_or(0),
+                ))
             })
             .collect();
         sizes.sort();
@@ -198,7 +201,9 @@ fn raise_memlock() {
     };
     // SAFETY: `limit` is a valid rlimit for getrlimit/setrlimit to read and write.
     unsafe {
-        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) == 0 && limit.rlim_cur < limit.rlim_max {
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) == 0
+            && limit.rlim_cur < limit.rlim_max
+        {
             limit.rlim_cur = limit.rlim_max;
             if libc::setrlimit(libc::RLIMIT_MEMLOCK, &raw const limit) != 0 {
                 log::debug!("raising RLIMIT_MEMLOCK: {}", io::Error::last_os_error());

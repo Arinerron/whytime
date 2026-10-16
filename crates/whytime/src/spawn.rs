@@ -56,11 +56,14 @@ const STAGE_EXEC: u8 = 1;
 impl Child {
     /// Forks the child for `argv`, parked until [`release`](Self::release).
     pub fn spawn(argv: &[OsString], creds: Option<&Credentials>) -> io::Result<Self> {
-        let args: Vec<CString> = argv
+        let cargs: Vec<CString> = argv
             .iter()
-            .map(|arg| CString::new(arg.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput)))
+            .map(|arg| {
+                CString::new(arg.as_bytes())
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+            })
             .collect::<io::Result<_>>()?;
-        let mut arg_ptrs: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+        let mut arg_ptrs: Vec<*const libc::c_char> = cargs.iter().map(|a| a.as_ptr()).collect();
         arg_ptrs.push(ptr::null());
         let (go_read, go_write) = pipe()?;
         let (status_read, status_write) = pipe()?;
@@ -73,7 +76,14 @@ impl Child {
         }
         if pid == 0 {
             // SAFETY: in the child; see `child_main`.
-            unsafe { child_main(go_read.as_raw_fd(), status_write.as_raw_fd(), &arg_ptrs, creds) }
+            unsafe {
+                child_main(
+                    go_read.as_raw_fd(),
+                    status_write.as_raw_fd(),
+                    &arg_ptrs,
+                    creds,
+                )
+            }
         }
         drop((go_read, status_write));
         // SAFETY: pidfd_open takes a pid and flags; the result is a new descriptor or -1.
@@ -88,7 +98,11 @@ impl Child {
             return Err(err);
         }
         // SAFETY: `raw` is a fresh descriptor we own.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(RawFd::try_from(raw).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?) };
+        let pidfd = unsafe {
+            OwnedFd::from_raw_fd(
+                RawFd::try_from(raw).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
+            )
+        };
         Ok(Self {
             pid,
             pidfd,
@@ -116,7 +130,8 @@ impl Child {
             // Pipe closed by the successful exec (close-on-exec).
             return Ok(());
         }
-        let err = io::Error::from_raw_os_error(i32::from_ne_bytes([msg[1], msg[2], msg[3], msg[4]]));
+        let err =
+            io::Error::from_raw_os_error(i32::from_ne_bytes([msg[1], msg[2], msg[3], msg[4]]));
         Err(if msg[0] == STAGE_EXEC {
             StartError::Exec(err)
         } else {
@@ -164,7 +179,12 @@ impl Child {
 /// # Safety
 ///
 /// Must only be called in a freshly forked child of a single-threaded process.
-unsafe fn child_main(go: RawFd, status: RawFd, argv: &[*const libc::c_char], creds: Option<&Credentials>) -> ! {
+unsafe fn child_main(
+    go: RawFd,
+    status: RawFd,
+    argv: &[*const libc::c_char],
+    creds: Option<&Credentials>,
+) -> ! {
     // SAFETY: only async-signal-safe calls on valid, pre-allocated memory.
     unsafe {
         let mut byte = 0_u8;
@@ -186,7 +206,11 @@ unsafe fn child_main(go: RawFd, status: RawFd, argv: &[*const libc::c_char], cre
         libc::sigemptyset(&raw mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, ptr::null_mut());
         libc::execvp(argv[0], argv.as_ptr());
-        let code = if *libc::__errno_location() == libc::ENOENT { 127 } else { 126 };
+        let code = if *libc::__errno_location() == libc::ENOENT {
+            127
+        } else {
+            126
+        };
         report_and_exit(status, STAGE_EXEC, code);
     }
 }

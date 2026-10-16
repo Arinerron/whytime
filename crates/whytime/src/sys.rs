@@ -216,7 +216,9 @@ mod tests {
         assert_eq!(table.get(-1), None);
         assert_eq!(table.get(i32::MAX), None);
         assert_eq!(
-            table.get(i32::try_from(libc::SYS_wait4).unwrap()).map(|s| s.kind),
+            table
+                .get(i32::try_from(libc::SYS_wait4).unwrap())
+                .map(|s| s.kind),
             Some(Kind::Wait)
         );
     }

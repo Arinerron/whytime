@@ -176,7 +176,13 @@ impl Classifier {
         }
     }
 
-    fn by_descriptor(&mut self, tgid: u32, sys: &SysInfo, name: &'static str, write: bool) -> Blocked {
+    fn by_descriptor(
+        &mut self,
+        tgid: u32,
+        sys: &SysInfo,
+        name: &'static str,
+        write: bool,
+    ) -> Blocked {
         let (class, subject) = match sys.mode {
             S_IFREG | S_IFBLK | S_IFDIR => {
                 let durable = write && sys.f_flags & O_DSYNC != 0;
@@ -209,13 +215,12 @@ impl Classifier {
     /// The directory holding the descriptor's file (or the device/directory itself).
     fn file_subject(&mut self, tgid: u32, sys: &SysInfo) -> Subject {
         let key = (sys.dev, sys.ino);
-        let cached = match self.paths.get(&key) {
-            Some(cached) => cached.clone(),
-            None => {
-                let resolved = self.resolve(tgid, sys).map(Arc::from);
-                self.paths.insert(key, resolved.clone());
-                resolved
-            }
+        let cached = if let Some(cached) = self.paths.get(&key) {
+            cached.clone()
+        } else {
+            let resolved = self.resolve(tgid, sys).map(Arc::from);
+            self.paths.insert(key, resolved.clone());
+            resolved
         };
         cached.map_or(
             Subject::Inode {
@@ -337,8 +342,14 @@ mod tests {
     #[test]
     fn home_prefix_is_abbreviated_on_component_boundaries() {
         let home = Some(Path::new("/home/u"));
-        assert_eq!(abbreviate_home(Path::new("/home/u/.npm/x"), home), "~/.npm/x");
+        assert_eq!(
+            abbreviate_home(Path::new("/home/u/.npm/x"), home),
+            "~/.npm/x"
+        );
         assert_eq!(abbreviate_home(Path::new("/home/u"), home), "~");
-        assert_eq!(abbreviate_home(Path::new("/home/user2/x"), home), "/home/user2/x");
+        assert_eq!(
+            abbreviate_home(Path::new("/home/user2/x"), home),
+            "/home/user2/x"
+        );
     }
 }

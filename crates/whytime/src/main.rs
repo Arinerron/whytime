@@ -70,7 +70,11 @@ fn wrap(args: &RunArgs) -> i32 {
             let ids = tracer::errno(&err).map_or(&[][..], ids_for_errno);
             if !ids.is_empty() {
                 let report = doctor::full().run_ids(&RealEnv, &tool, ids);
-                if report.checks.iter().any(|c| c.status != bpfdoctor::Status::Pass) {
+                if report
+                    .checks
+                    .iter()
+                    .any(|c| c.status != bpfdoctor::Status::Pass)
+                {
                     doctor::print(&report);
                 }
             }
@@ -94,7 +98,7 @@ struct Wrapped {
 }
 
 enum Started {
-    Running(Session),
+    Running(Box<Session>),
     /// COMMAND never ran; exit with this code.
     Failed(i32),
 }
@@ -117,14 +121,17 @@ impl Session {
         let syscalls = SyscallTable::new();
         let loaded = Tracer::load(&syscalls)?;
         if let Err(err) = &loaded.syscalls {
-            log::warn!("syscall tracepoints unavailable ({err:#}); blocked time will not be classified");
+            log::warn!(
+                "syscall tracepoints unavailable ({err:#}); blocked time will not be classified"
+            );
         }
         let mut tracer = loaded.tracer;
         // Not ProcFs::clock_ticks_per_sec: /proc/self/auxv is unreadable when whytime runs
         // with file capabilities (non-dumpable), while the in-memory auxv always works.
         // SAFETY: getauxval only reads the process's saved auxiliary vector.
         let ticks = unsafe { libc::getauxval(libc::AT_CLKTCK) };
-        let ticks_per_sec = std::num::NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")?;
+        let ticks_per_sec =
+            std::num::NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")?;
         let procfs = ProcFs::new();
         let table = ProcTable::new(
             procfs,
@@ -153,12 +160,12 @@ impl Session {
             }
         }
         let trace = Trace::new(child.pid(), Classifier::new(syscalls, home), table);
-        Ok(Started::Running(Self {
+        Ok(Started::Running(Box::new(Self {
             tracer,
             syscalls: loaded.syscalls.is_ok(),
             command: Wrapped { child, signals },
             trace,
-        }))
+        })))
     }
 
     /// Observes until the window ends, reports, and returns COMMAND's exit code.
@@ -192,7 +199,11 @@ impl Session {
         maps.drain(|record| trace.ingest(record));
         trace.sweep(&maps.tasks(), end);
         let meta = Meta {
-            command: args.command.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
+            command: args
+                .command
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
             wall_ns: 0,
             ended_by,
             exit_code,
@@ -222,7 +233,9 @@ impl Session {
         loop {
             let trace = &mut self.trace;
             self.tracer.drain(|record| trace.ingest(record));
-            let deadline = duration_ns.zip(trace.window.start).map(|(d, start)| start.saturating_add(d));
+            let deadline = duration_ns
+                .zip(trace.window.start)
+                .map(|(d, start)| start.saturating_add(d));
             let now = monotonic_ns();
             if let Some(deadline) = deadline
                 && now >= deadline
@@ -351,7 +364,8 @@ fn sudo_credentials() -> anyhow::Result<Option<Credentials>> {
 }
 
 fn group_list(user: &OsStr, gid: libc::gid_t) -> io::Result<Vec<libc::gid_t>> {
-    let name = CString::new(user.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let name =
+        CString::new(user.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let mut groups = vec![0; 64];
     loop {
         let mut n = libc::c_int::try_from(groups.len()).unwrap_or(libc::c_int::MAX);
@@ -396,7 +410,15 @@ fn home_dir(uid: Option<libc::uid_t>) -> Option<PathBuf> {
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result = std::ptr::null_mut();
     // SAFETY: all pointers are valid for the sizes given.
-    let rc = unsafe { libc::getpwuid_r(uid, &raw mut pwd, buf.as_mut_ptr(), buf.len(), &raw mut result) };
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &raw mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut result,
+        )
+    };
     if rc == 0 && !result.is_null() && !pwd.pw_dir.is_null() {
         // SAFETY: pw_dir points at a NUL-terminated string inside `buf`.
         let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
@@ -407,7 +429,10 @@ fn home_dir(uid: Option<libc::uid_t>) -> Option<PathBuf> {
 
 /// `CLOCK_MONOTONIC` in nanoseconds: the clock of `bpf_ktime_get_ns`.
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: clock_gettime writes the timespec.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
     u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap_or(0)
@@ -433,7 +458,9 @@ impl Epoll {
             u64: token,
         };
         // SAFETY: registering a valid descriptor with a valid event.
-        if unsafe { libc::epoll_ctl(self.0.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &raw mut event) } != 0 {
+        if unsafe { libc::epoll_ctl(self.0.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &raw mut event) }
+            != 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -452,6 +479,9 @@ impl Epoll {
                 Err(err)
             };
         }
-        Ok(events[..usize::try_from(n).unwrap_or(0)].iter().map(|e| e.u64).collect())
+        Ok(events[..usize::try_from(n).unwrap_or(0)]
+            .iter()
+            .map(|e| e.u64)
+            .collect())
     }
 }

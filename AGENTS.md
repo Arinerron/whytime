@@ -262,7 +262,8 @@ Targets, to be measured (not yet benchmarked):
 
 `cargo xtask test-e2e` builds release `whytime` + testbins, then runs (all via
 `sudo -n whytime --json --` unless noted; every report must sum to 1 ± 0.001 with
-`quality.dropped == 0`):
+`quality.dropped == 0`). Its scratch directory is `~/.cache/whytime-e2e`, or
+`$WHYTIME_E2E_DIR` (set a distinct one per checkout to run suites in parallel):
 
 1. `sleep`: `wt-sleep 1000` → `sleep` ≥ 0.9, wall 1.0 s ± 10%
 2. `cpu-burn`: `wt-burn 1000` → `cpu` ≥ 0.9

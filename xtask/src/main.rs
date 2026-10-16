@@ -27,15 +27,26 @@ fn main() -> anyhow::Result<()> {
 
 fn test_e2e() -> anyhow::Result<()> {
     let bins = build()?;
-    let ok = Command::new("sudo").args(["-n", "true"]).status().context("running sudo")?;
+    let ok = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .context("running sudo")?;
     ensure!(ok.success(), "the e2e suite needs passwordless `sudo -n`");
 
-    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-    let work = home.join(".cache/whytime-e2e");
+    // WHYTIME_E2E_DIR lets parallel checkouts run the suite without sharing files.
+    let work = match std::env::var_os("WHYTIME_E2E_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+            .join(".cache/whytime-e2e"),
+    };
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let fs_type = run(Command::new("stat").args(["-f", "-c", "%T"]).arg(&work))?;
     let fs_type = String::from_utf8_lossy(&fs_type.stdout).trim().to_owned();
-    ensure!(fs_type != "tmpfs", "{} is on tmpfs; fsync would not wait", work.display());
+    ensure!(
+        fs_type != "tmpfs",
+        "{} is on tmpfs; fsync would not wait",
+        work.display()
+    );
 
     let server = slow_server()?;
     let whytime = &bins["whytime"];
@@ -49,21 +60,41 @@ fn test_e2e() -> anyhow::Result<()> {
     let fsync_dir = work.display().to_string();
     let server_arg = server.to_string();
     let scenarios: Vec<(&str, Command, Check)> = vec![
-        ("sleep", sudo(&[&bin("wt-sleep"), "1000"]), Box::new(check_sleep)),
-        ("cpu-burn", sudo(&[&bin("wt-burn"), "1000"]), Box::new(check_burn)),
+        (
+            "sleep",
+            sudo(&[&bin("wt-sleep"), "1000"]),
+            Box::new(check_sleep),
+        ),
+        (
+            "cpu-burn",
+            sudo(&[&bin("wt-burn"), "1000"]),
+            Box::new(check_burn),
+        ),
         (
             "fsync",
             sudo(&[&bin("wt-fsync"), &fsync_dir, "200"]),
             Box::new(check_fsync),
         ),
-        ("child", sudo(&[&bin("wt-child"), "1000"]), Box::new(check_child)),
-        ("futex", sudo(&[&bin("wt-futex"), "800"]), Box::new(check_futex)),
+        (
+            "child",
+            sudo(&[&bin("wt-child"), "1000"]),
+            Box::new(check_child),
+        ),
+        (
+            "futex",
+            sudo(&[&bin("wt-futex"), "800"]),
+            Box::new(check_futex),
+        ),
         (
             "tcp-slow",
             sudo(&[&bin("wt-tcp"), &server_arg, "3"]),
             Box::new(move |out: &Output| check_tcp(out, server)),
         ),
-        ("exit-code", sudo(&["sh", "-c", "exit 7"]), Box::new(check_exit_code)),
+        (
+            "exit-code",
+            sudo(&["sh", "-c", "exit 7"]),
+            Box::new(check_exit_code),
+        ),
         (
             "nopriv",
             {
@@ -104,7 +135,9 @@ type Check = Box<dyn Fn(&Output) -> anyhow::Result<String>>;
 /// Builds the release binaries; returns executable name → path.
 fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().context("workspace root")?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("workspace root")?;
     let out = Command::new(cargo)
         .current_dir(root)
         .args([
@@ -130,8 +163,13 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
             bins.insert(name.to_owned(), PathBuf::from(exe));
         }
     }
-    for name in ["whytime", "wt-sleep", "wt-burn", "wt-fsync", "wt-child", "wt-futex", "wt-tcp"] {
-        ensure!(bins.contains_key(name), "cargo did not report the {name} binary");
+    for name in [
+        "whytime", "wt-sleep", "wt-burn", "wt-fsync", "wt-child", "wt-futex", "wt-tcp",
+    ] {
+        ensure!(
+            bins.contains_key(name),
+            "cargo did not report the {name} binary"
+        );
     }
     Ok(bins)
 }
@@ -190,7 +228,10 @@ fn report(out: &Output) -> anyhow::Result<Value> {
 }
 
 fn lines(report: &Value) -> Vec<&Value> {
-    report["lines"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+    report["lines"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
 }
 
 fn share(line: &Value) -> f64 {
@@ -212,7 +253,11 @@ fn wall_secs(report: &Value) -> f64 {
 }
 
 fn exited(out: &Output, code: i32) -> anyhow::Result<()> {
-    ensure!(out.status.code() == Some(code), "exit status {} (want {code})", out.status);
+    ensure!(
+        out.status.code() == Some(code),
+        "exit status {} (want {code})",
+        out.status
+    );
     Ok(())
 }
 
@@ -222,7 +267,10 @@ fn check_sleep(out: &Output) -> anyhow::Result<String> {
     let sleep = class_share(&report, "sleep", |_| true);
     let wall = wall_secs(&report);
     ensure!(sleep >= 0.9, "sleep share {sleep:.3} < 0.9");
-    ensure!((0.9..=1.1).contains(&wall), "wall {wall:.3}s not within 1.0s ± 10%");
+    ensure!(
+        (0.9..=1.1).contains(&wall),
+        "wall {wall:.3}s not within 1.0s ± 10%"
+    );
     Ok(format!("wall {wall:.3}s, sleep {:.1}%", sleep * 100.0))
 }
 
@@ -231,7 +279,11 @@ fn check_burn(out: &Output) -> anyhow::Result<String> {
     let report = report(out)?;
     let cpu = class_share(&report, "cpu", |_| true);
     ensure!(cpu >= 0.9, "on-CPU share {cpu:.3} < 0.9");
-    Ok(format!("wall {:.3}s, on-CPU {:.1}%", wall_secs(&report), cpu * 100.0))
+    Ok(format!(
+        "wall {:.3}s, on-CPU {:.1}%",
+        wall_secs(&report),
+        cpu * 100.0
+    ))
 }
 
 fn check_fsync(out: &Output) -> anyhow::Result<String> {
@@ -239,7 +291,10 @@ fn check_fsync(out: &Output) -> anyhow::Result<String> {
     let report = report(out)?;
     let top = lines(&report).first().copied().context("no lines")?;
     let class = top["class"].as_str().unwrap_or("");
-    ensure!(matches!(class, "fsync" | "file"), "top class is {class}, not fsync/file");
+    ensure!(
+        matches!(class, "fsync" | "file"),
+        "top class is {class}, not fsync/file"
+    );
     ensure!(share(top) >= 0.5, "top share {:.3} < 0.5", share(top));
     Ok(format!(
         "wall {:.3}s, top {class} on {} {:.1}%",
@@ -266,7 +321,11 @@ fn check_futex(out: &Output) -> anyhow::Result<String> {
     let report = report(out)?;
     let futex = class_share(&report, "futex", |_| true);
     ensure!(futex >= 0.5, "futex share {futex:.3} < 0.5");
-    Ok(format!("wall {:.3}s, futex {:.1}%", wall_secs(&report), futex * 100.0))
+    Ok(format!(
+        "wall {:.3}s, futex {:.1}%",
+        wall_secs(&report),
+        futex * 100.0
+    ))
 }
 
 fn check_tcp(out: &Output, server: SocketAddr) -> anyhow::Result<String> {
@@ -275,7 +334,11 @@ fn check_tcp(out: &Output, server: SocketAddr) -> anyhow::Result<String> {
     let peer = server.to_string();
     let net = class_share(&report, "net", |s| s == peer);
     ensure!(net >= 0.6, "net share for {peer} {net:.3} < 0.6");
-    Ok(format!("wall {:.3}s, net {peer} {:.1}%", wall_secs(&report), net * 100.0))
+    Ok(format!(
+        "wall {:.3}s, net {peer} {:.1}%",
+        wall_secs(&report),
+        net * 100.0
+    ))
 }
 
 fn check_exit_code(out: &Output) -> anyhow::Result<String> {

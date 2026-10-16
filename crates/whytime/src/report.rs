@@ -121,13 +121,20 @@ impl Report {
         let lines: Vec<ReportLine> = attribution
             .lines
             .into_iter()
-            .map(|Line { class, subject, ns, connections }| ReportLine {
-                class,
-                share: share(ns),
-                ns,
-                subject,
-                connections,
-            })
+            .map(
+                |Line {
+                     class,
+                     subject,
+                     ns,
+                     connections,
+                 }| ReportLine {
+                    class,
+                    share: share(ns),
+                    ns,
+                    subject,
+                    connections,
+                },
+            )
             .collect();
         let processes = trace
             .procs
@@ -140,7 +147,10 @@ impl Report {
                     ppid: info.and_then(|info| info.ppid),
                     comm: proc.comm().to_string(),
                     argv: info.map_or_else(Vec::new, |info| {
-                        info.argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+                        info.argv
+                            .iter()
+                            .map(|arg| arg.to_string_lossy().into_owned())
+                            .collect()
                     }),
                     cpu_ns: proc.cpu_ns,
                     exit_code: info
@@ -203,7 +213,10 @@ impl Report {
         let mut other = 0;
         let mut shown = 0;
         for line in &self.lines {
-            if line.class == Class::Other || line.share < MIN_SHOWN_SHARE || shown == MAX_SHOWN_LINES {
+            if line.class == Class::Other
+                || line.share < MIN_SHOWN_SHARE
+                || shown == MAX_SHOWN_LINES
+            {
                 other += line.ns;
                 continue;
             }
@@ -231,7 +244,7 @@ impl Report {
 
 /// Shell convention: the exit code, or 128 + signal, from a wait status.
 pub fn exit_code(status: i32) -> i32 {
-    if status & 0x7f == 0 {
+    if status.trailing_zeros() >= 7 {
         (status >> 8) & 0xff
     } else {
         128 + (status & 0x7f)
