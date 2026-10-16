@@ -344,7 +344,9 @@ Targets, to be measured (not yet benchmarked):
 - Tracking membership is inserted in kernel at fork; user space inserts only COMMAND's pid,
   before releasing it. Never add user-space insertion at fork (it races the child).
 - Running the e2e suite in virtme-ng (as CI does): `vng --run v6.12.40 --disable-microvm
-  --user "$USER" --disk e2e.img --exec "export PATH='$PATH'; ..."`. The microvm machine
-  hung at ACPI init with that Ubuntu mainline kernel; the guest's default PATH finds a system
+  --user "$USER" --disk e2e.img --exec 'export PATH="$HOME/.cargo/bin:$PATH"; ...'`. The
+  microvm machine hung at ACPI init with that Ubuntu mainline kernel; vng passes the script
+  base64-encoded on the kernel command line, so an over-long one (e.g. the host's whole
+  `PATH` inlined) hangs the guest with no output; the guest's default PATH finds a system
   cargo without the musl target; the guest root is read-only virtiofs, so put
   `WHYTIME_E2E_DIR` on a mounted ext4 image (`/dev/vda`). vng returns the guest's exit code.

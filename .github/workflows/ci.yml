@@ -87,16 +87,17 @@ jobs:
       - name: cargo xtask test-e2e in the VM
         working-directory: whytime
         run: |
-          # The guest sees the host's root filesystem read-only (writes under /home and /etc
-          # go to a RAM overlay) and runs the suite as the runner user, whose passwordless
-          # sudo works in the guest too. Scratch files go on an ext4 disk image: the suite
-          # refuses tmpfs and needs a filesystem with file capabilities (setcap). The image
-          # is the guest's only virtio disk, /dev/vda. PATH is the host's (rustup's cargo).
+          # The guest starts in this directory and sees the host's root filesystem read-only
+          # (writes under /home and /etc go to a RAM overlay); it runs the suite as the runner
+          # user, whose passwordless sudo works in the guest too. Scratch files go on an ext4
+          # disk image (the guest's only virtio disk, /dev/vda): the suite refuses tmpfs and
+          # needs file capabilities (setcap). Keep the script short: vng passes it on the
+          # kernel command line, and an over-long one hangs the guest silently.
           truncate -s 1G "$RUNNER_TEMP/e2e.img"
           mkfs.ext4 -q "$RUNNER_TEMP/e2e.img"
+          # shellcheck disable=SC2016 # expanded in the guest
           vng --run "$KERNEL" --disable-microvm --user "$USER" --memory 4G --cpus 4 \
             --disk "$RUNNER_TEMP/e2e.img" \
-            --exec "set -e; export PATH='$PATH'; cd '$PWD'; uname -r;
+            --exec 'set -e; export PATH="$HOME/.cargo/bin:$PATH" WHYTIME_E2E_DIR=/tmp/e2e; uname -r;
                     sudo mkdir -p /tmp/e2e; sudo mount /dev/vda /tmp/e2e;
-                    sudo chown \$(id -u):\$(id -g) /tmp/e2e;
-                    WHYTIME_E2E_DIR=/tmp/e2e cargo xtask test-e2e" < /dev/null
+                    sudo chown $(id -u):$(id -g) /tmp/e2e; cargo xtask test-e2e' < /dev/null
