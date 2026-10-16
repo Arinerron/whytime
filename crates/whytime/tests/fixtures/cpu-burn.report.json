@@ -1,0 +1,176 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-burn",
+    "1000"
+  ],
+  "wall_ns": 1000317517,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 999510564,
+    "processes": 1,
+    "factor": 0.9991933031399669
+  },
+  "lines": [
+    {
+      "class": "cpu",
+      "share": 0.9991933031399669,
+      "ns": 999510564,
+      "subject": "wt-burn"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.0008066968600330929,
+      "ns": 806953,
+      "subject": "wt-burn",
+      "held_by": [
+        {
+          "comm": "migration/13",
+          "tgid": 64,
+          "ns": 806953
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 100031751,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031751
+        }
+      ]
+    },
+    {
+      "start_ns": 100031751,
+      "end_ns": 200063503,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031752
+        }
+      ]
+    },
+    {
+      "start_ns": 200063503,
+      "end_ns": 300095255,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031752
+        }
+      ]
+    },
+    {
+      "start_ns": 300095255,
+      "end_ns": 400127006,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031751
+        }
+      ]
+    },
+    {
+      "start_ns": 400127006,
+      "end_ns": 500158758,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031752
+        }
+      ]
+    },
+    {
+      "start_ns": 500158758,
+      "end_ns": 600190510,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031752
+        }
+      ]
+    },
+    {
+      "start_ns": 600190510,
+      "end_ns": 700222261,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031751
+        }
+      ]
+    },
+    {
+      "start_ns": 700222261,
+      "end_ns": 800254013,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031752
+        }
+      ]
+    },
+    {
+      "start_ns": 800254013,
+      "end_ns": 900285765,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 100031752
+        }
+      ]
+    },
+    {
+      "start_ns": 900285765,
+      "end_ns": 1000317517,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-burn",
+          "ns": 99224799
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-burn",
+          "ns": 806953
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2849946,
+      "ppid": 2849884,
+      "comm": "wt-burn",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-burn",
+        "1000"
+      ],
+      "cpu_ns": 999510564,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 2,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": []
+}

@@ -1,0 +1,238 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-child",
+    "1000"
+  ],
+  "wall_ns": 1001007767,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 992399908,
+    "processes": 2,
+    "factor": 0.9914008069829492
+  },
+  "lines": [
+    {
+      "class": "child",
+      "share": 0.9910284322499168,
+      "ns": 992027158,
+      "subject": "wt-burn"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.008417901716440928,
+      "ns": 8426385,
+      "subject": "wt-burn",
+      "held_by": [
+        {
+          "comm": "sway",
+          "tgid": 15353,
+          "ns": 8426385
+        }
+      ]
+    },
+    {
+      "class": "cpu",
+      "share": 0.00031971679995965505,
+      "ns": 320039,
+      "subject": "wt-child"
+    },
+    {
+      "class": "child",
+      "share": 0.00020186556654360106,
+      "ns": 202069,
+      "subject": "wt-child"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.000032083667139018316,
+      "ns": 32116,
+      "subject": "wt-child",
+      "held_by": [
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 32116
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 100100776,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 99668208
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-child",
+          "ns": 211615
+        },
+        {
+          "class": "child",
+          "subject": "wt-child",
+          "ns": 202069
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-child",
+          "ns": 18884
+        }
+      ]
+    },
+    {
+      "start_ns": 100100776,
+      "end_ns": 200201553,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100777
+        }
+      ]
+    },
+    {
+      "start_ns": 200201553,
+      "end_ns": 300302330,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100777
+        }
+      ]
+    },
+    {
+      "start_ns": 300302330,
+      "end_ns": 400403106,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100776
+        }
+      ]
+    },
+    {
+      "start_ns": 400403106,
+      "end_ns": 500503883,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100777
+        }
+      ]
+    },
+    {
+      "start_ns": 500503883,
+      "end_ns": 600604660,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100777
+        }
+      ]
+    },
+    {
+      "start_ns": 600604660,
+      "end_ns": 700705436,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100776
+        }
+      ]
+    },
+    {
+      "start_ns": 700705436,
+      "end_ns": 800806213,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100777
+        }
+      ]
+    },
+    {
+      "start_ns": 800806213,
+      "end_ns": 900906990,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 100100777
+        }
+      ]
+    },
+    {
+      "start_ns": 900906990,
+      "end_ns": 1001007767,
+      "lines": [
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 91552736
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-burn",
+          "ns": 8426385
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-child",
+          "ns": 108424
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-child",
+          "ns": 13232
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2850085,
+      "ppid": 2850044,
+      "comm": "wt-child",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-child",
+        "1000"
+      ],
+      "cpu_ns": 320039,
+      "exit_code": 0,
+      "critical": true
+    },
+    {
+      "pid": 2850086,
+      "ppid": 2850085,
+      "comm": "wt-burn",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-burn",
+        "1000"
+      ],
+      "cpu_ns": 992079869,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 7,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": []
+}

@@ -1,0 +1,237 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-poll",
+    "127.0.0.1:43279",
+    "4"
+  ],
+  "wall_ns": 1202323184,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 1196149,
+    "processes": 1,
+    "factor": 0.000994864788367917
+  },
+  "lines": [
+    {
+      "class": "net",
+      "share": 0.9989328401738613,
+      "ns": 1201040113,
+      "subject": "127.0.0.1:43279",
+      "connections": 4
+    },
+    {
+      "class": "cpu",
+      "share": 0.000994864788367917,
+      "ns": 1196149,
+      "subject": "wt-poll"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.00007229503777080955,
+      "ns": 86922,
+      "subject": "wt-poll",
+      "held_by": [
+        {
+          "comm": "containerd",
+          "tgid": 23978,
+          "ns": 40911
+        },
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 33454
+        },
+        {
+          "comm": "migration/0",
+          "tgid": 20,
+          "ns": 12557
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 120232318,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120003422
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-poll",
+          "ns": 228896
+        }
+      ]
+    },
+    {
+      "start_ns": 120232318,
+      "end_ns": 240464636,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120232318
+        }
+      ]
+    },
+    {
+      "start_ns": 240464636,
+      "end_ns": 360696955,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 119791880
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-poll",
+          "ns": 386971
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-poll",
+          "ns": 53468
+        }
+      ]
+    },
+    {
+      "start_ns": 360696955,
+      "end_ns": 480929273,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120232318
+        }
+      ]
+    },
+    {
+      "start_ns": 480929273,
+      "end_ns": 601161592,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120232319
+        }
+      ]
+    },
+    {
+      "start_ns": 601161592,
+      "end_ns": 721393910,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120021353
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-poll",
+          "ns": 200191
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-poll",
+          "ns": 10774
+        }
+      ]
+    },
+    {
+      "start_ns": 721393910,
+      "end_ns": 841626228,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120232318
+        }
+      ]
+    },
+    {
+      "start_ns": 841626228,
+      "end_ns": 961858547,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120068576
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-poll",
+          "ns": 158515
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-poll",
+          "ns": 5228
+        }
+      ]
+    },
+    {
+      "start_ns": 961858547,
+      "end_ns": 1082090865,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 120232318
+        }
+      ]
+    },
+    {
+      "start_ns": 1082090865,
+      "end_ns": 1202323184,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:43279",
+          "ns": 119993291
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-poll",
+          "ns": 221576
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-poll",
+          "ns": 17452
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2850788,
+      "ppid": 2850744,
+      "comm": "wt-poll",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-poll",
+        "127.0.0.1:43279",
+        "4"
+      ],
+      "cpu_ns": 1196149,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 7,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": [
+    "1 network peer(s) shown as ip:port: no name lookup returning that address was seen in the traced tree (resolved before the window, by another process, from /etc/hosts or a cache inside the program, or connected to by address)"
+  ]
+}

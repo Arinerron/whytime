@@ -833,6 +833,31 @@ records carrying holders; `report.rs` the timeline slicing and rendering and the
 HOLDER` threshold; `perfetto.rs` writes a testkit trace and checks the JSON (disjoint slices
 per track, the critical path summing to the window, names, instants, holders).
 
+**Replay fixtures** (`crates/whytime/tests/fixtures.rs`, run by `cargo test --workspace`, so
+by CI; no root, x86_64 only: the traces carry x86_64 syscall numbers): real traces of the
+e2e workloads in `crates/whytime/tests/fixtures/` (`sleep`, `cpu-burn`, `child`,
+`lock-holder`, `threads-cpu`, `fsync`, `flock-path`, `poll-ready`, `dns-udp`,
+`attach-spawn`, `flame`; 164 KB in all, `fsync.wt` the largest at 64 KB), each `NAME.wt`
+with the expected outputs of the built binary's `whytime report NAME.wt --json --timeline`
+(`NAME.report.json`, its stderr), plus `--folded` (`flame.folded`) and `--perfetto`
+(`child.perfetto.json`) where those files exist. The test compares them byte for byte (a
+mismatch prints a diff hunk), checks each report on its own (shares sum to 1 ± 0.001, lines,
+`quality.dropped` 0), and fails on a file that belongs to no trace. A trace whose ABI hash
+is not `whytime_bpf::ABI_HASH`, or that `report` refuses (format `VERSION`), fails with "run
+cargo xtask record-fixtures": never skipped. After an intended output change,
+`WHYTIME_BLESS=1 cargo test -p whytime --test fixtures` rewrites the expected files (review
+the diff). After a record layout or format change, or to add a fixture, `cargo xtask
+record-fixtures` (needs `sudo -n`) builds like the e2e suite, copies `whytime` and the
+testbins to `/var/tmp/whytime-fixtures` (the root filesystem, not tmpfs: fsync and flock
+wait there) and records each workload with `--record --json --timeline` from there, as root
+through `sudo -n env -i` (no `SUDO_*`, so no user's passwd home in the header: root's
+`/root`; `PATH` and a `HOME` under that directory only; the attach target runs with the same
+environment). It checks each live report with the e2e scenario's check, the replay against
+the live report and files, and that no file names the user, the host name or `$HOME`
+(`strings`-style runs, names as words), then replaces the fixture directory's files
+(dotfiles stay) and removes its scratch directory. Keep fixtures small: workloads of about a
+second, few records.
+
 ## Privileges
 
 Required: `CAP_BPF` + `CAP_PERFMON` (verified sufficient), or root. Two ways:

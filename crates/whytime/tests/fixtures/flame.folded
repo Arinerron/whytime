@@ -1,0 +1,5 @@
+on-CPU (wt-flame);wt-flame;[no sample] 56
+on-CPU (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace;wt_flame::main;wt_flame::burn_cpu_here 594900
+on-CPU (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace;wt_flame::main;wt_flame::burn_cpu_here;asm_sysvec_apic_timer_interrupt_[k];sysvec_apic_timer_interrupt_[k];__irq_exit_rcu_[k];handle_softirqs_[k] 5042
+timer sleep (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace;wt_flame::main;wt_flame::sleep_here;sccp;entry_SYSCALL_64_after_hwframe_[k];do_syscall_64_[k];__x64_sys_nanosleep_[k];hrtimer_nanosleep_[k];do_nanosleep_[k];schedule_[k];__schedule_[k] 399999
+waiting for a CPU (wt-flame) — mostly sway 98%;wt-flame;[runqueue] 1093
