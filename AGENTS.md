@@ -70,9 +70,16 @@ CI (`.github/workflows/ci.yml`): x86_64 build + unit tests + completions/man smo
 `cargo xtask licenses`, aarch64 check/build/qemu smoke, and `cargo xtask test-e2e` inside a
 virtme-ng VM. `release.yml`: a `v*` tag publishes
 `whytime-vX.Y.Z-{x86_64,aarch64}-linux-musl.tar.gz` (binary, `LICENSE`,
-`THIRD_PARTY_LICENSES.md`, `README.md`, `completions/`, `man/`) with a `.sha256` each and
-generated release notes; the README's install snippet depends on these names. Both check out with
+`THIRD_PARTY_LICENSES.md`, `README.md`, `completions/`, `man/`) with a `.sha256` each; the
+README's install snippet depends on these names. Both check out with
 `submodules: recursive`; `.github/actions/setup` installs clang and the toolchain.
+
+Releasing: date the `CHANGELOG.md` section, push to main and wait for green CI, then
+`git tag -a vX.Y.Z -m 'whytime X.Y.Z' && git push origin vX.Y.Z`. Once `release.yml` has
+published, replace its generated notes with the CHANGELOG section plus an install snippet
+pinned to the tag: `gh release edit vX.Y.Z --title 'whytime X.Y.Z' --notes-file NOTES.md`.
+In the e2e VM (Ubuntu runner rootfs, no systemd), `dns-varlink` is a SKIP: there is no
+systemd-resolved.
 
 `crates/whytime/src/cli.rs` is also compiled into xtask (`#[path]`, for `cargo xtask man`):
 keep it self-contained (std, clap, clap_complete only; no `crate::` items).
