@@ -8,8 +8,9 @@ COMMAND's code.
 **Name.** The repo directory is `why`, but the crate and binary are `whytime`: the `why`
 crate name is taken on crates.io. Use `whytime` everywhere in code, docs and output.
 
-**Status: MVP.** Wrap mode only. Attach mode (`-p PID`), flamegraphs, and hostname/DNS
-correlation for network subjects are later milestones.
+**Status: MVP.** Wrap mode, plus trace files: `--record FILE` saves a run and
+`whytime report FILE` replays it offline into the identical report. Attach mode (`-p PID`),
+flamegraphs, and hostname/DNS correlation for network subjects are later milestones.
 
 ## Commands
 
@@ -28,6 +29,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | End-to-end suite | `cargo xtask test-e2e` (needs passwordless `sudo -n`) |
 | Run | `sudo $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime -- sleep 1` |
 | Doctor | `whytime doctor [--json]` (exit 0 ready, 3 cannot run) |
+| Record / replay | `sudo whytime --record t.wt -- CMD`, then `whytime report t.wt [--json]` (no privileges; exit 0, or 2 if the file cannot be replayed) |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (prints the verifier log on load failures) |
 
 Toolchain: `rust-toolchain.toml` pins **stable** with the `x86_64-unknown-linux-musl`
@@ -49,18 +51,20 @@ crates/whytime-bpf/        build.rs + bpf/ ; exports OBJECT (the .o) and ABI_HAS
   bpf/vmlinux_min.h        hand-curated preserve_access_index subset of vmlinux.h
   bpf/include/bpf/         vendored libbpf v1.8.0 headers
 crates/whytime/            the binary
-  src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling
+  src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling,
+                           `report` subcommand (replay)
   src/cli.rs               clap derive CLI, --duration parser
   src/tracer.rs            aya loader: load, attach, maps, detach
   src/spawn.rs             fork, park-on-pipe, priv drop, exec with error pipe, pidfd
   src/timeline.rs          records → per-thread segments, procctx table, final sweep
-  src/classify.rs          (syscall, fd type, socket) → class + subject; /proc path resolution
+  src/classify.rs          (syscall, fd type, socket) → class + subject; FdTarget: /proc path lookup
   src/sys.rs               syscall table (libc numbers) → kind + BPF sys_flags bits
   src/attribute.rs         critical-path walk → lines that partition the window
   src/report.rs            whytime.report/1 JSON + human rendering
+  src/record.rs            trace files: Recorder (--record), format, parse + replay
+  src/testkit.rs           #[cfg(test)] synthetic records and traces for unit tests
   src/doctor.rs            bpfdoctor Tool, probe.sched / probe.syscalls checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
-crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp
 xtask/                     cargo xtask test-e2e
 ```
 
@@ -105,7 +109,8 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
 
 1. `bpfdoctor` preflight; on FAIL print diagnostics, exit 125.
 2. Load the object and attach all programs (`tracer.rs`). Scheduler programs are required;
-   if the syscall pair fails, continue with a warning and a report note.
+   if the syscall pair fails, continue with a warning and a report note. With `--record`,
+   create the trace file now (before COMMAND runs, so a bad path fails fast with 125).
 3. Under sudo (`euid 0` + `SUDO_UID`/`SUDO_GID`), compute the invoking user's credentials
    and groups, and restore `HOME`/`USER`/`LOGNAME` to that user.
 4. Ignore SIGINT/SIGQUIT (the TTY delivers them to COMMAND's process group, which whytime
@@ -120,8 +125,9 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
    `--duration` after the start). The loop polls ring buffer, pidfd and signalfd with epoll.
 7. On window end: drop the `Ebpf` (detaches every program; the maps were taken out and stay
    alive), wait 2 ms for in-flight programs, drain the ring, then **sweep** the `tasks` map
-   to close every still-open interval at the window end. Attribute, report, return
-   COMMAND's code (with `--duration`, keep forwarding signals until it exits).
+   to close every still-open interval at the window end. With `--record`, write the sweep
+   and the end frame. Attribute, report, return COMMAND's code (with `--duration`, keep
+   forwarding signals until it exits).
 
 ## Probes (verified BTF prototypes on 7.2.6)
 
@@ -217,7 +223,50 @@ exit_code, lines: [{class, share, ns, subject, connections?}], processes: [{pid,
 argv, cpu_ns, exit_code, critical}], quality: {events, dropped, syscalls}, notes}`.
 
 Exit codes: COMMAND's (128 + signal if killed); 125 whytime failed before/at start (with
-doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run.
+doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run;
+`report`: 0, or 2 if the trace file cannot be replayed.
+
+## Trace files (`--record` / `report`)
+
+`--record FILE` (with or without `--json`/`--duration`) writes, next to the normal run,
+everything the report is computed from; `whytime report FILE [--json]` feeds it through the
+same `Trace::ingest` → `sweep` → `attribute` → `Report` code and prints the identical
+report (byte for byte: the e2e suite compares the JSON). Replay needs no BPF, no privileges
+and none of the traced processes. The format (versioned, little-endian frames) is
+documented in `record.rs`'s module doc. Contents:
+
+- preamble: magic `WHYTRACE`, format version, `whytime_bpf::ABI_HASH`;
+- header frame: arch (syscall numbers), command line, root pid, home dir for `~`, syscall
+  probes attached, `AT_CLKTCK` (procctx start clock);
+- every ring buffer record verbatim, in arrival order (undecodable ones too: they count in
+  `quality.events`);
+- every `FdTarget` answer (`/proc/<pid>/fd/<fd>` → path, keyed by `(dev, ino)` like the
+  classifier's cache), recorded by the `Logged` wrapper as lookups happen;
+- the final `tasks` sweep, then the end frame: window start/end, ended by, exit code,
+  dropped count. A file without the end frame (whytime killed or failed) is "truncated".
+
+procctx needs nothing recorded: whytime calls only its event handlers and `get_key`, which
+never read `/proc`. Rules that keep replay exact:
+
+- **Anything external that affects the report goes through the recording**: a new lookup
+  (`/proc`, DNS, clocks, env) needs a seam like `FdTarget` with a live (logged) and a
+  replayed implementation, plus a frame; a new `Meta` input goes in the header or end frame
+  (`main.rs::meta` builds `Meta` for both paths).
+- Changing framing or a payload: bump `record::VERSION`. Changing a wire record: the ABI hash
+  changes and old files are refused with both hashes named (re-record them).
+- Files are rejected, never half-replayed: preamble, frame structure and every payload are
+  checked before the first record is ingested. Exit 2 with `FILE: <reason>`.
+- Under sudo the file is created by root and then `fchown`ed to the invoking user (regular
+  files only: never `--record /dev/null`'s owner).
+
+## Unit tests
+
+`testkit.rs` (`#[cfg(test)]`) builds ring records from all-zero bytes and sets only named
+fields (`exec`, `fork`, `episode`, `exit`, `task`, `seg`, `sys`), so fields appended to the
+ABI keep a neutral 0 and tests survive layout growth; `testkit::trace(pid)` is a `Trace` with
+no `/proc` access. Timeline and attribution tests feed records like the ring buffer would
+and assert on segments and lines; `record.rs` tests round-trip a recorded run to the
+identical JSON report and reject damaged files.
 
 ## Privileges
 
@@ -277,6 +326,9 @@ Targets, to be measured (not yet benchmarked):
 8. `nopriv`: the build output run as the user without caps → exit 125 and a `setcap` line
 9. `setcap`: copy to `~/.cache/whytime-e2e/bin`, `setcap cap_bpf,cap_perfmon+ep`, run
    unprivileged on `wt-sleep 300` → `sleep` ≥ 0.9
+10. `record-replay`: `--json --record F -- wt-child 300`, then unprivileged
+    `whytime report F --json` → JSON identical to the live report (every field), human
+    replay exits 0, F belongs to the invoking user; F cut in half → exit 2, "truncated"
 
 ## Gotchas
 
@@ -291,5 +343,8 @@ Targets, to be measured (not yet benchmarked):
 - Under sudo, `sh -c '... of=~/x'` does not expand `~` after `of=` (POSIX `sh`); use `$HOME`.
 - The report is the last thing on stderr; the e2e harness locates it by the
   `"schema": "whytime.report/1"` prefix, so test workloads must not write JSON to stderr.
+  A trace-file write error is printed before the report for the same reason.
+- `wire::from_bytes` needs 8-byte alignment (the ring hands records out aligned); replay
+  copies each record into an aligned scratch buffer before `Trace::ingest`.
 - Tracking membership is inserted in kernel at fork; user space inserts only COMMAND's pid,
   before releasing it. Never add user-space insertion at fork (it races the child).

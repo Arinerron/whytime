@@ -59,6 +59,7 @@ fn test_e2e() -> anyhow::Result<()> {
 
     let fsync_dir = work.display().to_string();
     let server_arg = server.to_string();
+    let trace_file = work.join("replay.wt");
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -108,6 +109,19 @@ fn test_e2e() -> anyhow::Result<()> {
             "setcap",
             setcap_copy(whytime, &work, &bin("wt-sleep"))?,
             Box::new(check_setcap),
+        ),
+        (
+            "record-replay",
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.arg("-n").arg(whytime).args(["--json", "--record"]);
+                cmd.arg(&trace_file).args(["--", &bin("wt-child"), "300"]);
+                cmd
+            },
+            Box::new({
+                let (whytime, trace, work) = (whytime.clone(), trace_file.clone(), work.clone());
+                move |out: &Output| check_replay(out, &whytime, &trace, &work)
+            }),
         ),
     ];
 
@@ -366,5 +380,53 @@ fn check_setcap(out: &Output) -> anyhow::Result<String> {
         "unprivileged user + file caps: wall {:.3}s, sleep {:.1}%",
         wall_secs(&report),
         sleep * 100.0
+    ))
+}
+
+/// The `--record` run reported normally; `whytime report FILE --json`, unprivileged, prints the
+/// identical report; the file belongs to the invoking user; a cut-short copy exits 2.
+fn check_replay(
+    out: &Output,
+    whytime: &Path,
+    trace: &Path,
+    work: &Path,
+) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    exited(out, 0)?;
+    let live = report(out)?;
+    let replay = run(Command::new(whytime).arg("report").arg(trace).arg("--json"))?;
+    exited(&replay, 0)?;
+    let replayed = report(&replay)?;
+    ensure!(
+        replayed == live,
+        "the replayed report differs from the live one:\nlive: {live}\nreplayed: {replayed}"
+    );
+    let human = run(Command::new(whytime).arg("report").arg(trace))?;
+    exited(&human, 0)?;
+    ensure!(
+        String::from_utf8_lossy(&human.stderr).starts_with("wall "),
+        "the human replay does not start with the wall time"
+    );
+    let owner = std::fs::metadata(trace)?.uid();
+    ensure!(
+        owner == std::fs::metadata(work)?.uid(),
+        "the trace file belongs to uid {owner}, not the invoking user"
+    );
+
+    let bytes = std::fs::read(trace).with_context(|| format!("reading {}", trace.display()))?;
+    let cut = trace.with_extension("cut.wt");
+    std::fs::write(&cut, &bytes[..bytes.len() / 2])?;
+    let damaged = run(Command::new(whytime).arg("report").arg(&cut))?;
+    exited(&damaged, 2)?;
+    let message = String::from_utf8_lossy(&damaged.stderr);
+    ensure!(
+        message.contains("truncated"),
+        "a cut-short trace is not reported as truncated: {message}"
+    );
+    Ok(format!(
+        "{} bytes, {} events: the replayed report is identical; a cut-short file exits 2",
+        bytes.len(),
+        live["quality"]["events"]
     ))
 }

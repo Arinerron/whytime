@@ -10,27 +10,30 @@ mod classify;
 mod cli;
 mod doctor;
 mod logger;
+mod record;
 mod report;
 mod spawn;
 mod sys;
+#[cfg(test)]
+mod testkit;
 mod timeline;
 mod tracer;
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{self, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use bpfdoctor::{Doctor, RealEnv, ids_for_errno};
 use clap::Parser as _;
-use procctx::{Config, ProcFs, ProcTable, StartClock};
 
-use crate::classify::Classifier;
+use crate::classify::{Classifier, FdTarget, ProcFd};
 use crate::cli::{Cli, RunArgs, Sub};
+use crate::record::{End, Header, Logged, Recorder};
 use crate::report::{EndedBy, Meta, Report};
 use crate::spawn::{Child, Credentials, StartError};
 use crate::sys::SyscallTable;
@@ -39,6 +42,8 @@ use crate::tracer::Tracer;
 
 /// whytime could not start tracing (or failed before COMMAND ran).
 const EXIT_SETUP: i32 = 125;
+/// `whytime report`: the trace file cannot be replayed.
+const EXIT_REPLAY: i32 = 2;
 
 fn main() -> ExitCode {
     logger::init();
@@ -48,6 +53,7 @@ fn main() -> ExitCode {
             eprintln!("whytime: {err}");
             EXIT_SETUP
         }),
+        Some(Sub::Report { file, json }) => replay(&file, json),
         None => wrap(&cli.run),
     };
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
@@ -89,6 +95,7 @@ struct Session {
     syscalls: bool,
     command: Wrapped,
     trace: Trace,
+    recorder: Option<Recorder>,
 }
 
 /// The running COMMAND and the signals whytime forwards to it.
@@ -132,15 +139,14 @@ impl Session {
         let ticks = unsafe { libc::getauxval(libc::AT_CLKTCK) };
         let ticks_per_sec =
             std::num::NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")?;
-        let procfs = ProcFs::new();
-        let table = ProcTable::new(
-            procfs,
-            Config {
-                start_clock: StartClock::BootNs { ticks_per_sec },
-                read_environ: false,
-                ..Config::default()
-            },
-        );
+        let recorder = args
+            .record
+            .as_deref()
+            .map(|path| {
+                Recorder::create(path, creds.as_ref().map(|c| (c.uid, c.gid)))
+                    .with_context(|| format!("creating the trace file {}", path.display()))
+            })
+            .transpose()?;
 
         let signals = take_signals().context("setting up signal handling")?;
         let mut child = Child::spawn(&args.command, creds.as_ref()).context("forking")?;
@@ -159,12 +165,32 @@ impl Session {
                 return Ok(Started::Failed(EXIT_SETUP));
             }
         }
-        let trace = Trace::new(child.pid(), Classifier::new(syscalls, home), table);
+        let syscalls_attached = loaded.syscalls.is_ok();
+        let files: Box<dyn FdTarget> = match &recorder {
+            Some(recorder) => {
+                recorder.header(&Header {
+                    arch: std::env::consts::ARCH.to_owned(),
+                    command: args.command.clone(),
+                    root_pid: child.pid(),
+                    home: home.clone(),
+                    syscalls: syscalls_attached,
+                    ticks_per_sec,
+                });
+                Box::new(Logged::new(ProcFd, recorder.clone()))
+            }
+            None => Box::new(ProcFd),
+        };
+        let trace = Trace::new(
+            child.pid(),
+            Classifier::new(syscalls, home, files),
+            timeline::proc_table(ticks_per_sec),
+        );
         Ok(Started::Running(Box::new(Self {
             tracer,
-            syscalls: loaded.syscalls.is_ok(),
+            syscalls: syscalls_attached,
             command: Wrapped { child, signals },
             trace,
+            recorder,
         })))
     }
 
@@ -192,27 +218,29 @@ impl Session {
             syscalls,
             command,
             mut trace,
+            recorder,
         } = self;
         let mut maps = tracer.detach();
         // Programs still running on other CPUs commit within microseconds.
         std::thread::sleep(Duration::from_millis(2));
-        maps.drain(|record| trace.ingest(record));
-        trace.sweep(&maps.tasks(), end);
-        let meta = Meta {
-            command: args
-                .command
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
-            wall_ns: 0,
+        maps.drain(|record| ingest(&mut trace, recorder.as_ref(), record));
+        let tasks = maps.tasks();
+        trace.sweep(&tasks, end);
+        let end = End {
+            start: trace.window.start,
+            end,
             ended_by,
             exit_code,
             dropped: maps.dropped(),
-            syscalls,
         };
         drop(maps);
+        if let (Some(recorder), Some(path)) = (recorder, &args.record)
+            && let Err(err) = recorder.finish(&tasks, &end)
+        {
+            eprintln!("whytime: writing the trace file {}: {err}", path.display());
+        }
 
-        report(&trace, end, meta, args.json);
+        report(&trace, end.end, meta(&args.command, syscalls, &end), args.json);
         match outcome {
             Outcome::Exited(code) => code,
             Outcome::Deadline(_) => command.wait_forwarding(),
@@ -232,7 +260,8 @@ impl Session {
         let duration_ns = duration.map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         loop {
             let trace = &mut self.trace;
-            self.tracer.drain(|record| trace.ingest(record));
+            let recorder = self.recorder.as_ref();
+            self.tracer.drain(|record| ingest(trace, recorder, record));
             let deadline = duration_ns
                 .zip(trace.window.start)
                 .map(|(d, start)| start.saturating_add(d));
@@ -256,27 +285,78 @@ impl Session {
     }
 }
 
-/// Attributes the window `[exec, end)` and writes the report to stderr. `meta.wall_ns` is
+/// Applies one ring buffer record, recording it first when `--record` is on.
+fn ingest(trace: &mut Trace, recorder: Option<&Recorder>, record: &[u8]) {
+    if let Some(recorder) = recorder {
+        recorder.record(record);
+    }
+    trace.ingest(record);
+}
+
+/// The report's inputs besides the trace; the same for a live run and its replay.
+fn meta(command: &[OsString], syscalls: bool, end: &End) -> Meta {
+    Meta {
+        command: command
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        wall_ns: 0,
+        ended_by: end.ended_by,
+        exit_code: end.exit_code,
+        dropped: end.dropped,
+        syscalls,
+    }
+}
+
+/// Attributes the window `[exec, end)` and writes the report to stderr.
+fn report(trace: &Trace, end: u64, meta: Meta, json: bool) {
+    let mut err = io::stderr().lock();
+    if let Err(e) = write_report(&mut err, trace, end, meta, json).and_then(|()| err.flush()) {
+        log::error!("writing the report: {e}");
+    }
+}
+
+/// Attributes the window `[exec, end)` and writes the report to `w`. `meta.wall_ns` is
 /// filled in here.
-fn report(trace: &Trace, end: u64, mut meta: Meta, json: bool) {
+fn write_report(
+    w: &mut dyn io::Write,
+    trace: &Trace,
+    end: u64,
+    mut meta: Meta,
+    json: bool,
+) -> io::Result<()> {
     let (Some(root), Some(start)) = (trace.root, trace.window.start) else {
-        eprintln!(
+        return writeln!(
+            w,
             "whytime: the command's exec was not observed ({} records lost); no report",
             meta.dropped
         );
-        return;
     };
     let end = end.max(start);
     meta.wall_ns = end - start;
     let report = Report::new(trace, attribute::attribute(trace, root, start, end), meta);
-    let mut err = io::stderr().lock();
-    let written = if json {
-        report.render_json(&mut err)
+    if json {
+        report.render_json(w)
     } else {
-        report.render_human(&mut err)
-    };
-    if let Err(e) = written.and_then(|()| err.flush()) {
-        log::error!("writing the report: {e}");
+        report.render_human(w)
+    }
+}
+
+/// `whytime report FILE`: replays a trace file and prints its report; returns the exit code.
+fn replay(path: &Path, json: bool) -> i32 {
+    let replayed = std::fs::read(path)
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| record::replay(&bytes).map_err(|err| err.to_string()));
+    match replayed {
+        Ok(replay) => {
+            let meta = meta(&replay.header.command, replay.header.syscalls, &replay.end);
+            report(&replay.trace, replay.end.end, meta, json);
+            0
+        }
+        Err(err) => {
+            eprintln!("whytime: {}: {err}", path.display());
+            EXIT_REPLAY
+        }
     }
 }
 

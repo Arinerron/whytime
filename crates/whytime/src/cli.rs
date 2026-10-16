@@ -1,6 +1,7 @@
 //! Command-line interface.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -39,6 +40,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "D", value_parser = parse_duration)]
     pub duration: Option<Duration>,
 
+    /// Also write a trace file to FILE, from which `whytime report FILE` prints the same
+    /// report offline.
+    #[arg(long, value_name = "FILE")]
+    pub record: Option<PathBuf>,
+
     /// The command to run, and its arguments.
     #[arg(
         value_name = "COMMAND",
@@ -55,6 +61,16 @@ pub enum Sub {
     /// Check whether whytime can run on this system and print exact fixes.
     Doctor {
         /// Print the report as JSON (schema bpfdoctor/1).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the report of a trace file written by `--record`, exactly as it was recorded.
+    /// Needs no privileges. Exit status 0, or 2 if FILE cannot be replayed.
+    Report {
+        /// The trace file.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Print the report as JSON (schema whytime.report/1).
         #[arg(long)]
         json: bool,
     },
@@ -110,5 +126,20 @@ mod tests {
 
         let cli = Cli::try_parse_from(["whytime", "doctor", "--json"]).unwrap();
         assert!(matches!(cli.sub, Some(Sub::Doctor { json: true })));
+    }
+
+    #[test]
+    fn record_is_a_run_option_and_report_a_subcommand() {
+        let cli =
+            Cli::try_parse_from(["whytime", "--record", "t.wt", "--", "report", "x"]).unwrap();
+        assert!(cli.sub.is_none());
+        assert_eq!(cli.run.record, Some(PathBuf::from("t.wt")));
+        assert_eq!(cli.run.command, ["report", "x"]);
+
+        let cli = Cli::try_parse_from(["whytime", "report", "t.wt", "--json"]).unwrap();
+        assert!(matches!(
+            cli.sub,
+            Some(Sub::Report { ref file, json: true }) if file.as_os_str() == "t.wt"
+        ));
     }
 }

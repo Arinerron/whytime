@@ -6,9 +6,10 @@
 //! [`crate::attribute`] can descend from the wrapped command into its descendants.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use procctx::{ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable};
+use procctx::{Config, ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable, StartClock};
 use whytime_abi::{
     CpuSegment, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord, EvHeader, ExecRecord,
     ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE, ST_RUNNING, ST_WOKEN, TaskState,
@@ -20,6 +21,20 @@ use crate::classify::{Blocked, Classifier};
 pub type ProcId = usize;
 /// Index into [`Trace::threads`].
 pub type ThreadId = usize;
+
+/// The process table a [`Trace`] keeps, comparing process starts at clock-tick (`AT_CLKTCK`)
+/// resolution. whytime only feeds it events and looks records up by key, which never reads
+/// `/proc`, so a replayed trace rebuilds it exactly.
+pub fn proc_table(ticks_per_sec: NonZeroU64) -> ProcTable<ProcFs> {
+    ProcTable::new(
+        ProcFs::new(),
+        Config {
+            start_clock: StartClock::BootNs { ticks_per_sec },
+            read_environ: false,
+            ..Config::default()
+        },
+    )
+}
 
 /// What a thread was doing during a [`Seg`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,4 +417,165 @@ impl Trace {
 fn cstr(bytes: &[u8]) -> &[u8] {
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     &bytes[..len]
+}
+
+#[cfg(test)]
+mod tests {
+    use libc::SYS_nanosleep;
+
+    use super::*;
+    use crate::classify::Class;
+    use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, task, trace};
+
+    fn spans(thread: &Thread) -> Vec<(u64, u64)> {
+        thread.segs.iter().map(|s| (s.start, s.end)).collect()
+    }
+
+    fn blocked_class(seg: &Seg) -> Option<Class> {
+        match &seg.kind {
+            SegKind::Blocked(block) => Some(block.what.class),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_episode_chains_on_cpu_blocked_and_runqueue_segments_without_gaps() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        let sleep = sys(SYS_nanosleep);
+        feed(&mut t, &episode(100, 100, seg(1_000, 300, 100), sleep, [1_400, 2_000, 2_100]));
+        feed(&mut t, &exit(3_000, 100, 100, seg(2_100, 900, 0), 0, true));
+
+        let thread = &t.threads[0];
+        assert_eq!(
+            spans(thread),
+            [(1_000, 1_400), (1_400, 2_000), (2_000, 2_100), (2_100, 3_000)]
+        );
+        let segs = &thread.segs;
+        assert!(matches!(segs[0].kind, SegKind::Mixed { run: 300, rq: 100, .. }));
+        assert_eq!(blocked_class(&segs[1]), Some(Class::Sleep));
+        assert_eq!(segs[2].kind, SegKind::Runq);
+        assert!(matches!(segs[3].kind, SegKind::Mixed { run: 900, rq: 0, .. }));
+        assert_eq!(t.procs[0].cpu_ns, 1_200);
+        assert_eq!(
+            t.window,
+            Window {
+                start: Some(1_000),
+                exit: Some(3_000)
+            }
+        );
+    }
+
+    #[test]
+    fn a_wakeup_that_was_not_seen_counts_the_whole_gap_as_blocked() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        let sleep = sys(SYS_nanosleep);
+        // No wakeup observed.
+        feed(&mut t, &episode(100, 100, seg(1_000, 400, 0), sleep, [1_400, 0, 2_100]));
+        // A stale wake time from before the block.
+        feed(&mut t, &episode(100, 100, seg(2_100, 100, 0), sleep, [2_200, 1_500, 2_600]));
+
+        let thread = &t.threads[0];
+        assert_eq!(
+            spans(thread),
+            [(1_000, 1_400), (1_400, 2_100), (2_100, 2_200), (2_200, 2_600)]
+        );
+        assert_eq!(blocked_class(&thread.segs[1]), Some(Class::Sleep));
+        assert_eq!(blocked_class(&thread.segs[3]), Some(Class::Sleep));
+        assert!(thread.segs.iter().all(|s| s.kind != SegKind::Runq));
+    }
+
+    #[test]
+    fn a_non_leader_exec_moves_its_thread_onto_the_leader_tid() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 101, 100));
+        // Thread 101 execs: the kernel ends the leader, then 101 takes over tid 100.
+        feed(&mut t, &exit(1_900, 100, 100, seg(1_000, 900, 0), 0, false));
+        feed(&mut t, &exec(2_000, 101, 100, "tool", seg(1_100, 900, 0)));
+        let sleep = sys(SYS_nanosleep);
+        feed(&mut t, &episode(100, 100, seg(2_000, 100, 0), sleep, [2_100, 2_500, 2_500]));
+        feed(&mut t, &exit(3_000, 100, 100, seg(2_500, 500, 0), 0, true));
+
+        assert_eq!(t.threads.len(), 2, "the post-exec tid is not a new thread");
+        let (leader, execer) = (&t.threads[0], &t.threads[1]);
+        assert_eq!(leader.death, Some(1_900));
+        assert_eq!(execer.tid, 100);
+        assert_eq!(execer.death, Some(3_000));
+        assert_eq!(
+            spans(execer),
+            [(1_100, 2_000), (2_000, 2_100), (2_100, 2_500), (2_500, 3_000)]
+        );
+        let proc = &t.procs[0];
+        assert_eq!(proc.comm_at(1_999).as_ref(), "app");
+        assert_eq!(proc.comm_at(2_000).as_ref(), "tool");
+        assert_eq!(proc.death, Some(3_000));
+    }
+
+    #[test]
+    fn only_the_last_thread_of_the_command_ends_the_window() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 101, 100));
+        feed(&mut t, &fork(1_200, 100, 100, 200, 200));
+
+        feed(&mut t, &exit(2_000, 101, 100, seg(1_100, 900, 0), 0, false));
+        assert_eq!(t.threads[1].death, Some(2_000));
+        assert_eq!(t.procs[0].death, None);
+        // A child process ending is not the command ending.
+        feed(&mut t, &exit(2_500, 200, 200, seg(1_200, 1_300, 0), 0, true));
+        assert_eq!(t.procs[1].death, Some(2_500));
+        assert_eq!(t.window.exit, None);
+
+        feed(&mut t, &exit(3_000, 100, 100, seg(1_000, 2_000, 0), 7 << 8, true));
+        assert_eq!(t.procs[0].death, Some(3_000));
+        assert_eq!(t.window.exit, Some(3_000));
+        let info = t.table.get_key(t.procs[0].key).expect("root in the process table");
+        assert_eq!(info.exit.and_then(|exit| exit.code), Some(7 << 8));
+    }
+
+    #[test]
+    fn the_sweep_closes_every_open_interval_at_the_window_end() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        for tid in 101..=103 {
+            feed(&mut t, &fork(1_000 + u64::from(tid - 100) * 100, 100, 100, tid, 100));
+        }
+        let mut blocked = task(100, ST_BLOCKED, seg(1_000, 500, 0));
+        blocked.block_ts = 1_500;
+        blocked.sys = sys(SYS_nanosleep);
+        let mut woken = task(100, ST_WOKEN, seg(1_100, 400, 0));
+        woken.block_ts = 1_500;
+        woken.wake_ts = 9_000;
+        woken.sys = sys(SYS_nanosleep);
+        let mut running = task(100, ST_RUNNING, seg(1_200, 300, 0));
+        running.last_ts = 9_500;
+        let mut preempted = task(100, ST_RUNNABLE, seg(1_300, 300, 0));
+        preempted.last_ts = 9_500;
+        let untracked = task(999, ST_RUNNING, seg(0, 1, 0));
+        let tasks = [
+            (100, blocked),
+            (101, woken),
+            (102, running),
+            (103, preempted),
+            (999, untracked),
+        ];
+        t.sweep(&tasks, 10_000);
+
+        assert_eq!(t.threads.len(), 4);
+        let [blocked, woken, running, preempted] = [0, 1, 2, 3].map(|i| &t.threads[i]);
+        assert_eq!(spans(blocked), [(1_000, 1_500), (1_500, 10_000)]);
+        assert_eq!(blocked_class(&blocked.segs[1]), Some(Class::Sleep));
+        assert_eq!(
+            spans(woken),
+            [(1_100, 1_500), (1_500, 9_000), (9_000, 10_000)]
+        );
+        assert_eq!(woken.segs[2].kind, SegKind::Runq);
+        assert_eq!(spans(running), [(1_200, 10_000)]);
+        assert!(matches!(running.segs[0].kind, SegKind::Mixed { run: 800, rq: 0, .. }));
+        assert_eq!(spans(preempted), [(1_300, 10_000)]);
+        assert!(matches!(preempted.segs[0].kind, SegKind::Mixed { run: 300, rq: 500, .. }));
+        assert_eq!(t.procs[0].cpu_ns, 500 + 400 + 800 + 300);
+    }
 }

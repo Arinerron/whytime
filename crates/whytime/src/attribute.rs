@@ -286,3 +286,114 @@ impl Walker<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use libc::{SYS_nanosleep, SYS_wait4};
+
+    use super::*;
+    use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
+
+    /// Nanoseconds of the line `(class, subject)`.
+    fn ns(attribution: &Attribution, class: Class, subject: &str) -> u64 {
+        attribution
+            .lines
+            .iter()
+            .filter(|line| line.class == class && line.subject == subject)
+            .map(|line| line.ns)
+            .sum()
+    }
+
+    fn total(attribution: &Attribution) -> u64 {
+        attribution.lines.iter().map(|line| line.ns).sum()
+    }
+
+    #[test]
+    fn lines_partition_the_window_and_clip_mixed_segments_proportionally() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        let sleep = sys(SYS_nanosleep);
+        feed(&mut t, &episode(100, 100, seg(1_000, 300, 100), sleep, [1_400, 2_000, 2_100]));
+        feed(&mut t, &exit(3_000, 100, 100, seg(2_100, 900, 0), 0, true));
+
+        let whole = attribute(&t, 0, 1_000, 3_000);
+        assert_eq!(total(&whole), 2_000);
+        assert_eq!(ns(&whole, Class::Cpu, "app"), 1_200);
+        assert_eq!(ns(&whole, Class::Runqueue, "app"), 200);
+        assert_eq!(ns(&whole, Class::Sleep, "app"), 600);
+
+        // Half of the first segment: on-CPU and preempted keep their 3:1 ratio.
+        let clipped = attribute(&t, 0, 1_200, 2_050);
+        assert_eq!(total(&clipped), 850);
+        assert_eq!(ns(&clipped, Class::Cpu, "app"), 150);
+        assert_eq!(ns(&clipped, Class::Runqueue, "app"), 50 + 50);
+        assert_eq!(ns(&clipped, Class::Sleep, "app"), 600);
+    }
+
+    #[test]
+    fn a_wait_is_explained_by_the_child_that_woke_it() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "sh", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 200, 200));
+        feed(&mut t, &fork(1_200, 100, 100, 300, 300));
+        feed(&mut t, &exec(1_300, 200, 200, "woke", seg(1_100, 200, 0)));
+        feed(&mut t, &exec(1_300, 300, 300, "younger", seg(1_200, 100, 0)));
+        // Both children outlive the wait; without the waker, the younger one would explain it.
+        let mut wait = episode(100, 100, seg(1_000, 300, 0), sys(SYS_wait4), [1_300, 5_000, 5_000]);
+        wait.waker_tid = 200;
+        wait.waker_tgid = 200;
+        feed(&mut t, &wait);
+        feed(&mut t, &exit(6_000, 200, 200, seg(1_300, 4_700, 0), 0, true));
+        feed(&mut t, &exit(7_000, 300, 300, seg(1_300, 5_700, 0), 0, true));
+        feed(&mut t, &exit(8_000, 100, 100, seg(5_000, 3_000, 0), 0, true));
+
+        let a = attribute(&t, 0, 1_000, 8_000);
+        assert_eq!(total(&a), 7_000);
+        assert_eq!(ns(&a, Class::Child, "woke"), 3_700);
+        assert_eq!(ns(&a, Class::Child, "younger"), 0);
+        assert_eq!(ns(&a, Class::Cpu, "sh"), 300 + 3_000);
+    }
+
+    #[test]
+    fn time_no_record_covers_is_other_untraced() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        let sleep = sys(SYS_nanosleep);
+        feed(&mut t, &episode(100, 100, seg(1_000, 100, 0), sleep, [1_100, 1_500, 1_500]));
+        // The episode covering [1500, 2500) was lost.
+        feed(&mut t, &episode(100, 100, seg(2_500, 100, 0), sleep, [2_600, 3_000, 3_000]));
+        feed(&mut t, &exit(4_000, 100, 100, seg(3_000, 1_000, 0), 0, true));
+
+        let a = attribute(&t, 0, 1_000, 4_000);
+        assert_eq!(total(&a), 3_000);
+        assert_eq!(ns(&a, Class::Other, "untraced"), 1_000);
+        assert_eq!(ns(&a, Class::Cpu, "app"), 1_200);
+        assert_eq!(ns(&a, Class::Sleep, "app"), 800);
+        // Past the last record of the process, too.
+        let longer = attribute(&t, 0, 1_000, 4_500);
+        assert_eq!(ns(&longer, Class::Other, "untraced"), 1_500);
+    }
+
+    #[test]
+    fn each_program_of_an_exec_chain_is_named_by_its_own_comm() {
+        // `make` runs a `bash` wrapper that execs `git`, and waits for it.
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "make", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 200, 200));
+        feed(&mut t, &exec(1_300, 200, 200, "bash", seg(1_100, 200, 0)));
+        feed(&mut t, &exec(3_300, 200, 200, "git", seg(1_300, 2_000, 0)));
+        feed(&mut t, &exit(8_000, 200, 200, seg(3_300, 4_700, 0), 0, true));
+        let wait = sys(SYS_wait4);
+        feed(&mut t, &episode(100, 100, seg(1_000, 100, 0), wait, [1_100, 9_000, 9_000]));
+        feed(&mut t, &exit(10_000, 100, 100, seg(9_000, 1_000, 0), 0, true));
+
+        let a = attribute(&t, 0, 1_000, 10_000);
+        assert_eq!(total(&a), 9_000);
+        assert_eq!(ns(&a, Class::Cpu, "make"), 100 + 1_000);
+        // Before its exec the child still carries its parent's comm.
+        assert_eq!(ns(&a, Class::Child, "make"), 200);
+        assert_eq!(ns(&a, Class::Child, "bash"), 2_000);
+        // git's own CPU, then the wait after it exited, until make ran again.
+        assert_eq!(ns(&a, Class::Child, "git"), 4_700 + 1_000);
+    }
+}

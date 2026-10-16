@@ -3,7 +3,8 @@
 //! Runs as records arrive, while the blocked process and its descriptor most likely still
 //! exist, because file paths come from `/proc/<pid>/fd/<fd>`. A path is trusted only if the
 //! file it names has the device and inode the kernel reported; otherwise the subject falls
-//! back to `dev M:m ino N`.
+//! back to `dev M:m ino N`. That lookup is the classifier's only outside input, behind
+//! [`FdTarget`] so trace files can record and replay it ([`crate::record`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -119,23 +120,49 @@ const TASK_TRACED: u32 = 0x8;
 /// `O_DSYNC`; `O_SYNC` includes it.
 const O_DSYNC: u32 = 0o10_000;
 
+/// What a descriptor's `/proc` link names: the classifier's only external lookup.
+pub trait FdTarget: fmt::Debug {
+    /// The target of `/proc/<tgid>/fd/<fd>`, if that link still names the file with inode
+    /// `ino` on `dev` (kernel `dev_t`).
+    fn fd_target(&self, tgid: u32, fd: i32, dev: u32, ino: u64) -> Option<PathBuf>;
+}
+
+/// [`FdTarget`] reading `/proc`.
+#[derive(Debug)]
+pub struct ProcFd;
+
+impl FdTarget for ProcFd {
+    fn fd_target(&self, tgid: u32, fd: i32, dev: u32, ino: u64) -> Option<PathBuf> {
+        let link = PathBuf::from(format!("/proc/{tgid}/fd/{fd}"));
+        let meta = std::fs::metadata(&link).ok()?;
+        let dev = u64::from(dev);
+        let same_file = meta.ino() == ino
+            && libc::major(meta.dev()) == u32::try_from(dev >> 20).ok()?
+            && libc::minor(meta.dev()) == u32::try_from(dev & 0xf_ffff).ok()?;
+        if !same_file {
+            return None;
+        }
+        std::fs::read_link(&link).ok()
+    }
+}
+
 /// Classifies blocks, resolving and caching file paths.
 #[derive(Debug)]
 pub struct Classifier {
     syscalls: SyscallTable,
-    proc_root: PathBuf,
     home: Option<PathBuf>,
+    files: Box<dyn FdTarget>,
     /// `(dev, ino)` → subject path; `None` when resolution failed.
     paths: HashMap<(u32, u64), Option<Arc<str>>>,
 }
 
 impl Classifier {
-    /// `home` is abbreviated to `~` in paths.
-    pub fn new(syscalls: SyscallTable, home: Option<PathBuf>) -> Self {
+    /// `home` is abbreviated to `~` in paths; `files` resolves descriptors to paths.
+    pub fn new(syscalls: SyscallTable, home: Option<PathBuf>, files: Box<dyn FdTarget>) -> Self {
         Self {
             syscalls,
-            proc_root: PathBuf::from("/proc"),
             home,
+            files,
             paths: HashMap::new(),
         }
     }
@@ -232,16 +259,7 @@ impl Classifier {
     }
 
     fn resolve(&self, tgid: u32, sys: &SysInfo) -> Option<String> {
-        let link = self.proc_root.join(format!("{tgid}/fd/{}", sys.fd));
-        let meta = std::fs::metadata(&link).ok()?;
-        let dev = u64::from(sys.dev);
-        let same_file = meta.ino() == sys.ino
-            && libc::major(meta.dev()) == u32::try_from(dev >> 20).ok()?
-            && libc::minor(meta.dev()) == u32::try_from(dev & 0xf_ffff).ok()?;
-        if !same_file {
-            return None;
-        }
-        let target = std::fs::read_link(&link).ok()?;
+        let target = self.files.fd_target(tgid, sys.fd, sys.dev, sys.ino)?;
         let target = target.to_string_lossy();
         let path = Path::new(target.strip_suffix(" (deleted)").unwrap_or(&target));
         let shown = if sys.mode == S_IFREG {
@@ -295,11 +313,47 @@ mod tests {
         }
     }
 
+    /// Descriptor targets by `(dev, ino)`; no `/proc` involved.
+    #[derive(Debug, Default)]
+    struct Files(HashMap<(u32, u64), PathBuf>);
+
+    impl FdTarget for Files {
+        fn fd_target(&self, _tgid: u32, _fd: i32, dev: u32, ino: u64) -> Option<PathBuf> {
+            self.0.get(&(dev, ino)).cloned()
+        }
+    }
+
+    fn classifier_with(files: Files) -> Classifier {
+        Classifier::new(
+            SyscallTable::new(),
+            Some(PathBuf::from("/home/u")),
+            Box::new(files),
+        )
+    }
+
     fn classifier() -> Classifier {
-        let mut c = Classifier::new(SyscallTable::new(), Some(PathBuf::from("/home/u")));
-        // Fixture-free: no /proc lookups succeed under this root.
-        c.proc_root = PathBuf::from("/nonexistent");
-        c
+        classifier_with(Files::default())
+    }
+
+    #[test]
+    fn files_are_named_by_their_directory_and_devices_by_themselves() {
+        let dev = (8 << 20) | 1;
+        let mut files = Files::default();
+        files
+            .0
+            .insert((dev, 10), PathBuf::from("/home/u/proj/.git/index (deleted)"));
+        files.0.insert((dev, 11), PathBuf::from("/dev/sda1"));
+        let mut c = classifier_with(files);
+        let mut s = sys(libc::SYS_fsync);
+        s.mode = S_IFREG;
+        s.dev = dev;
+        s.ino = 10;
+        let b = c.classify(1, &s, 2);
+        assert_eq!(b.class, Class::Fsync);
+        assert_eq!(b.subject.to_string(), "~/proj/.git");
+        s.mode = S_IFBLK;
+        s.ino = 11;
+        assert_eq!(c.classify(1, &s, 2).subject.to_string(), "/dev/sda1");
     }
 
     #[test]
