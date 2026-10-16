@@ -347,6 +347,7 @@ impl Classifier {
             Kind::PathFs => plain(Class::File, Subject::Syscall(syscall.name)),
             Kind::Other => plain(Class::Other, Subject::Syscall(syscall.name)),
             Kind::Fsync => plain(Class::Fsync, self.file_or_syscall(tgid, fd, syscall.name)),
+            Kind::FsyncNoFd => plain(Class::Fsync, Subject::Syscall(syscall.name)),
             Kind::Lock => plain(Class::Lock, self.file_or_syscall(tgid, fd, syscall.name)),
             Kind::Fcntl if waits_for_lock(detail.args[1]) => {
                 plain(Class::Lock, self.file_or_syscall(tgid, fd, syscall.name))
@@ -807,6 +808,18 @@ mod tests {
         let b = c.classify(1, &s, &d, 2);
         assert_eq!(b.class, Class::Fsync);
         assert_eq!(b.subject.to_string(), "dev 8:1 ino 12");
+    }
+
+    #[test]
+    fn sync_and_msync_name_the_syscall_whatever_their_first_argument() {
+        // sync() takes no argument and msync() an address: a file described from arg0 (an
+        // earlier call's fd left in the register, as older trace files carry) is not theirs.
+        let mut c = classifier();
+        let rooted = detail(SYSD_PATH_ROOTED, &["hostname", "etc"]);
+        for (nr, name) in [(libc::SYS_sync, "sync"), (libc::SYS_msync, "msync")] {
+            let b = c.classify(1, &file(nr, 4), &rooted, 2);
+            assert_eq!((b.class, b.subject), (Class::Fsync, Subject::Syscall(name)));
+        }
     }
 
     #[test]
