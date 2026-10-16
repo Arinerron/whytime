@@ -1,6 +1,6 @@
 //! `whytime doctor` and the start-up diagnostics: the shared bpfdoctor checks plus whytime's
-//! own probes (`probe.sched`, `probe.syscalls`, `probe.readiness`, `probe.faults`), which load
-//! and attach the real programs.
+//! own probes (`probe.sched`, `probe.syscalls`, `probe.dns`, `probe.readiness`,
+//! `probe.faults`), which load and attach the real programs.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use bpfdoctor::{
 };
 
 use crate::sys::SyscallTable;
-use crate::tracer::{self, FAULTS, READINESS, SCHED, SYSCALLS, Tracer};
+use crate::tracer::{self, DNS, FAULTS, READINESS, SCHED, SYSCALLS, Tracer};
 
 /// whytime as bpfdoctor sees it.
 pub fn tool() -> Tool {
@@ -79,7 +79,7 @@ struct Outcome {
     sched: Result<String, anyhow::Error>,
     /// The optional program sets, in [`OPTIONAL`] order; `None` when the scheduler probe
     /// failed and nothing else was tried.
-    optional: Option<[Result<String, anyhow::Error>; 3]>,
+    optional: Option<[Result<String, anyhow::Error>; 4]>,
 }
 
 impl Probe {
@@ -101,6 +101,9 @@ impl Probe {
                         loaded
                             .syscalls
                             .map(|()| attached("tp_btf/sys_enter and sys_exit", &SYSCALLS)),
+                        loaded
+                            .dns
+                            .map(|()| attached("tp_btf/sys_exit with resolver capture", &[DNS])),
                         loaded.readiness.map(|()| {
                             attached("fentry/pollwake and ep_poll_callback", &READINESS)
                         }),
@@ -214,7 +217,7 @@ struct OptionalSpec {
 }
 
 /// Optional program sets, in the order of [`Outcome::optional`].
-static OPTIONAL: [OptionalSpec; 3] = [
+static OPTIONAL: [OptionalSpec; 4] = [
     OptionalSpec {
         id: "probe.syscalls",
         title: "Syscall tracepoints",
@@ -222,6 +225,16 @@ static OPTIONAL: [OptionalSpec; 3] = [
                  peer, futex, ...)",
         explain: "the syscall in flight when a thread blocks says what it waited for; \
                   tp_btf/sys_enter and sys_exit record it",
+        functions: None,
+    },
+    OptionalSpec {
+        id: "probe.dns",
+        title: "Resolver capture",
+        impact: "network peers are reported as ip:port instead of the hostname the program \
+                 resolved",
+        explain: "a tp_btf/sys_exit variant copies what traced threads receive from DNS servers \
+                  (port 53) and systemd-resolved's varlink socket, so peers can be named; \
+                  without it the plain sys_exit program is attached",
         functions: None,
     },
     OptionalSpec {

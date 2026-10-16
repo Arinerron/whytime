@@ -15,7 +15,7 @@ critical path: 3 processes · 0 events lost
 whytime runs a command, traces it and every process it starts with eBPF, and splits the
 wall-clock time along the command's critical path: on-CPU, waiting on a child that was
 computing, timer sleeps, fsync (per directory), file I/O, file locks (`flock`/`fcntl`),
-async I/O completions (io_uring, AIO), network peers (`ip:port`), pipes and other IPC,
+async I/O completions (io_uring, AIO), network peers (`example.com:443`), pipes and other IPC,
 futexes, polling, page faults (per mapped file's directory), waiting for a CPU. Shares always
 add up to 100% of the wall time. When the command waits on another of its threads or
 processes (joining workers, a contended lock, a pipe, a child), the time is explained by what
@@ -24,7 +24,11 @@ sleep is the sleep. A poll/select/epoll wait is reported as the descriptor that 
 (so `curl` shows its server, not "poll"), and a pipe or poll wait ended by a process outside
 the tree names it (`woken by dbus-daemon`). File subjects are captured in the kernel when the
 process blocks, so they name the directory even for processes that are gone by the time
-whytime reports.
+whytime reports. Network peers are named after the host the command looked up, read from
+its resolver's answers (DNS on port 53 over UDP or TCP, or systemd-resolved as glibc's
+`getaddrinfo` uses it), so `curl https://example.com` shows `blocked on network:
+example.com:443`; peers reached by address, or looked up before whytime started, stay
+`ip:port`. In `--json`, a named peer's line also carries its numeric address (`addr`).
 
 ```
 $ whytime -- ./build.sh            # report on stderr; the command's output passes through
@@ -123,7 +127,7 @@ code may be distributed under the GPL). The vendored libbpf headers in
 
 ## Status: MVP
 
-Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, and trace
-files for both (`--record`, `whytime report`). Not yet: flamegraphs, hostnames for network
-peers (DNS correlation). The attribution model, its limits, and the developer guide are in
+Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, hostnames for
+network peers, and trace files for both (`--record`, `whytime report`). Not yet:
+flamegraphs. The attribution model, its limits, and the developer guide are in
 [AGENTS.md](AGENTS.md).

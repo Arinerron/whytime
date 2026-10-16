@@ -3,17 +3,18 @@
 //! A trace file holds every input the report is computed from, so replaying it through the
 //! same [`Trace`], attribution and report code prints the identical report offline, without
 //! BPF and without the traced processes: the raw ring buffer records in arrival order (with
-//! the file paths the kernel captured), the answer to every external lookup the pipeline made
-//! ([`FdTarget`], the classifier's `/proc/<pid>/fd/<fd>` fallback for paths the kernel could
-//! not capture, keyed by `(dev, ino)` like its cache), the final sweep of the `tasks` map, and
-//! the run's context (command line, root pid, home directory for `~`, syscall probe
-//! availability, `AT_CLKTCK` for procctx, architecture for syscall numbers, how the window
-//! ended, dropped records). Attach mode (`-p`) adds what it read from `/proc`
+//! the file paths the kernel captured and the resolver traffic hostnames come from), the
+//! answer to every external lookup the pipeline made ([`FdTarget`], the classifier's
+//! `/proc/<pid>/fd/<fd>` fallback for paths the kernel could not capture, keyed by
+//! `(dev, ino)` like its cache), the final sweep of the `tasks` map, and the run's context
+//! (command line, root pid, home directory for `~`, optional probe availability, `AT_CLKTCK`
+//! for procctx, architecture for syscall numbers, how the window ended, dropped records and
+//! lost resolver captures). Attach mode (`-p`) adds what it read from `/proc`
 //! before the window: the [`ProcSeed`]s it fed [`Trace::seed`], the window start, and how
 //! many blocked threads had an unreadable syscall. procctx needs nothing else: whytime only
 //! calls its event handlers and `get_key`, which never read `/proc`.
 //!
-//! # Format (version 3)
+//! # Format (version 4)
 //!
 //! Little-endian. A 24-byte preamble, then frames.
 //!
@@ -29,12 +30,12 @@
 //!
 //! | Kind | Frame | Payload |
 //! |---|---|---|
-//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 3 (syscalls, readiness, faults), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
+//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 4 (syscalls, readiness, faults, dns), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
 //! | 2 | record | one ring buffer record, verbatim |
 //! | 3 | lookup | `/proc/<pid>/fd/<fd>`: dev `u32`, ino `u64`, found `u8`, then the link target (rest of the payload) |
 //! | 7 | mapping | `/proc/<pid>/maps`: dev `u32`, ino `u64`, found `u8`, then the mapped path (rest of the payload) |
 //! | 4 | task | tid `u32`, `task_state` (one entry of the final `tasks` sweep) |
-//! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration, 2 interrupt), exit code `opt i32`, dropped `u64` |
+//! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration, 2 interrupt), exit code `opt i32`, dropped `u64`, resolver captures lost `u64` |
 //! | 6 | seed: attach mode only, once, before any record | window start `u64`, count `u32`, then per process: pid `u32`, start `u64` (procctx key), ppid `u32`, seeded at `u64`, comm `bytes`, argv `bytes` (NUL-separated), thread count `u32`, threads × (tid `u32`, entry time `u64`) |
 //!
 //! Frames are written as the run goes; tasks and the end frame when the window ends, so a
@@ -66,7 +67,7 @@ const MAGIC: [u8; 8] = *b"WHYTRACE";
 /// Preamble length (magic, version, zero, ABI hash): the header frame's offset.
 const PREAMBLE: usize = MAGIC.len() + 16;
 /// Format version written and read.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// Architecture whose syscall numbers this build classifies.
 const ARCH: &str = std::env::consts::ARCH;
 
@@ -87,6 +88,8 @@ pub struct Probes {
     pub readiness: bool,
     /// Page-fault fentry/fexit programs.
     pub faults: bool,
+    /// The resolver capture (`sys_exit` copying resolver replies).
+    pub dns: bool,
 }
 
 /// What the recording run knew when the window opened.
@@ -130,6 +133,8 @@ pub struct End {
     pub exit_code: Option<i32>,
     /// Records or tasks lost in kernel.
     pub dropped: u64,
+    /// Resolver sockets or payloads the kernel could not capture.
+    pub dns_lost: u64,
 }
 
 /// Why a trace file cannot be replayed.
@@ -229,6 +234,7 @@ impl Recorder {
             .u8(u8::from(header.probes.syscalls))
             .u8(u8::from(header.probes.readiness))
             .u8(u8::from(header.probes.faults))
+            .u8(u8::from(header.probes.dns))
             .u64(header.ticks_per_sec.get())
             .bytes(header.arch.as_bytes());
         match &header.home {
@@ -295,7 +301,8 @@ impl Recorder {
                 EndedBy::Interrupt => 2,
             })
             .opt(end.exit_code, Enc::i32)
-            .u64(end.dropped);
+            .u64(end.dropped)
+            .u64(end.dns_lost);
         self.frame(F_END, &[&p.0]);
         let mut sink = self.0.borrow_mut();
         if sink.error.is_none()
@@ -678,6 +685,7 @@ impl<'a> Dec<'a> {
             syscalls: self.flag()?,
             readiness: self.flag()?,
             faults: self.flag()?,
+            dns: self.flag()?,
         };
         let ticks_per_sec =
             NonZeroU64::new(self.u64()?).ok_or_else(|| malformed(self.at - 8, "zero AT_CLKTCK"))?;
@@ -755,6 +763,7 @@ impl<'a> Dec<'a> {
         };
         let exit_code = self.opt(Self::i32)?;
         let dropped = self.u64()?;
+        let dns_lost = self.u64()?;
         self.done()?;
         Ok(End {
             start,
@@ -762,6 +771,7 @@ impl<'a> Dec<'a> {
             ended_by,
             exit_code,
             dropped,
+            dns_lost,
         })
     }
 }
@@ -773,11 +783,11 @@ fn malformed(at: usize, what: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use libc::SYS_fsync;
-    use whytime_abi::ST_RUNNING;
+    use libc::{SYS_fsync, SYS_recvfrom};
+    use whytime_abi::{DNS_UDP, ST_RUNNING};
 
     use super::*;
-    use crate::testkit::{episode, exec, seg, sys, task};
+    use crate::testkit::{dns, episode, exec, seg, sys, task};
 
     const DEV: u32 = (8 << 20) | 1;
     const INO: u64 = 42;
@@ -813,6 +823,7 @@ mod tests {
                 syscalls: true,
                 readiness: true,
                 faults: true,
+                dns: true,
             },
             ticks_per_sec: NonZeroU64::new(100).expect("non-zero"),
             attached: attached.then_some(Attached {
@@ -862,8 +873,22 @@ mod tests {
         fault.fault.dev = DEV;
         fault.fault.ino = INO + 1;
         live(&mut trace, wire::as_bytes(&fault));
-        let mut running = task(100, ST_RUNNING, seg(2_800, 0, 0));
-        running.last_ts = 2_800;
+        // A DNS answer (db.internal A 10.0.0.9, as a UDP resolver sends it), then a block on a
+        // socket connected to 10.0.0.9:5432: the hostname comes from the recorded records.
+        let mut answer = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        answer.extend_from_slice(b"\x02db\x08internal\x00\x00\x01\x00\x01");
+        answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 9]);
+        live(&mut trace, wire::as_bytes(&dns(100, 77, DNS_UDP, false, &answer)));
+        let mut recv = sys(SYS_recvfrom);
+        recv.mode = 0o140_000;
+        recv.family = 2;
+        recv.port = 5432;
+        recv.addr[..4].copy_from_slice(&[10, 0, 0, 9]);
+        recv.ino = 78;
+        let net = episode(100, 100, seg(2_800, 0, 0), recv, [2_800, 2_900, 2_900]);
+        live(&mut trace, wire::as_bytes(&net));
+        let mut running = task(100, ST_RUNNING, seg(2_900, 0, 0));
+        running.last_ts = 2_900;
         let tasks = [(100, running)];
         trace.sweep(&tasks, 3_000);
         let end = End {
@@ -876,6 +901,7 @@ mod tests {
             },
             exit_code: None,
             dropped: 2,
+            dns_lost: 0,
         };
         recorder.finish(&tasks, &end).expect("writing the trace file");
 
@@ -911,7 +937,10 @@ mod tests {
         assert!(replayed.contains("\"subject\": \"~/proj\""), "{replayed}");
         // The page fault's file came from the recorded mapping.
         assert!(replayed.contains("\"subject\": \"~/maps\""), "{replayed}");
-        assert!(replayed.contains("\"events\": 5"), "{replayed}");
+        // The peer's name came from the recorded resolver answer.
+        assert!(replayed.contains("\"subject\": \"db.internal:5432\""), "{replayed}");
+        assert!(replayed.contains("\"addr\": \"10.0.0.9:5432\""), "{replayed}");
+        assert!(replayed.contains("\"events\": 7"), "{replayed}");
     }
 
     #[test]

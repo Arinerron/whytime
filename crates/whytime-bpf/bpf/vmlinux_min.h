@@ -152,6 +152,7 @@ struct sock {
 };
 
 struct socket {
+	short type;
 	struct sock *sk;
 };
 

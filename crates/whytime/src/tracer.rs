@@ -8,7 +8,7 @@ use aya::maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf};
 use aya::programs::{Program, ProgramError};
 use aya::sys::SyscallError;
 use aya::{Btf, Ebpf, EbpfLoader, Pod};
-use whytime_abi::{STAT_NR, TaskState};
+use whytime_abi::{STAT_DNS_LOST, STAT_RING_FULL, STAT_TASKS_FULL, STAT_TRACKED_FULL, TaskState};
 
 use crate::sys::SyscallTable;
 
@@ -21,10 +21,19 @@ pub const SCHED: [(&str, &str); 5] = [
     ("on_exit", "sched_process_exit"),
 ];
 
-/// Syscall programs; without them blocks are not classified. `sys_exit` attaches first: on
-/// its own it only clears state, while `sys_enter` alone would leave stale syscalls behind.
-pub const SYSCALLS: [(&str, &str); 2] =
-    [("on_sys_exit", "sys_exit"), ("on_sys_enter", "sys_enter")];
+/// Syscall programs, `sys_exit` (one of these two) and then `sys_enter`; without them
+/// blocks are not classified. `sys_exit` attaches first: on its own it only clears state,
+/// while `sys_enter` alone would leave stale syscalls behind. The second exit program,
+/// [`DNS`], is tried first; the plain one is the fallback.
+pub const SYSCALLS: [(&str, &str); 3] = [
+    ("on_sys_exit", "sys_exit"),
+    ("on_sys_exit_dns", "sys_exit"),
+    ("on_sys_enter", "sys_enter"),
+];
+
+/// The resolver capture: the `sys_exit` program that also copies what tracked threads
+/// receive from resolver sockets into the ring. Without it network peers stay `ip:port`.
+pub const DNS: (&str, &str) = SYSCALLS[1];
 
 /// Readiness programs, `(program, kernel function)` (fentry): which file ended a
 /// poll/select or epoll wait. Without them those waits stay class `poll`.
@@ -76,6 +85,9 @@ pub struct Loaded {
     pub tracer: Tracer,
     /// Why the syscall programs could not be attached, if they could not.
     pub syscalls: Result<(), anyhow::Error>,
+    /// Why the resolver capture could not be attached, if it could not (always an error
+    /// when the syscall programs are missing: it needs `sys_enter`).
+    pub dns: Result<(), anyhow::Error>,
     /// Why the readiness programs could not be attached, if they could not.
     pub readiness: Result<(), anyhow::Error>,
     /// Why the page-fault programs could not be attached, if they could not.
@@ -112,7 +124,16 @@ impl Tracer {
         }
 
         attach_all(&mut ebpf, &btf, &SCHED)?;
-        let syscalls = attach_all(&mut ebpf, &btf, &SYSCALLS);
+        // One sys_exit program: the capturing one if the kernel takes it.
+        let dns = attach_all(&mut ebpf, &btf, &[DNS]);
+        let syscalls = match &dns {
+            Ok(()) => attach_all(&mut ebpf, &btf, &[SYSCALLS[2]]),
+            Err(_) => attach_all(&mut ebpf, &btf, &[SYSCALLS[0], SYSCALLS[2]]),
+        };
+        let dns = match (&syscalls, dns) {
+            (Err(_), Ok(())) => Err(anyhow::anyhow!("sys_enter is not attached")),
+            (_, dns) => dns,
+        };
         let readiness = attach_all(&mut ebpf, &btf, &READINESS);
         let faults = attach_all(&mut ebpf, &btf, &FAULTS);
 
@@ -125,6 +146,7 @@ impl Tracer {
         Ok(Loaded {
             tracer: Self { ebpf, maps },
             syscalls,
+            dns,
             readiness,
             faults,
         })
@@ -215,10 +237,22 @@ impl Maps {
         self.tasks.iter().filter_map(Result::ok).collect()
     }
 
-    /// Records and tasks lost in kernel (all `stats` slots, all CPUs).
+    /// Records and tasks lost in kernel (ring buffer, `tasks` or `tracked` full; all CPUs).
     pub fn dropped(&self) -> u64 {
-        (0..STAT_NR)
-            .filter_map(|slot| self.stats.get(&slot, 0).ok())
+        self.stat(&[STAT_RING_FULL, STAT_TASKS_FULL, STAT_TRACKED_FULL])
+    }
+
+    /// Resolver sockets the kernel could not remember and resolver payloads it could not
+    /// copy (all CPUs).
+    pub fn dns_lost(&self) -> u64 {
+        self.stat(&[STAT_DNS_LOST])
+    }
+
+    /// Sum of `stats` slots over all CPUs.
+    fn stat(&self, slots: &[u32]) -> u64 {
+        slots
+            .iter()
+            .filter_map(|slot| self.stats.get(slot, 0).ok())
             .map(|per_cpu| per_cpu.iter().sum::<u64>())
             .sum()
     }

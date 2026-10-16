@@ -13,10 +13,10 @@
 mod cli;
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail, ensure};
@@ -37,6 +37,25 @@ const OVERHEAD_RUNS: usize = 5;
 /// Highest accepted traced/untraced on-CPU time ratio of `wt-syscalls`: measured 1.4–1.8
 /// under parallel load (describing every syscall at `sys_enter`, as before, measured 2.2).
 const MAX_OVERHEAD: f64 = 2.5;
+/// Where the suite's DNS server (`wt-dns serve`) listens: port 53, as resolver capture
+/// expects, on a loopback address of its own.
+const DNS_SERVER: &str = "127.0.0.153:53";
+/// The name it resolves, to 127.0.0.1 (the slow server's address).
+const DNS_NAME: &str = "slow.whytime.test";
+/// systemd-resolved's varlink socket, which glibc's nss-resolve talks to.
+const RESOLVED_SOCKET: &str = "/run/systemd/resolve/io.systemd.Resolve";
+
+/// A check outcome that is neither pass nor failure: the host lacks what the scenario needs.
+#[derive(Debug)]
+struct Skip(String);
+
+impl std::fmt::Display for Skip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Skip {}
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -118,6 +137,10 @@ fn test_e2e() -> anyhow::Result<()> {
     ensure!(made.status.success(), "mkfifo {} failed", fifo.display());
     let watched = work.join("waker.watched");
     std::fs::write(&watched, b"").with_context(|| format!("creating {}", watched.display()))?;
+    let mut dns_server = dns_server(&bins["wt-dns"], &work)?;
+    let dns_trace = work.join("dns.wt");
+    let port = server.port().to_string();
+    let varlink_skip = varlink_skip();
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -300,6 +323,48 @@ fn test_e2e() -> anyhow::Result<()> {
                 move |out: &Output| check_attach_record(out, &whytime, &trace, &work)
             }),
         ),
+        (
+            // wt-dns asks the suite's DNS server for slow.whytime.test from an unconnected UDP
+            // socket, then connects to the slow server at the answer; recorded and replayed.
+            "dns-udp",
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.arg("-n").arg(whytime).args(["--json", "--record"]);
+                cmd.arg(&dns_trace).arg("--").arg(bin("wt-dns"));
+                cmd.args(["udp", DNS_SERVER, DNS_NAME, &port, "3"]);
+                cmd
+            },
+            Box::new({
+                let (whytime, trace, work) = (whytime.clone(), dns_trace.clone(), work.clone());
+                move |out: &Output| {
+                    let named = check_host(out, DNS_NAME, server)?;
+                    let replayed = check_replay(out, &whytime, &trace, &work)?;
+                    Ok(format!("{named}; {replayed}"))
+                }
+            }),
+        ),
+        (
+            // The same over TCP: length prefix and message read separately, like glibc.
+            "dns-tcp",
+            sudo(&[&bin("wt-dns"), "tcp", DNS_SERVER, DNS_NAME, &port, "3"]),
+            Box::new(move |out: &Output| check_host(out, DNS_NAME, server)),
+        ),
+        (
+            // glibc's getaddrinfo through nss-resolve asks systemd-resolved over varlink;
+            // then wt-tcp connects to the slow server at 127.0.0.1 (skipped, running `true`,
+            // where that path does not exist).
+            "dns-varlink",
+            if varlink_skip.is_some() {
+                Command::new("true")
+            } else {
+                let script = "getent ahostsv4 localhost >/dev/null && exec \"$0\" \"$1\" 3";
+                sudo(&["sh", "-c", script, &bin("wt-tcp"), &server_arg])
+            },
+            Box::new(move |out: &Output| match &varlink_skip {
+                Some(reason) => Err(Skip(reason.clone()).into()),
+                None => check_host(out, "localhost", server),
+            }),
+        ),
     ];
 
     let mut failed = 0;
@@ -308,6 +373,7 @@ fn test_e2e() -> anyhow::Result<()> {
         let out = run(command.stdin(Stdio::null()))?;
         match check(&out) {
             Ok(summary) => println!("PASS {n} {name}: {summary}"),
+            Err(err) if err.downcast_ref::<Skip>().is_some() => println!("SKIP {n} {name}: {err}"),
             Err(err) => {
                 failed += 1;
                 println!("FAIL {n} {name}: {err:#}");
@@ -316,6 +382,10 @@ fn test_e2e() -> anyhow::Result<()> {
         }
         std::io::stdout().flush()?;
     }
+    // Closing its stdin ends the DNS server; kill it should it linger.
+    drop(dns_server.stdin.take());
+    let _ = dns_server.kill();
+    let _ = dns_server.wait();
     ensure!(failed == 0, "{failed} scenario(s) failed");
     println!("all scenarios passed");
     Ok(())
@@ -370,6 +440,7 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         "wt-poll",
         "wt-fault",
         "wt-fifo",
+        "wt-dns",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -413,6 +484,58 @@ fn slow_server() -> anyhow::Result<SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+/// Starts `wt-dns serve` on [`DNS_SERVER`] answering [`DNS_NAME`] with 127.0.0.1, outside the
+/// traced tree: a copy in `work` with `cap_net_bind_service` (port 53) run as the current
+/// user. It exits when its stdin closes.
+fn dns_server(wt_dns: &Path, work: &Path) -> anyhow::Result<Child> {
+    let dir = work.join("bin");
+    std::fs::create_dir_all(&dir)?;
+    let copy = dir.join("wt-dns-server");
+    // Replace rather than overwrite: the old file may carry capabilities.
+    let _ = std::fs::remove_file(&copy);
+    std::fs::copy(wt_dns, &copy).with_context(|| format!("copying to {}", copy.display()))?;
+    let status = Command::new("sudo")
+        .args(["-n", "setcap", "cap_net_bind_service+ep"])
+        .arg(&copy)
+        .status()?;
+    ensure!(status.success(), "setcap on {} failed", copy.display());
+    let mut child = Command::new(&copy)
+        .args(["serve", DNS_SERVER, &format!("{DNS_NAME}=127.0.0.1")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {}", copy.display()))?;
+    let mut ready = String::new();
+    let stdout = child.stdout.take().context("DNS server stdout")?;
+    BufReader::new(stdout).read_line(&mut ready)?;
+    if ready.trim() != "ready" {
+        let _ = child.kill();
+        bail!("the DNS server did not start on {DNS_SERVER} (see its error above)");
+    }
+    Ok(child)
+}
+
+/// Why the varlink scenario cannot run here, if it cannot: it needs systemd-resolved,
+/// nss-resolve in the `hosts` line of `/etc/nsswitch.conf`, and `getent`.
+fn varlink_skip() -> Option<String> {
+    if !Path::new(RESOLVED_SOCKET).exists() {
+        return Some(format!("{RESOLVED_SOCKET} is absent (systemd-resolved not running)"));
+    }
+    let nss = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+    let resolve = nss
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("hosts:"))
+        .any(|hosts| hosts.split_whitespace().any(|source| source == "resolve"));
+    if !resolve {
+        return Some("/etc/nsswitch.conf does not send host lookups to nss-resolve".to_owned());
+    }
+    let getent = Command::new("getent").args(["ahostsv4", "localhost"]).output();
+    if !getent.is_ok_and(|out| out.status.success()) {
+        return Some("`getent ahostsv4 localhost` fails".to_owned());
+    }
+    None
 }
 
 /// Copies whytime to a non-nosuid directory, grants it the required capabilities and returns
@@ -630,6 +753,27 @@ fn check_tcp(out: &Output, server: SocketAddr) -> anyhow::Result<String> {
         "wall {:.3}s, net {peer} {:.1}%",
         wall_secs(&report),
         net * 100.0
+    ))
+}
+
+/// The `net` line on `server` is named `host:PORT`, with `addr` the numeric `server`, three
+/// connections (one per round) and at least 0.6 of the wall time.
+fn check_host(out: &Output, host: &str, server: SocketAddr) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let subject = format!("{host}:{}", server.port());
+    let line = lines(&report)
+        .into_iter()
+        .find(|l| l["class"] == "net" && l["subject"] == subject.as_str())
+        .with_context(|| format!("no net line {subject}"))?;
+    ensure!(share(line) >= 0.6, "net share for {subject} {:.3} < 0.6", share(line));
+    let addr = server.to_string();
+    ensure!(line["addr"] == addr.as_str(), "addr {} (want {addr})", line["addr"]);
+    ensure!(line["connections"] == 3, "{} connections (want 3)", line["connections"]);
+    Ok(format!(
+        "wall {:.3}s, net {subject} (addr {addr}, 3 connections) {:.1}%",
+        wall_secs(&report),
+        share(line) * 100.0
     ))
 }
 

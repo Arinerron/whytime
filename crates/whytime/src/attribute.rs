@@ -28,6 +28,7 @@
 //! them by class and subject.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
 use crate::classify::{Class, Subject};
 use crate::timeline::{Block, ProcId, Seg, SegKind, ThreadId, Trace};
@@ -43,12 +44,14 @@ const RETRY_CPU_DIVISOR: u64 = 8;
 pub struct Line {
     /// Resource class.
     pub class: Class,
-    /// What within the class: a comm, directory, `ip:port`, or syscall.
+    /// What within the class: a comm, directory, `ip:port`, `host:port`, or syscall.
     pub subject: String,
     /// Nanoseconds attributed.
     pub ns: u64,
     /// Distinct sockets behind a `net` line.
     pub connections: Option<usize>,
+    /// For a `host:port` line, the numeric peer (`ip:port`) that took most of its time.
+    pub addr: Option<String>,
 }
 
 /// One stretch of the critical path: `[start, end)` of the window, explained by `thread`.
@@ -100,6 +103,7 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
         parents: vec![None; trace.procs.len()],
         spans: Vec::new(),
         sockets: HashMap::new(),
+        addrs: HashMap::new(),
         stack: Vec::new(),
         retries: HashMap::new(),
     };
@@ -113,7 +117,12 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
         walker.by_tid.entry(thread.tid).or_default().push(id);
     }
     walker.walk_proc(root, start, end, 0);
-    let Walker { spans, sockets, .. } = walker;
+    let Walker {
+        spans,
+        sockets,
+        addrs,
+        ..
+    } = walker;
 
     let mut totals: HashMap<(Class, &str), u64> = HashMap::new();
     for span in &spans {
@@ -129,6 +138,13 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
                 .get(subject)
                 .map(HashSet::len)
                 .filter(|_| class == Class::Net),
+            addr: addrs.get(subject).and_then(|by_addr| {
+                // Ties go to the lower address, so the choice is the same on replay.
+                by_addr
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                    .map(|(addr, _)| addr.to_string())
+            }),
         })
         .collect();
     lines.sort_by(|a, b| {
@@ -168,6 +184,8 @@ struct Walker<'a> {
     spans: Vec<Span>,
     /// Distinct socket inodes per `net` subject.
     sockets: HashMap<String, HashSet<u64>>,
+    /// Nanoseconds per numeric peer of each `host:port` subject.
+    addrs: HashMap<String, HashMap<SocketAddr, u64>>,
     /// Threads being walked, outermost first. Each is blocked over the interval walked inside
     /// it, so following one again would loop (A waits on B while B waits on A).
     stack: Vec<ThreadId>,
@@ -356,6 +374,10 @@ impl Walker<'_> {
                         .entry(subject.clone())
                         .or_default()
                         .insert(socket);
+                }
+                if let Subject::Host { addr, .. } = &block.what.subject {
+                    let by_addr = self.addrs.entry(subject.clone()).or_default();
+                    *by_addr.entry(*addr).or_default() += s1 - s0;
                 }
                 self.emit(at, s0, s1, class, subject);
             }

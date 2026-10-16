@@ -230,6 +230,29 @@ wire::wire! {
         /// `comm` of the waker of the current block when it is outside the traced tree.
         pub waker_comm: [u8; 16],
     }
+
+    /// Bytes a tracked thread received from (or, for varlink, sent to) a resolver socket:
+    /// a socket connected to port 53, sent a datagram to port 53, or connected to
+    /// systemd-resolved's varlink socket. Emitted at the syscall's exit.
+    pub struct DnsRecord {
+        /// `ts` is the syscall exit.
+        pub hdr: EvHeader,
+        /// Inode of the socket: identifies the resolver connection.
+        pub ino: u64,
+        /// Descriptor the syscall used.
+        pub fd: i32,
+        /// One of the `DNS_UDP`, `DNS_TCP`, `DNS_VARLINK` constants.
+        pub transport: u16,
+        /// 1 for bytes sent (varlink requests), 0 for bytes received.
+        pub sent: u16,
+        /// Bytes the syscall transferred (for `recvmmsg`/`sendmmsg`: of the first message).
+        pub total: u32,
+        /// Leading bytes captured in `data` (at most `DNS_BYTES`; from the first buffer of a
+        /// vector).
+        pub len: u32,
+        /// The payload's leading bytes.
+        pub data: [u8; DNS_BYTES as usize],
+    }
 }
 
 wire::wire_consts! {
@@ -243,6 +266,8 @@ wire::wire_consts! {
     pub const EV_EPISODE: u32 = 3;
     /// [`ExitRecord`].
     pub const EV_EXIT: u32 = 4;
+    /// [`DnsRecord`].
+    pub const EV_DNS: u32 = 5;
 
     /// [`TaskState::state`]: on a CPU.
     pub const ST_RUNNING: u32 = 1;
@@ -265,6 +290,46 @@ wire::wire_consts! {
     pub const SYSF_FD0: u32 = 1;
     /// `sys_flags` bit: arguments 1 and 2 are a user `sockaddr` and its length.
     pub const SYSF_SOCKADDR: u32 = 2;
+    /// `sys_flags`: the resolver capture operation (`DNSOP_*`) of the syscall sits in the
+    /// bits from here up (`sys_flags >> SYSF_DNS_SHIFT`).
+    pub const SYSF_DNS_SHIFT: u32 = 8;
+    /// `DNSOP_*`: `connect(fd, sockaddr, len)`; a resolver target marks the socket.
+    pub const DNSOP_CONNECT: u32 = 1;
+    /// `DNSOP_*`: `close(fd)` forgets the socket.
+    pub const DNSOP_CLOSE: u32 = 2;
+    /// `DNSOP_*`: received into the buffer at argument 1 (`read`, `recvfrom`).
+    pub const DNSOP_READ: u32 = 3;
+    /// `DNSOP_*`: received into the `iovec` array at argument 1 (`readv`).
+    pub const DNSOP_READV: u32 = 4;
+    /// `DNSOP_*`: received into the `msghdr` at argument 1 (`recvmsg`).
+    pub const DNSOP_RECVMSG: u32 = 5;
+    /// `DNSOP_*`: received into the `mmsghdr` array at argument 1 (`recvmmsg`).
+    pub const DNSOP_RECVMMSG: u32 = 6;
+    /// `DNSOP_*`: sent from the buffer at argument 1 (`write`).
+    pub const DNSOP_WRITE: u32 = 7;
+    /// `DNSOP_*`: sent from the buffer at argument 1 to the `sockaddr` in arguments 4 and 5
+    /// (`sendto`); a resolver target marks the socket.
+    pub const DNSOP_SENDTO: u32 = 8;
+    /// `DNSOP_*`: sent from the `iovec` array at argument 1 (`writev`).
+    pub const DNSOP_WRITEV: u32 = 9;
+    /// `DNSOP_*`: sent from the `msghdr` at argument 1 (`sendmsg`); a resolver `msg_name`
+    /// marks the socket.
+    pub const DNSOP_SENDMSG: u32 = 10;
+    /// `DNSOP_*`: sent from the `mmsghdr` array at argument 1 (`sendmmsg`), first message.
+    pub const DNSOP_SENDMMSG: u32 = 11;
+
+    /// [`DnsRecord::transport`]: DNS messages over UDP.
+    pub const DNS_UDP: u32 = 1;
+    /// [`DnsRecord::transport`]: DNS messages over TCP, each after a 2-byte length.
+    pub const DNS_TCP: u32 = 2;
+    /// [`DnsRecord::transport`]: systemd-resolved varlink (NUL-terminated JSON messages).
+    pub const DNS_VARLINK: u32 = 3;
+    /// Size of [`DnsRecord::data`].
+    pub const DNS_BYTES: u32 = 1024;
+    /// Resolver sockets remembered per process.
+    pub const DNS_SOCKS: u32 = 8;
+    /// Capacity of the `dns_procs` map (processes with resolver sockets open at once).
+    pub const DNS_PROCS_MAX: u32 = 1024;
     /// Entries of the `sys_flags` array (syscall numbers above are ignored).
     pub const SYS_TABLE_LEN: u32 = 512;
 
@@ -289,8 +354,11 @@ wire::wire_consts! {
     pub const STAT_TASKS_FULL: u32 = 1;
     /// `stats` slot: processes that could not be added to the `tracked` map.
     pub const STAT_TRACKED_FULL: u32 = 2;
+    /// `stats` slot: resolver sockets that could not be remembered (`dns_procs` or the
+    /// process's slots full) and resolver payloads that could not be copied.
+    pub const STAT_DNS_LOST: u32 = 3;
     /// Number of `stats` slots.
-    pub const STAT_NR: u32 = 3;
+    pub const STAT_NR: u32 = 4;
 
     /// Capacity of the `tasks` map (tracked threads alive at once).
     pub const TASKS_MAX: u32 = 32768;
@@ -313,6 +381,7 @@ pub fn header() -> wire::HeaderBuilder {
         .structs::<ExecRecord>()
         .structs::<EpisodeRecord>()
         .structs::<ExitRecord>()
+        .structs::<DnsRecord>()
         .structs::<TaskState>()
         .consts(&CONSTS);
     header

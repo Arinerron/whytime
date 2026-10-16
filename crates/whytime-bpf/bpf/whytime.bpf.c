@@ -14,6 +14,9 @@
  *
  * Optional fentry programs refine that: pollwake/ep_poll_callback record which file ended a
  * poll/select/epoll wait, and handle_mm_fault entry/exit mark blocks inside page faults.
+ * on_sys_exit_dns, attached instead of on_sys_exit when it loads, also copies what tracked
+ * threads receive from resolver sockets (DNS servers on port 53, systemd-resolved's varlink
+ * socket) into EV_DNS records, so user space can name network peers.
  *
  * Untracked tasks cost one hash lookup per handler (two in sched_switch).
  */
@@ -28,8 +31,12 @@
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
 #define S_IFDIR 0040000
+#define AF_UNIX 1
 #define AF_INET 2
 #define AF_INET6 10
+#define SOCK_STREAM 1
+#define EINPROGRESS 115
+#define DNS_PORT 53
 #define TASK_RUNNING 0
 /* Dentries plus mount crossings visited by one path walk. */
 #define PATH_DEPTH 32
@@ -99,6 +106,29 @@ struct {
 	__type(key, u32);
 	__type(value, struct task_state);
 } task_zero SEC(".maps");
+
+/* Resolver sockets of one process; a slot with transport 0 is free. */
+struct dns_sock {
+	u64 ino;
+	s32 fd;
+	u32 transport;
+};
+
+struct dns_proc {
+	struct dns_sock socks[DNS_SOCKS];
+};
+
+/* tgid -> the resolver sockets it has open. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, DNS_PROCS_MAX);
+	__type(key, u32);
+	__type(value, struct dns_proc);
+} dns_procs SEC(".maps");
+
+/* Entries in dns_procs. While 0, I/O and close exits skip the dns_procs lookup, so programs
+ * that never talk to a resolver pay nothing for the capture. */
+u32 dns_live = 0;
 
 static __always_inline void stat_inc(u32 slot)
 {
@@ -175,8 +205,8 @@ static __always_inline void describe_file(struct sys_info *s, struct file *f)
 	}
 }
 
-/* Describes the current task's descriptor `fd` into `s`; returns its file, 0 if not open. */
-static __always_inline struct file *describe_fd(struct sys_info *s, int fd)
+/* The open file behind the current task's descriptor `fd`; 0 if there is none. */
+static __always_inline struct file *fd_file(int fd)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	struct fdtable *fdt = BPF_CORE_READ(task, files, fdt);
@@ -189,9 +219,18 @@ static __always_inline struct file *describe_fd(struct sys_info *s, int fd)
 	if ((unsigned int)fd >= max)
 		return 0;
 	fds = BPF_CORE_READ(fdt, fd);
-	if (bpf_probe_read_kernel(&f, sizeof(f), &fds[fd]) || !f)
+	if (bpf_probe_read_kernel(&f, sizeof(f), &fds[fd]))
 		return 0;
-	describe_file(s, f);
+	return f;
+}
+
+/* Describes the current task's descriptor `fd` into `s`; returns its file, 0 if not open. */
+static __always_inline struct file *describe_fd(struct sys_info *s, int fd)
+{
+	struct file *f = fd_file(fd);
+
+	if (f)
+		describe_file(s, f);
 	return f;
 }
 
@@ -288,9 +327,11 @@ static __always_inline void describe_blocked(struct task_state *t)
 	t->detail.flags = SYSD_DESCRIBED;
 	t->detail.magic = 0;
 	t->detail.path_len = 0;
-	if (!flags || !*flags)
+	if (!flags)
 		return;
-	want = *flags;
+	want = *flags & (SYSF_FD0 | SYSF_SOCKADDR);
+	if (!want)
+		return;
 	clear_sys(&t->sys);
 	t->sys.nr = nr;
 	if (want & SYSF_FD0) {
@@ -332,6 +373,288 @@ static __always_inline struct task_state *new_task(u32 tid, u32 tgid, u32 state,
 	clear_sys(&t->ready);
 	clear_sys(&t->fault);
 	return t;
+}
+
+/* ---- resolver capture (on_sys_exit_dns) --------------------------------------------- */
+
+/* systemd-resolved's varlink socket, which glibc's nss-resolve talks to. */
+static const char resolve_path[] = "/run/systemd/resolve/io.systemd.Resolve";
+
+/* Userspace ABI (LP64, every supported arch): struct iovec, struct user_msghdr (msg_name,
+ * msg_namelen, msg_iov, msg_iovlen, ...). struct mmsghdr is a user_msghdr and msg_len. */
+struct u_iovec {
+	u64 base;
+	u64 len;
+};
+
+struct u_msghdr {
+	u64 name;
+	u32 namelen;
+	u32 _pad;
+	u64 iov;
+	u64 iovlen;
+	u64 control;
+	u64 controllen;
+	u32 flags;
+	u32 _pad2;
+};
+
+struct u_mmsghdr {
+	struct u_msghdr hdr;
+	u32 len;
+	u32 _pad;
+};
+
+/* What a user sockaddr names: DNS_UDP for any inet address on port 53 (the socket type
+ * decides UDP or TCP), DNS_VARLINK for resolved's varlink path, else 0. */
+static __always_inline u32 dns_target(const void *uaddr, long len)
+{
+	struct {
+		u16 family;
+		__be16 port;
+	} head;
+	char path[sizeof(resolve_path) - 1], nul = 1;
+	u32 i;
+
+	if (!uaddr || len < (long)sizeof(head) || bpf_probe_read_user(&head, sizeof(head), uaddr))
+		return 0;
+	if (head.family == AF_INET || head.family == AF_INET6)
+		return head.port == __builtin_bswap16(DNS_PORT) ? DNS_UDP : 0;
+	if (head.family != AF_UNIX || len < 2 + (long)sizeof(path) ||
+	    bpf_probe_read_user(path, sizeof(path), uaddr + 2))
+		return 0;
+#pragma unroll
+	for (i = 0; i < sizeof(path); i++)
+		if (path[i] != resolve_path[i])
+			return 0;
+	/* sun_path ends at the address length or at a NUL. */
+	if (len > 2 + (long)sizeof(path) &&
+	    (bpf_probe_read_user(&nul, 1, uaddr + 2 + sizeof(path)) || nul))
+		return 0;
+	return DNS_VARLINK;
+}
+
+/* Deletes the process's entry if no slot is in use. */
+static __always_inline void dns_prune(u32 tgid, struct dns_proc *p)
+{
+	u32 i;
+
+	for (i = 0; i < DNS_SOCKS; i++)
+		if (p->socks[i].transport)
+			return;
+	if (!bpf_map_delete_elem(&dns_procs, &tgid))
+		__sync_fetch_and_sub(&dns_live, 1);
+}
+
+/* Forgets the resolver sockets of `tgid` (exit, exec). */
+static __always_inline void dns_forget_proc(u32 tgid)
+{
+	if (dns_live && !bpf_map_delete_elem(&dns_procs, &tgid))
+		__sync_fetch_and_sub(&dns_live, 1);
+}
+
+/* Forgets descriptor `fd` of `tgid` as a resolver socket. */
+static __always_inline void dns_forget(u32 tgid, int fd)
+{
+	struct dns_proc *p = bpf_map_lookup_elem(&dns_procs, &tgid);
+	u32 i;
+
+	if (!p)
+		return;
+	for (i = 0; i < DNS_SOCKS; i++)
+		if (p->socks[i].transport && p->socks[i].fd == fd)
+			p->socks[i].transport = 0;
+	dns_prune(tgid, p);
+}
+
+/* Remembers descriptor `fd` of `tgid` as a resolver socket (`target` from dns_target), with
+ * its inode so a reused descriptor number is not mistaken for it. */
+static __always_inline void dns_mark(u32 tgid, int fd, u32 target)
+{
+	struct file *f = fd_file(fd);
+	struct dns_proc *p;
+	u32 i, slot = DNS_SOCKS, transport = target;
+	u64 ino;
+
+	if (!f)
+		return;
+	ino = BPF_CORE_READ(f, f_inode, i_ino);
+	if (target == DNS_UDP) {
+		struct socket *sock = BPF_CORE_READ(f, private_data);
+
+		if (BPF_CORE_READ(sock, type) == SOCK_STREAM)
+			transport = DNS_TCP;
+	}
+	p = bpf_map_lookup_elem(&dns_procs, &tgid);
+	if (!p) {
+		struct dns_proc empty = {};
+
+		if (!bpf_map_update_elem(&dns_procs, &tgid, &empty, BPF_NOEXIST))
+			__sync_fetch_and_add(&dns_live, 1);
+		p = bpf_map_lookup_elem(&dns_procs, &tgid);
+		if (!p) {
+			stat_inc(STAT_DNS_LOST);
+			return;
+		}
+	}
+	/* The descriptor's own slot, else the first free one. */
+	for (i = 0; i < DNS_SOCKS; i++) {
+		if (p->socks[i].transport && p->socks[i].fd == fd) {
+			slot = i;
+			break;
+		}
+		if (!p->socks[i].transport && slot == DNS_SOCKS)
+			slot = i;
+	}
+	if (slot >= DNS_SOCKS) {
+		stat_inc(STAT_DNS_LOST);
+		return;
+	}
+	p->socks[slot].ino = ino;
+	p->socks[slot].fd = fd;
+	p->socks[slot].transport = transport;
+}
+
+/* First buffer of a user iovec array: its address, and its length capped at `n`. */
+static __always_inline const void *first_iov(u64 iov, u64 *n)
+{
+	struct u_iovec v;
+
+	if (!iov || bpf_probe_read_user(&v, sizeof(v), (const void *)iov))
+		return 0;
+	if (v.len < *n)
+		*n = v.len;
+	return (const void *)v.base;
+}
+
+/*
+ * The resolver part of a syscall exit, for a tracked thread. Port-53 or varlink targets of
+ * connect/sendto/sendmsg mark the socket; close forgets it; bytes received on a marked socket
+ * (and requests sent on a varlink one) become an EV_DNS record. Anything but the marking
+ * syscalls returns after one array lookup while no process has a resolver socket open.
+ */
+static __always_inline void dns_exit(struct task_state *t, s32 nr, u32 tid, u32 tgid,
+				     struct pt_regs *regs, long ret)
+{
+	u32 key = nr, *flags, op, i, slot = DNS_SOCKS, sent = 0;
+	int fd = t->detail.args[0];
+	u64 arg1 = t->detail.args[1], n = ret, total = ret;
+	const void *buf = 0;
+	struct dns_record *e;
+	struct dns_proc *p;
+	struct file *f;
+
+	if (ret < 0 && ret != -EINPROGRESS)
+		return;
+	flags = bpf_map_lookup_elem(&sys_flags, &key);
+	if (!flags)
+		return;
+	op = *flags >> SYSF_DNS_SHIFT;
+	switch (op) {
+	case 0:
+		return;
+	case DNSOP_CONNECT: {
+		u32 target = dns_target((const void *)arg1, t->detail.args[2]);
+
+		if (target)
+			dns_mark(tgid, fd, target);
+		else if (dns_live)
+			dns_forget(tgid, fd);
+		return;
+	}
+	case DNSOP_CLOSE:
+		if (!ret && dns_live)
+			dns_forget(tgid, fd);
+		return;
+	case DNSOP_SENDTO:
+		if (ret > 0 && dns_target((const void *)PT_REGS_PARM5_SYSCALL(regs),
+					  PT_REGS_PARM6_SYSCALL(regs)) == DNS_UDP)
+			dns_mark(tgid, fd, DNS_UDP);
+		break;
+	case DNSOP_SENDMSG:
+	case DNSOP_SENDMMSG: {
+		struct u_msghdr m;
+
+		if (ret > 0 && !bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) &&
+		    dns_target((const void *)m.name, m.namelen) == DNS_UDP)
+			dns_mark(tgid, fd, DNS_UDP);
+		break;
+	}
+	}
+	if (ret <= 0 || !dns_live)
+		return;
+	p = bpf_map_lookup_elem(&dns_procs, &tgid);
+	if (!p)
+		return;
+	for (i = 0; i < DNS_SOCKS; i++) {
+		if (p->socks[i].transport && p->socks[i].fd == fd) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot >= DNS_SOCKS)
+		return;
+	sent = op == DNSOP_WRITE || op == DNSOP_SENDTO || op == DNSOP_WRITEV ||
+	       op == DNSOP_SENDMSG || op == DNSOP_SENDMMSG;
+	/* DNS answers carry their question; only varlink replies need the request. */
+	if (sent && p->socks[slot].transport != DNS_VARLINK)
+		return;
+	f = fd_file(fd);
+	if (!f || BPF_CORE_READ(f, f_inode, i_ino) != p->socks[slot].ino) {
+		/* The number now names another file: the socket was closed some other way. */
+		p->socks[slot].transport = 0;
+		dns_prune(tgid, p);
+		return;
+	}
+	switch (op) {
+	case DNSOP_READ:
+	case DNSOP_WRITE:
+	case DNSOP_SENDTO:
+		buf = (const void *)arg1;
+		break;
+	case DNSOP_READV:
+	case DNSOP_WRITEV:
+		buf = first_iov(arg1, &n);
+		break;
+	case DNSOP_RECVMSG:
+	case DNSOP_SENDMSG: {
+		struct u_msghdr m;
+
+		if (!bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) && m.iovlen)
+			buf = first_iov(m.iov, &n);
+		break;
+	}
+	case DNSOP_RECVMMSG:
+	case DNSOP_SENDMMSG: {
+		struct u_mmsghdr m;
+
+		if (!bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) && m.hdr.iovlen) {
+			total = n = m.len;
+			buf = first_iov(m.hdr.iov, &n);
+		}
+		break;
+	}
+	}
+	if (!buf || !n)
+		return;
+	e = reserve(sizeof(*e));
+	if (!e)
+		return;
+	if (n > DNS_BYTES)
+		n = DNS_BYTES;
+	if (bpf_probe_read_user(e->data, n, buf)) {
+		bpf_ringbuf_discard(e, 0);
+		stat_inc(STAT_DNS_LOST);
+		return;
+	}
+	fill_hdr(&e->hdr, EV_DNS, tid, tgid, bpf_ktime_get_ns());
+	e->ino = p->socks[slot].ino;
+	e->fd = fd;
+	e->transport = p->socks[slot].transport;
+	e->sent = sent;
+	e->total = total;
+	e->len = n;
+	bpf_ringbuf_submit(e, 0);
 }
 
 /* ---- scheduler ---------------------------------------------------------------------- */
@@ -551,6 +874,8 @@ int BPF_PROG(on_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm 
 	if (!bpf_map_lookup_elem(&tracked, &tgid))
 		return 0;
 	now = bpf_ktime_get_ns();
+	/* exec closed the resolver sockets (they are close-on-exec) or replaced their users. */
+	dns_forget_proc(tgid);
 
 	t = bpf_map_lookup_elem(&tasks, &tid);
 	if (!t && old != tid) {
@@ -626,13 +951,14 @@ int BPF_PROG(on_exit, struct task_struct *p)
 		bpf_ringbuf_submit(e, 0);
 	}
 	bpf_map_delete_elem(&tasks, &tid);
-	if (live == 0)
+	if (live == 0) {
 		bpf_map_delete_elem(&tracked, &tgid);
+		dns_forget_proc(tgid);
+	}
 	return 0;
 }
 
 /* ---- syscalls ----------------------------------------------------------------------- */
-
 
 SEC("tp_btf/sys_enter")
 int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id)
@@ -659,6 +985,23 @@ int BPF_PROG(on_sys_exit, struct pt_regs *regs, long ret)
 
 	if (t)
 		t->sys.nr = NR_NONE;
+	return 0;
+}
+
+/* on_sys_exit plus the resolver capture (dns_exit); user space attaches one of the two. */
+SEC("tp_btf/sys_exit")
+int BPF_PROG(on_sys_exit_dns, struct pt_regs *regs, long ret)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	u32 tid = (u32)id;
+	struct task_state *t = bpf_map_lookup_elem(&tasks, &tid);
+	s32 nr;
+
+	if (!t)
+		return 0;
+	nr = t->sys.nr;
+	t->sys.nr = NR_NONE;
+	dns_exit(t, nr, tid, id >> 32, regs, ret);
 	return 0;
 }
 
