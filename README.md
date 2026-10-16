@@ -15,7 +15,10 @@ critical path: 3 processes · 0 events lost
 whytime runs a command, traces it and every process it starts with eBPF, and splits the
 wall-clock time along the command's critical path: on-CPU, waiting on a child that was
 computing, timer sleeps, fsync (per directory), file I/O, network peers (`ip:port`), pipes,
-locks, polling, waiting for a CPU. Shares always add up to 100% of the wall time.
+locks, page faults (per mapped file's directory), waiting for a CPU. A poll/select/epoll wait
+is reported as the descriptor that became ready (so `curl` shows its server, not "poll"),
+and a pipe or poll wait ended by a process outside the tree names it (`woken by
+dbus-daemon`). Shares always add up to 100% of the wall time.
 
 ```
 $ whytime -- ./build.sh            # report on stderr; the command's output passes through

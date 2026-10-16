@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use procctx::{ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable};
 use whytime_abi::{
-    CpuSegment, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord, EvHeader, ExecRecord,
-    ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE, ST_RUNNING, ST_WOKEN, TaskState,
+    CpuSegment, EPF_FAULT, EPF_READY, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EpisodeRecord,
+    EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE, ST_RUNNING, ST_WOKEN,
+    TaskState,
 };
 
-use crate::classify::{Blocked, Classifier};
+use crate::classify::{BlockInfo, Blocked, Classifier};
 
 /// Index into [`Trace::procs`].
 pub type ProcId = usize;
@@ -42,8 +43,11 @@ pub enum SegKind {
 pub struct Block {
     /// What it waited for.
     pub what: Blocked,
-    /// Thread-group id of the task that ended the block; 0 when unknown.
+    /// Thread-group id of the task that ended the block; 0 when unknown or when the wakeup
+    /// came from interrupt context.
     pub waker_tgid: u32,
+    /// `comm` of the waker when it is a process-context task outside the traced tree.
+    pub waker_comm: Option<Arc<str>>,
 }
 
 /// A half-open interval `[start, end)` of `CLOCK_MONOTONIC` nanoseconds on one thread.
@@ -134,6 +138,8 @@ pub struct Trace {
     live_procs: HashMap<u32, ProcId>,
     live_threads: HashMap<u32, ThreadId>,
     classifier: Classifier,
+    /// Interned waker `comm`s.
+    comms: HashMap<[u8; 16], Arc<str>>,
 }
 
 impl Trace {
@@ -151,6 +157,7 @@ impl Trace {
             live_procs: HashMap::new(),
             live_threads: HashMap::new(),
             classifier,
+            comms: HashMap::new(),
         }
     }
 
@@ -249,8 +256,23 @@ impl Trace {
             run_ts
         };
         self.push_mixed(thread, &r.seg, block_ts);
-        let what = self.classifier.classify(hdr.tgid, &r.sys, r.block_state);
-        self.push_block(thread, block_ts, wake_ts, what, r.waker_tgid);
+        let waker_comm = self.intern_comm(&r.waker_comm);
+        let what = self.classifier.classify_block(
+            hdr.tgid,
+            &BlockInfo {
+                sys: &r.sys,
+                block_state: r.block_state,
+                ready: (r.flags & EPF_READY != 0).then_some(&r.ready),
+                fault: (r.flags & EPF_FAULT != 0).then_some(&r.fault),
+                waker: waker_comm.as_ref(),
+            },
+        );
+        let block = Block {
+            what,
+            waker_tgid: r.waker_tgid,
+            waker_comm,
+        };
+        self.push_block(thread, block_ts, wake_ts, block);
         self.push(thread, wake_ts, run_ts, SegKind::Runq);
     }
 
@@ -288,9 +310,9 @@ impl Trace {
                 let since = end.saturating_sub(state.last_ts);
                 let (run, rq) = if extra_run { (since, 0) } else { (0, since) };
                 CpuSegment {
-                    start: state.seg.start,
                     run_ns: state.seg.run_ns + run,
                     rq_ns: state.seg.rq_ns + rq,
+                    ..state.seg
                 }
             };
             match state.state {
@@ -299,15 +321,28 @@ impl Trace {
                 ST_BLOCKED | ST_WOKEN => {
                     self.push_mixed(thread, &state.seg, state.block_ts);
                     let tgid = self.procs[proc].key.pid;
-                    let what = self
-                        .classifier
-                        .classify(tgid, &state.sys, state.block_state);
+                    let waker_comm = self.intern_comm(&state.waker_comm);
+                    let what = self.classifier.classify_block(
+                        tgid,
+                        &BlockInfo {
+                            sys: &state.sys,
+                            block_state: state.block_state,
+                            ready: (state.has_ready != 0).then_some(&state.ready),
+                            fault: (state.in_fault != 0).then_some(&state.fault),
+                            waker: waker_comm.as_ref(),
+                        },
+                    );
                     let wake = if state.state == ST_WOKEN {
                         state.wake_ts.clamp(state.block_ts, end.max(state.block_ts))
                     } else {
                         end
                     };
-                    self.push_block(thread, state.block_ts, wake, what, state.waker_tgid);
+                    let block = Block {
+                        what,
+                        waker_tgid: state.waker_tgid,
+                        waker_comm,
+                    };
+                    self.push_block(thread, state.block_ts, wake, block);
                     self.push(thread, wake, end, SegKind::Runq);
                 }
                 _ => {}
@@ -375,16 +410,20 @@ impl Trace {
         );
     }
 
-    fn push_block(
-        &mut self,
-        thread: ThreadId,
-        start: u64,
-        end: u64,
-        what: Blocked,
-        waker_tgid: u32,
-    ) {
-        let block = Block { what, waker_tgid };
+    fn push_block(&mut self, thread: ThreadId, start: u64, end: u64, block: Block) {
         self.push(thread, start, end, SegKind::Blocked(Box::new(block)));
+    }
+
+    /// The `comm` in a NUL-padded kernel buffer, interned; `None` when empty.
+    fn intern_comm(&mut self, raw: &[u8; 16]) -> Option<Arc<str>> {
+        if raw[0] == 0 {
+            return None;
+        }
+        let comm = self
+            .comms
+            .entry(*raw)
+            .or_insert_with(|| Arc::from(String::from_utf8_lossy(cstr(raw)).as_ref()));
+        Some(Arc::clone(comm))
     }
 
     /// Appends a segment, trimming any overlap with the previous one; empty segments are

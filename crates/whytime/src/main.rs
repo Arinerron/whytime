@@ -10,6 +10,7 @@ mod classify;
 mod cli;
 mod doctor;
 mod logger;
+mod percpu;
 mod report;
 mod spawn;
 mod sys;
@@ -87,6 +88,8 @@ fn wrap(args: &RunArgs) -> i32 {
 struct Session {
     tracer: Tracer,
     syscalls: bool,
+    readiness: bool,
+    faults: bool,
     command: Wrapped,
     trace: Trace,
 }
@@ -123,6 +126,18 @@ impl Session {
         if let Err(err) = &loaded.syscalls {
             log::warn!(
                 "syscall tracepoints unavailable ({err:#}); blocked time will not be classified"
+            );
+        }
+        if let Err(err) = &loaded.readiness {
+            log::warn!(
+                "poll/epoll readiness probes unavailable ({err:#}); poll waits will not be \
+                 attributed to the ready descriptor"
+            );
+        }
+        if let Err(err) = &loaded.faults {
+            log::warn!(
+                "page-fault probes unavailable ({err:#}); blocks in page faults will not be \
+                 reported as fault"
             );
         }
         let mut tracer = loaded.tracer;
@@ -163,6 +178,8 @@ impl Session {
         Ok(Started::Running(Box::new(Self {
             tracer,
             syscalls: loaded.syscalls.is_ok(),
+            readiness: loaded.readiness.is_ok(),
+            faults: loaded.faults.is_ok(),
             command: Wrapped { child, signals },
             trace,
         })))
@@ -190,6 +207,8 @@ impl Session {
         let Self {
             tracer,
             syscalls,
+            readiness,
+            faults,
             command,
             mut trace,
         } = self;
@@ -209,6 +228,8 @@ impl Session {
             exit_code,
             dropped: maps.dropped(),
             syscalls,
+            readiness,
+            faults,
         };
         drop(maps);
 

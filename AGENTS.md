@@ -51,16 +51,19 @@ crates/whytime-bpf/        build.rs + bpf/ ; exports OBJECT (the .o) and ABI_HAS
 crates/whytime/            the binary
   src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling
   src/cli.rs               clap derive CLI, --duration parser
-  src/tracer.rs            aya loader: load, attach, maps, detach
+  src/tracer.rs            aya loader: load, attach (required + optional sets), maps, detach
+  src/percpu.rs            vmlinux BTF reader: __preempt_count's distance from runqueues
   src/spawn.rs             fork, park-on-pipe, priv drop, exec with error pipe, pidfd
   src/timeline.rs          records → per-thread segments, procctx table, final sweep
-  src/classify.rs          (syscall, fd type, socket) → class + subject; /proc path resolution
+  src/classify.rs          (syscall, fd type, socket, ready fd, fault, waker) → class + subject;
+                           /proc fd and maps path resolution
   src/sys.rs               syscall table (libc numbers) → kind + BPF sys_flags bits
   src/attribute.rs         critical-path walk → lines that partition the window
   src/report.rs            whytime.report/1 JSON + human rendering
-  src/doctor.rs            bpfdoctor Tool, probe.sched / probe.syscalls checks
+  src/doctor.rs            bpfdoctor Tool, probe.sched / syscalls / readiness / faults checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
-crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp
+crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp,
+                           wt-poll, wt-fault, wt-fifo
 xtask/                     cargo xtask test-e2e
 ```
 
@@ -90,6 +93,8 @@ flowchart LR
     SW[tp_btf/sched_switch] --> TS[(tasks: tid → task_state)]
     WK[tp_btf/sched_waking] --> TS
     SE[tp_btf/sys_enter/exit] --> TS
+    PW[fentry/pollwake, ep_poll_callback] -- ready file --> TS
+    MF[fentry+fexit/handle_mm_fault] -- in fault --> TS
     FK[tp_btf/sched_process_fork] --> TR[(tracked: tgid)]
     FK --> TS
     EX[tp_btf/sched_process_exec/exit] --> TS
@@ -105,7 +110,9 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
 
 1. `bpfdoctor` preflight; on FAIL print diagnostics, exit 125.
 2. Load the object and attach all programs (`tracer.rs`). Scheduler programs are required;
-   if the syscall pair fails, continue with a warning and a report note.
+   the syscall, readiness and page-fault sets are optional: if one fails, continue with a
+   warning and a report note. Before loading, `percpu.rs` reads `/sys/kernel/btf/vmlinux`
+   and sets the `.rodata` global `preempt_count_from_rq` (see `on_waking`).
 3. Under sudo (`euid 0` + `SUDO_UID`/`SUDO_GID`), compute the invoking user's credentials
    and groups, and restore `HOME`/`USER`/`LOGNAME` to that user.
 4. Ignore SIGINT/SIGQUIT (the TTY delivers them to COMMAND's process group, which whytime
@@ -127,16 +134,20 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
 
 | Program | Attach point | Prototype (`btf_trace_*`) | Does | Fallback |
 |---|---|---|---|---|
-| `on_switch` | `tp_btf/sched_switch` | `(void *, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)` | prev: add on-CPU time; `!preempt && prev_state != 0` → BLOCKED (record block ts + state), else RUNNABLE. next: RUNNABLE → add runqueue time; BLOCKED/WOKEN → emit EPISODE, open a new segment | required; needs ≥ 5.18 for `prev_state` (min_kernel) |
-| `on_waking` | `tp_btf/sched_waking` | `(void *, struct task_struct *p)` | BLOCKED → WOKEN, record wake ts and the waker (current) tid/tgid | required |
+| `on_switch` | `tp_btf/sched_switch` | `(void *, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)` | prev: add on-CPU time; `!preempt && prev_state != 0` → BLOCKED (record block ts + state), else RUNNABLE. next: RUNNABLE → add runqueue time; BLOCKED/WOKEN → emit EPISODE, open a new segment. CPU holders: a preempted prev remembers `next` (`pend_tgid/comm`); when a RUNNABLE thread runs again, the longest such wait of the segment and its holder go to `seg.preempt_*` (a new task's holder is the `prev` it replaced); an episode carries `prev` as `run_holder_*`. At block inside a page fault: `describe_file(vma->vm_file)` into `fault` | required; needs ≥ 5.18 for `prev_state` (min_kernel) |
+| `on_waking` | `tp_btf/sched_waking` | `(void *, struct task_struct *p)` | BLOCKED → WOKEN, record wake ts and the waker (current) tid/tgid, plus its comm when it is outside `tracked` and not exiting. Interrupt context (preempt_count has NMI, HARDIRQ or SOFTIRQ_OFFSET bits) → waker stays 0/0. preempt_count: `thread_info.preempt_count` where it exists (arm64, riscv); on x86-64 the per-CPU `__preempt_count` at `current->se.cfs_rq->rq` (checked `rq->curr == current`) + `preempt_count_from_rq` (user space: `.data..percpu` DATASEC offsets in vmlinux BTF, `pcpu_hot.preempt_count` on 6.2–6.14); aya cannot load `__ksym`s. Without either (no BTF var, no `CONFIG_FAIR_GROUP_SCHED`): waker = current, as before | required |
 | `on_fork` | `tp_btf/sched_process_fork` | `(void *, struct task_struct *parent, struct task_struct *child)` | parent tracked → add child tgid to `tracked` (in kernel: the child can never run untracked), create its task entry (RUNNABLE), emit FORK | required |
 | `on_exec` | `tp_btf/sched_process_exec` | `(void *, struct task_struct *p, pid_t old_pid, struct linux_binprm *)` | tracked tgid: create the root's task entry (window start) or flush the segment; migrate `old_pid`'s entry if a non-leader thread exec'd; emit EXEC with comm, argv (≤ 256 B from `mm->arg_start`), leader `start_boottime` | required |
 | `on_exit` | `tp_btf/sched_process_exit` | `(void *, struct task_struct *p, bool group_dead)` | close the segment, emit EXIT (exit_code, group_dead), delete the task entry; last thread → remove from `tracked` | `group_dead` is computed from `p->signal->live.counter == 0` instead of the argument, which older kernels lack |
 | `on_sys_enter` | `tp_btf/sys_enter` | `(void *, struct pt_regs *regs, long id)` | remember nr; per `sys_flags[nr]` describe arg0's fd (`task->files->fdt->fd[fd]` → `f_inode->i_mode & S_IFMT`, ino, `i_sb->s_dev`, `f_flags`; sockets: `private_data→sk→__sk_common` family, daddr/v6_daddr, dport) and for `connect` the user sockaddr | optional: if the pair fails, all blocked time is `other` and a note says so |
 | `on_sys_exit` | `tp_btf/sys_exit` | `(void *, struct pt_regs *regs, long ret)` | clear nr | attached before `sys_enter` so a half-attached pair is harmless |
+| `on_pollwake` | `fentry/pollwake` | `int (struct wait_queue_entry *wait, unsigned mode, int sync, void *key)` | poll/select: `container_of(wait, poll_table_entry, wait)->filp` is the ready file, `((poll_wqueues *)wait->private)->polling_task` the poller; tracked + BLOCKED + key matches `entry->key` → the first source claims `ready` (`describe_file`, fd −1) | optional (with `on_ep_poll_callback`: `probe.readiness`); without them poll waits stay `poll` |
+| `on_ep_poll_callback` | `fentry/ep_poll_callback` | same | epoll: `container_of(wait, eppoll_entry, wait)->base` is the epitem, its `ffd.file`/`ffd.fd` the ready file; the thread woken is the first entry of `epi->ep->wq` (exclusive waiters), `->private` its task; skipped when the item is disabled (`event.events` only `EP_PRIVATE_BITS`) or the key misses its events | optional |
+| `on_fault_exit` / `on_fault_enter` | `fexit` / `fentry` `handle_mm_fault` | `vm_fault_t (struct vm_area_struct *vma, unsigned long address, unsigned int flags, struct pt_regs *regs)` | entry: `in_fault = 1`, `fault_file = vma->vm_file`; exit: `in_fault = 0`. Covers faults inside syscalls (copy_to_user) too | optional (`probe.faults`); fexit attaches first |
 
-Maps: `events` RINGBUF 4 MiB; `tasks` HASH tid → `task_state` (32768); `tracked` HASH tgid
-(16384); `sys_flags` ARRAY nr → `SYSF_*` (512, filled by user space from libc numbers, so the
+Maps: `events` RINGBUF 4 MiB; `tasks` HASH tid → `task_state` (32768); `task_zero` ARRAY of
+one zeroed `task_state`, the template `new_task()` copies (task_state exceeds the 512-byte BPF
+stack, so no program may hold one on its stack); `tracked` HASH tgid (16384); `sys_flags` ARRAY nr → `SYSF_*` (512, filled by user space from libc numbers, so the
 C code has no syscall numbers); `stats` PERCPU_ARRAY of loss counters (ring full, tasks
 full, tracked full) → `quality.dropped`.
 
@@ -148,16 +159,18 @@ CO-RE: `vmlinux_min.h` declares only the fields used, under
 
 All records start with `ev_header {kind, tid, tgid, _pad, ts}` (`ts` = `bpf_ktime_get_ns`,
 CLOCK_MONOTONIC, the same clock user space reads for deadlines). `cpu_segment {start,
-run_ns, rq_ns}` is the in-kernel accumulation since `start`; its end is the record's own
-boundary, so a thread's segments chain without gaps.
+run_ns, rq_ns, preempt_max_ns, preempt_tgid, preempt_comm[16]}` is the in-kernel
+accumulation since `start` (plus the longest single preemption and who held the CPU); its end
+is the record's own boundary, so a thread's segments chain without gaps. New fields are
+appended at the end of a struct, 8-byte aligned.
 
 | Record | Size | Fields |
 |---|---|---|
 | `fork_record` (EV_FORK) | 40 | hdr (parent), child_tid, child_tgid, child_start (`start_boottime`) |
-| `exec_record` (EV_EXEC) | 344 | hdr, seg (up to exec), start (leader `start_boottime` = procctx key), ppid, old_tid, comm[16], argv_len, argv[256] |
-| `episode_record` (EV_EPISODE) | 128 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid, block_state (`prev_state`) |
-| `exit_record` (EV_EXIT) | 64 | hdr, seg (up to exit), start, code (`task->exit_code`), group_dead |
-| `task_state` (map value) | 120 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid |
+| `exec_record` (EV_EXEC) | 376 | hdr, seg (up to exec), start (leader `start_boottime` = procctx key), ppid, old_tid, comm[16], argv_len, argv[256] |
+| `episode_record` (EV_EPISODE) | 296 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid (0/0 = unknown or interrupt context), block_state (`prev_state`), flags (`EPF_FAULT`, `EPF_READY`), run_holder_tgid/comm (ran just before the switch-in), waker_comm (out-of-tree waker, else empty), ready (sys_info of the file that ended a poll), fault (sys_info of the faulting vma's file; mode 0 = anonymous) |
+| `exit_record` (EV_EXIT) | 96 | hdr, seg (up to exit), start, code (`task->exit_code`), group_dead |
+| `task_state` (map value) | 304 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid, ready, fault, fault_file (kernel `struct file *`), in_fault, has_ready, pend_tgid/comm (took the CPU at the last preemption), waker_comm |
 | `sys_info` | 48 | nr (−1 = none), fd, mode (`S_IFMT` bits), f_flags, ino, dev (kernel `dev_t`), family, port (host order), addr[16] |
 
 One EPISODE per block → wake → run cycle; on-CPU and preemption are accumulated in kernel,
@@ -180,8 +193,17 @@ Every nanosecond is assigned to exactly one `(class, subject)` line, so shares s
   path syscalls), `net` (inet sockets; subject = peer `ip:port` from `connect`'s sockaddr or
   the socket's `daddr:dport`; distinct socket inodes = "connections"), `ipc` (pipes, FIFOs,
   unix sockets), `tty` (character devices), `futex`, `sleep` (nanosleep/clock_nanosleep),
-  `poll` (poll/select/epoll), `signal`, `other` (unknown syscall, page faults/no syscall,
-  stopped, or `untraced` gaps from lost records).
+  `poll` (poll/select/epoll), `signal`, `fault` (blocked inside a page fault; subject = the
+  mapped file's directory from `/proc/<pid>/maps` checked against dev:ino, or
+  `anonymous memory (swap)`; takes precedence over the syscall the fault interrupted),
+  `other` (unknown syscall, off-CPU outside syscalls, stopped, or `untraced` gaps from lost
+  records).
+- A poll/select/epoll wait whose readiness source was seen is classified as that descriptor
+  would be: socket → `net`/`ipc`, FIFO → `ipc`, character device → `tty`; anything else
+  (eventfd, timerfd, inotify, regular files) stays `poll`.
+- `ipc` and `poll` blocks woken by a process-context task outside the traced tree get
+  subject `woken by <comm>` (e.g. dbus-daemon). Wakers in interrupt context are unknown
+  (0/0), never the interrupted task.
 - **Descent**: a `wait4`/`waitid` block is explained by the child that ended it (the waker
   if it is a child; else the child that exited last inside the block; else the youngest
   child alive at its end). A pipe/unix-socket block woken by another tracked process is
@@ -196,7 +218,10 @@ Honesty limits (state them when presenting results):
   sibling children not waited on at that moment) does not appear; `processes[].cpu_ns`
   in JSON shows every process's total CPU.
 - Futex waits are not followed to the lock holder (unknown in MVP), so a lock held across a
-  sleep or I/O shows as `futex`. Same for `poll`/`epoll`: the readiness source is unknown.
+  sleep or I/O shows as `futex`. A poll on an eventfd/pipe signalled by another thread of
+  COMMAND stays `poll` (the readiness source is the descriptor, not the thread).
+- The readiness source is the first descriptor reported ready while the thread blocked; an
+  epoll wait with several waiters on one eventpoll is credited to the first waiter.
 - Hidden dependencies outside the tree (a daemon, the X server, a remote service) are only
   visible as the resource COMMAND blocked on (`net`, `ipc`).
 - Network subjects are `ip:port`; DNS/hostname correlation is a later milestone (the report
@@ -210,11 +235,14 @@ Honesty limits (state them when presenting results):
 
 ## Report
 
-Human (stderr): `wall`, then lines ≥ 1% (max 8), `other` collecting the rest and every
-`other`-class line, then `critical path: N processes · M events lost` and notes.
+Human (stderr): `wall`, then lines ≥ 1% (at most 8, `other`-class lines such as
+`other (outside syscalls (page faults, kernel locks))` included), a final `other` collecting
+the rest, then `critical path: N processes · M events lost` and notes (one per unavailable
+optional probe set).
 JSON (`--json`, stderr): `{schema: "whytime.report/1", command, wall_ns, ended_by,
 exit_code, lines: [{class, share, ns, subject, connections?}], processes: [{pid, ppid, comm,
-argv, cpu_ns, exit_code, critical}], quality: {events, dropped, syscalls}, notes}`.
+argv, cpu_ns, exit_code, critical}], quality: {events, dropped, syscalls, readiness,
+faults}, notes}` (`readiness`/`faults`: whether those optional probe sets were attached).
 
 Exit codes: COMMAND's (128 + signal if killed); 125 whytime failed before/at start (with
 doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run.
@@ -241,6 +269,8 @@ memcg) plus:
 |---|---|---|
 | `probe.sched` | yes | loads the real object and attaches the 5 scheduler programs; PASS shows verified insn count. FAIL shows the errno; impact "cannot observe scheduling"; fixes by errno: EPERM/EACCES → `sudo setcap cap_bpf,cap_perfmon+ep <exe>` or run with sudo; ENOENT/EINVAL/E2BIG/EOPNOTSUPP → kernel ≥ 5.18 with `CONFIG_DEBUG_INFO_BTF`; else `WHYTIME_LOG=debug whytime doctor` for the verifier log |
 | `probe.syscalls` | no | attaches `sys_exit` then `sys_enter`; WARN impact "blocked time is reported as other"; SKIP if the scheduler probe failed |
+| `probe.readiness` | no | attaches `fentry/pollwake` and `fentry/ep_poll_callback`; WARN impact "poll/select/epoll waits are reported as poll"; fixes: BPF trampolines (x86-64 ≥ 5.5, arm64 ≥ 6.0) + BTF, or the verifier log; SKIP if the scheduler probe failed |
+| `probe.faults` | no | attaches `fexit` then `fentry` on `handle_mm_fault`; WARN impact "page-fault time is reported as other or as the interrupted syscall"; same fixes; SKIP if the scheduler probe failed |
 
 `kernel.kptr_restrict` is not checked: the MVP reads no kernel addresses (relevant once
 flamegraphs symbolize kernel stacks). Wrap mode runs `Doctor::preflight()` first, and after a
@@ -254,8 +284,12 @@ Targets, to be measured (not yet benchmarked):
   no clock read, ≤ ~150 ns.
 - `sys_enter`/`sys_exit` for untracked tasks: one hash lookup, ≤ ~100 ns. Tracked tasks
   additionally do an array lookup and, for fd syscalls, ~6–10 probe reads.
-- `sched_waking`, fork/exec/exit: one lookup for untracked tasks.
-- Ring traffic: one 128-byte record per block cycle of a tracked thread; CPU-bound threads
+- `sched_waking`, fork/exec/exit: one lookup for untracked tasks. A tracked wakee adds the
+  preempt_count read (3 probe reads on x86-64) and one `tracked` lookup.
+- `pollwake`/`ep_poll_callback`: a few probe reads and one `tasks` lookup per wakeup callback
+  system-wide (they fire for every poll/epoll wakeup, tracked or not).
+- `handle_mm_fault` entry/exit: one `tasks` lookup per page fault system-wide.
+- Ring traffic: one 296-byte record per block cycle of a tracked thread; CPU-bound threads
   emit nothing (on-CPU accumulates in kernel).
 
 ## e2e suite
@@ -277,6 +311,20 @@ Targets, to be measured (not yet benchmarked):
 8. `nopriv`: the build output run as the user without caps → exit 125 and a `setcap` line
 9. `setcap`: copy to `~/.cache/whytime-e2e/bin`, `setcap cap_bpf,cap_perfmon+ep`, run
    unprivileged on `wt-sleep 300` → `sleep` ≥ 0.9
+10. `poll-ready`: same server; `wt-poll ADDR 4` waits for each reply in `epoll_wait` and
+    `poll` in turn → `net` subject = server `ip:port` ≥ 0.6 (readiness probes; without
+    them these waits are `poll`)
+11. `fault`: xtask runs `wt-fault write $WORK/fault.bin 128` (synced), then
+    `wt-fault touch FILE` drops its pages (`posix_fadvise(DONTNEED)`), maps it and reads
+    every page last-to-first (synchronous read-around; a forward scan's async readahead
+    hides the I/O) → `fault` subject = the `~`-abbreviated work directory ≥ 0.5 (≈ 0.6 here)
+12. `waker`: xtask makes `$WORK/waker.fifo` and `$WORK/waker.watched`; `sh` starts
+    `wt-fifo write FIFO FILE 8 100` (comm `wt-fifo-writer`, outside the tree) and execs
+    whytime on `wt-fifo read FIFO FILE 8`, which alternates `poll` on an inotify watch of
+    FILE and blocking FIFO reads → `poll` subject `woken by wt-fifo-writer` ≥ 0.35 and
+    `ipc` ≥ 0.35 with that subject. Until feat/attrib is merged the `ipc` check also accepts
+    the reader's comm `wt-fifo` (attribute.rs names non-descended pipe waits after the
+    blocked process); drop that branch on the merge
 
 ## Gotchas
 
@@ -286,7 +334,18 @@ Targets, to be measured (not yet benchmarked):
   builtin_preserve_access_index"); read into a local first.
 - CO-RE relocation failures are silent at build time and show up in the verifier log as
   `unknown#195896080`; use `WHYTIME_LOG=debug`.
-- `bool` cannot be an aya global (`aya::Pod`); pass `u8`. (whytime currently has no globals.)
+- `bool` cannot be an aya global (`aya::Pod`); pass `u8`. The one global,
+  `preempt_count_from_rq`, is a `const volatile s64` set with `override_global` (0 = unknown,
+  so the verifier drops the per-CPU read).
+- aya loads no `__ksym` externs (no `.ksyms` handling): per-CPU kernel variables are reached
+  through an object BPF can address (`runqueues` via `current->se.cfs_rq->rq`) plus a BTF
+  offset computed in user space.
+- `task_state` is larger than the 512-byte BPF stack: never build one on the stack; create
+  entries with `new_task()` (copies the `task_zero` template), move them map-to-map.
+- x86-64 runs interrupts taken in user mode, and the softirqs at their exit, on the task's own
+  stack: stack-pointer tests cannot tell interrupt context; read preempt_count.
+- Anonymous inodes (eventfd, timerfd, signalfd, inotify, epoll, pidfd) have
+  `i_mode & S_IFMT == 0` on 7.2.
 - `/tmp` is `nosuid` here: file capabilities on a binary there are ignored.
 - Under sudo, `sh -c '... of=~/x'` does not expand `~` after `of=` (POSIX `sh`); use `$HOME`.
 - The report is the last thing on stderr; the e2e harness locates it by the

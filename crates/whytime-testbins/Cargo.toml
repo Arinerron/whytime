@@ -31,5 +31,20 @@ path = "src/bin/wt-futex.rs"
 name = "wt-tcp"
 path = "src/bin/wt-tcp.rs"
 
+[[bin]]
+name = "wt-poll"
+path = "src/bin/wt-poll.rs"
+
+[[bin]]
+name = "wt-fault"
+path = "src/bin/wt-fault.rs"
+
+[[bin]]
+name = "wt-fifo"
+path = "src/bin/wt-fifo.rs"
+
+[dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

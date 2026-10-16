@@ -59,6 +59,17 @@ fn test_e2e() -> anyhow::Result<()> {
 
     let fsync_dir = work.display().to_string();
     let server_arg = server.to_string();
+    // wt-fault touch drops the file's cached pages itself; it only needs a synced file.
+    let fault_file = work.join("fault.bin").display().to_string();
+    let wrote = run(Command::new(bin("wt-fault")).args(["write", &fault_file, "128"]))?;
+    ensure!(wrote.status.success(), "wt-fault write {fault_file} failed");
+    let fault_dir = home_abbreviated(&work.canonicalize()?);
+    let fifo = work.join("waker.fifo");
+    let _ = std::fs::remove_file(&fifo);
+    let made = run(Command::new("mkfifo").arg(&fifo))?;
+    ensure!(made.status.success(), "mkfifo {} failed", fifo.display());
+    let watched = work.join("waker.watched");
+    std::fs::write(&watched, b"").with_context(|| format!("creating {}", watched.display()))?;
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -108,6 +119,35 @@ fn test_e2e() -> anyhow::Result<()> {
             "setcap",
             setcap_copy(whytime, &work, &bin("wt-sleep"))?,
             Box::new(check_setcap),
+        ),
+        (
+            "poll-ready",
+            sudo(&[&bin("wt-poll"), &server_arg, "4"]),
+            Box::new(move |out: &Output| check_poll(out, server)),
+        ),
+        (
+            "fault",
+            sudo(&[&bin("wt-fault"), "touch", &fault_file]),
+            Box::new(move |out: &Output| check_fault(out, &fault_dir)),
+        ),
+        (
+            "waker",
+            {
+                // sh starts the writer next to whytime, outside the traced tree, then
+                // becomes sudo.
+                let mut cmd = Command::new("sh");
+                cmd.args([
+                    "-c",
+                    r#""$1" write "$2" "$3" 8 100 & exec sudo -n "$4" --json -- "$1" read "$2" "$3" 8"#,
+                    "sh",
+                ])
+                .arg(bin("wt-fifo"))
+                .arg(&fifo)
+                .arg(&watched)
+                .arg(whytime);
+                cmd
+            },
+            Box::new(check_waker),
         ),
     ];
 
@@ -164,7 +204,8 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         }
     }
     for name in [
-        "whytime", "wt-sleep", "wt-burn", "wt-fsync", "wt-child", "wt-futex", "wt-tcp",
+        "whytime", "wt-sleep", "wt-burn", "wt-fsync", "wt-child", "wt-futex", "wt-tcp", "wt-poll",
+        "wt-fault", "wt-fifo",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -250,6 +291,16 @@ fn class_share(report: &Value, class: &str, subject: impl Fn(&str) -> bool) -> f
 #[allow(clippy::cast_precision_loss)]
 fn wall_secs(report: &Value) -> f64 {
     report["wall_ns"].as_u64().unwrap_or(0) as f64 / 1e9
+}
+
+/// `path` with a leading `$HOME` replaced by `~`, as whytime shows directories.
+fn home_abbreviated(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 fn exited(out: &Output, code: i32) -> anyhow::Result<()> {
@@ -366,5 +417,50 @@ fn check_setcap(out: &Output) -> anyhow::Result<String> {
         "unprivileged user + file caps: wall {:.3}s, sleep {:.1}%",
         wall_secs(&report),
         sleep * 100.0
+    ))
+}
+
+fn check_poll(out: &Output, server: SocketAddr) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let peer = server.to_string();
+    // Without the readiness probes these waits would be class poll.
+    let net = class_share(&report, "net", |s| s == peer);
+    ensure!(net >= 0.6, "net share for {peer} {net:.3} < 0.6");
+    Ok(format!(
+        "wall {:.3}s, epoll_wait/poll ended by {peer}: net {:.1}%",
+        wall_secs(&report),
+        net * 100.0
+    ))
+}
+
+fn check_fault(out: &Output, dir: &str) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let fault = class_share(&report, "fault", |s| s == dir);
+    ensure!(fault >= 0.5, "fault share on {dir} {fault:.3} < 0.5");
+    Ok(format!(
+        "wall {:.3}s, page faults on {dir} {:.1}%",
+        wall_secs(&report),
+        fault * 100.0
+    ))
+}
+
+fn check_waker(out: &Output) -> anyhow::Result<String> {
+    const WOKEN: &str = "woken by wt-fifo-writer";
+    exited(out, 0)?;
+    let report = report(out)?;
+    let poll = class_share(&report, "poll", |s| s == WOKEN);
+    ensure!(poll >= 0.35, "poll share {WOKEN:?} {poll:.3} < 0.35");
+    // LENIENT until feat/attrib is merged: feat/wake's attribute.rs names a pipe wait it does
+    // not descend into after the blocked process ("wt-fifo"); feat/attrib renders it with the
+    // classified subject. On merging feat/attrib, drop `|| s == "wt-fifo"` (strict WOKEN).
+    let ipc = class_share(&report, "ipc", |s| s == WOKEN || s == "wt-fifo");
+    ensure!(ipc >= 0.35, "ipc share {WOKEN:?} {ipc:.3} < 0.35");
+    Ok(format!(
+        "wall {:.3}s, {WOKEN}: poll {:.1}%, fifo read {:.1}%",
+        wall_secs(&report),
+        poll * 100.0,
+        ipc * 100.0
     ))
 }
