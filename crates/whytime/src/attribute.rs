@@ -10,9 +10,9 @@
 //!
 //! - `futex`, `ipc` (pipes, local sockets) and `poll` blocks woken by a tracked thread: that
 //!   thread (the lock holder, the writer, the readiness source), in any tracked process,
-//!   including other threads of the same one. A `futex` or `poll` wait that ended without a
-//!   tracked waker (a timeout) and was retried at once is part of the next wait and takes
-//!   its waker (`Walker::retried_waker`);
+//!   including other threads of the same one. A `futex` or `poll` wait that no task ended
+//!   (a timeout) and was retried at once is part of the next wait and takes its waker
+//!   (`Walker::retried_waker`);
 //! - waiting for a child (`wait4`/`waitid`): the child process that ended the wait (the
 //!   waker when it is a child, else the child that exited last inside the block, else the
 //!   youngest child still alive at its end), along its main thread;
@@ -603,8 +603,12 @@ impl Walker<'_> {
                 Some((Target::Proc(child), (Class::Child, latest(child))))
             }
             class @ (Class::Futex | Class::Ipc | Class::Poll) => {
+                // Only a wait no task ended (a timeout, an interrupt) can have been retried; a
+                // waker outside the tree explains the wait itself (`woken by <comm>`).
                 let waker = match self.thread_at(block.waker_tid, block.waker_tgid, seg.end) {
-                    None if class != Class::Ipc => self.retried_waker(at.thread, index, class),
+                    None if class != Class::Ipc && block.waker_tid == 0 => {
+                        self.retried_waker(at.thread, index, class)
+                    }
                     waker => waker,
                 };
                 waker.map(|waker| (Target::Thread(waker), self.own_line(at, block, s0)))
@@ -738,11 +742,12 @@ impl Walker<'_> {
         (self.trace.procs[threads[thread].proc].key.pid == tgid).then_some(thread)
     }
 
-    /// The waker of a retried wait. A `futex` or `poll` wait that no tracked thread ended (a
-    /// timeout, typically) is one wait with the thread's next wait of the same `class` when
-    /// the thread ran less than 1/[`RETRY_CPU_DIVISOR`] of the first in between: it
-    /// re-checked and waited again (a timed condition wait, Python's GIL). The first wait of
-    /// such a chain that a tracked thread ended names the waker of all of them.
+    /// The waker of a retried wait. A `futex` or `poll` wait that no task ended (a timeout,
+    /// typically) is one wait with the thread's next wait of the same `class` when the thread
+    /// ran less than 1/[`RETRY_CPU_DIVISOR`] of the first in between: it re-checked and
+    /// waited again (a timed condition wait, Python's GIL). The first wait of such a chain
+    /// that a tracked thread ended names the waker of all of them; one that a task outside
+    /// the tree ended ends the chain unexplained.
     fn retried_waker(&mut self, t: ThreadId, index: usize, class: Class) -> Option<ThreadId> {
         if let Some(&waker) = self.retries.get(&(t, index)) {
             return waker;
@@ -763,7 +768,7 @@ impl Walker<'_> {
                 SegKind::Runq(_) => {}
                 SegKind::Blocked(block) if block.what.class == class => {
                     waker = self.thread_at(block.waker_tid, block.waker_tgid, seg.end);
-                    if waker.is_some() {
+                    if waker.is_some() || block.waker_tid != 0 {
                         break;
                     }
                     if let Some(&known) = self.retries.get(&(t, i)) {
@@ -1010,6 +1015,38 @@ mod tests {
 
         let a = attribute(&t, app, 0, 110);
         assert_eq!(tiled(&a, 0, 110), [(Class::Cpu, "app", 110)]);
+    }
+
+    #[test]
+    fn waits_woken_from_outside_the_tree_are_not_retried_timeouts() {
+        // A timed-out poll, then one a daemon ended, then one the sleeping worker ended,
+        // each re-checked in 1 ns: the daemon's wake explains its own wait and ends the
+        // timeout's chain, so neither is the worker's sleep.
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 100), None);
+        let daemon = Subject::Waker(Arc::from("dbus-daemon"));
+        let main = vec![
+            block(0, 40, Class::Poll, Subject::Process, (0, 0)),
+            run(40, 41),
+            block(41, 60, Class::Poll, daemon, (999, 999)),
+            run(60, 61),
+            block(61, 100, Class::Poll, Subject::Process, (11, 10)),
+        ];
+        thread(&mut t, app, 10, main);
+        let sleep = block(0, 100, Class::Sleep, Subject::Process, (0, 0));
+        thread(&mut t, app, 11, vec![sleep]);
+
+        let a = attribute(&t, app, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [
+                (Class::Cpu, "app", 2),
+                (Class::Sleep, "app", 39),
+                (Class::Poll, "app", 40),
+                (Class::Poll, "woken by dbus-daemon", 19),
+            ]
+        );
     }
 
     #[test]
