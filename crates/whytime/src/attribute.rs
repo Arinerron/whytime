@@ -31,7 +31,7 @@
 //! [`tell_apart`]). Runqueue lines say who held the CPU meanwhile ([`Line::held_by`]).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -516,19 +516,24 @@ impl Walker<'_> {
 
     /// The thread that stands for the process at each moment: the original leader while it
     /// lives, then whichever thread alive at that point lives longest (the one that took over
-    /// the leader's identity in a multithreaded exec, or the last to exit).
+    /// the leader's identity in a multithreaded exec, or the last to exit; of equals, the
+    /// last listed). O(T log T) in the process's threads.
     fn main_line(&self, p: ProcId) -> Vec<(ThreadId, u64, u64)> {
+        let threads = &self.trace.threads;
         let proc = &self.trace.procs[p];
         let end = proc.death.unwrap_or(u64::MAX);
-        let lives = |t: ThreadId| {
-            let thread = &self.trace.threads[t];
-            (thread.birth, thread.death.unwrap_or(u64::MAX).min(end))
-        };
+        let death_of = |t: ThreadId| threads[t].death.unwrap_or(u64::MAX).min(end);
+        let mut by_birth: Vec<(usize, ThreadId)> =
+            proc.threads.iter().copied().enumerate().collect();
+        by_birth.sort_by_key(|&(_, t)| threads[t].birth);
+        let mut by_birth = by_birth.into_iter().peekable();
+        // Threads born by the cursor, longest-living (then last listed) on top.
+        let mut born = BinaryHeap::new();
         let mut line = Vec::new();
         let mut cursor = proc.birth;
         let mut current = proc.threads.first().copied();
         while let Some(thread) = current {
-            let (_, death) = lives(thread);
+            let death = death_of(thread);
             if death > cursor {
                 line.push((thread, cursor, death));
                 cursor = death;
@@ -536,16 +541,15 @@ impl Walker<'_> {
             if cursor >= end {
                 break;
             }
-            current = proc
-                .threads
-                .iter()
-                .copied()
-                .filter(|&t| t != thread && !line.iter().any(|&(seen, ..)| seen == t))
-                .filter(|&t| {
-                    let (birth, death) = lives(t);
-                    birth <= cursor && death > cursor
-                })
-                .max_by_key(|&t| lives(t).1);
+            while let Some((listed, t)) = by_birth.next_if(|&(_, t)| threads[t].birth <= cursor) {
+                born.push((death_of(t), listed, t));
+            }
+            // The cursor only moves forward: a thread dead by it never qualifies again (nor
+            // do the ones already on the line).
+            while born.peek().is_some_and(|&(death, ..)| death <= cursor) {
+                born.pop();
+            }
+            current = born.pop().map(|(.., t)| t);
         }
         line
     }
@@ -1006,6 +1010,28 @@ mod tests {
 
         let a = attribute(&t, app, 0, 110);
         assert_eq!(tiled(&a, 0, 110), [(Class::Cpu, "app", 110)]);
+    }
+
+    #[test]
+    fn a_long_chain_of_thread_hand_offs_is_walked_in_order() {
+        // The leader exits early and each thread starts its successor before it exits (a
+        // pool replacing its workers): the main line passes through every thread. Quadratic
+        // or worse in the threads, this would not finish.
+        const THREADS: u64 = 20_000;
+        let end = (THREADS - 1) * 10 + 15;
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, end), None);
+        let chain: Vec<ThreadId> = (0..THREADS)
+            .map(|i| {
+                let tid = 10 + u32::try_from(i).unwrap();
+                thread(&mut t, app, tid, vec![run(i * 10, i * 10 + 15)])
+            })
+            .collect();
+
+        let a = attribute(&t, app, 0, end);
+        assert_eq!(tiled(&a, 0, end), [(Class::Cpu, "app", end)]);
+        let walked: Vec<ThreadId> = a.spans.iter().map(|span| span.thread).collect();
+        assert_eq!(walked, chain);
     }
 
     #[test]
