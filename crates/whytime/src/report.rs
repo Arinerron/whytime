@@ -21,6 +21,8 @@ pub enum EndedBy {
     Exit,
     /// `--duration` elapsed while the command was still running.
     Duration,
+    /// SIGINT, SIGTERM or SIGHUP ended an attached observation (`-p`).
+    Interrupt,
 }
 
 /// The whole report.
@@ -28,13 +30,17 @@ pub enum EndedBy {
 pub struct Report {
     /// [`Report::SCHEMA`].
     pub schema: &'static str,
-    /// The command line that was run.
+    /// The command line that was run (attach mode: the target's).
     pub command: Vec<String>,
-    /// Window length: the command's exec to its exit (or the deadline).
+    /// The running process whytime attached to (`-p`); absent in wrap mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_pid: Option<u32>,
+    /// Window length: the command's exec (or the attach) to its exit (or the deadline).
     pub wall_ns: u64,
     /// Why the window ended.
     pub ended_by: EndedBy,
-    /// The command's exit code (128 + signal when killed); `null` while it still runs.
+    /// The command's exit code (128 + signal when killed); `null` while it still runs (or,
+    /// attached, if it did not exit during the window).
     pub exit_code: Option<i32>,
     /// Where the window went, largest first; shares sum to 1.
     pub lines: Vec<ReportLine>,
@@ -107,6 +113,17 @@ pub struct Meta {
     pub dropped: u64,
     /// Syscall tracepoints attached.
     pub syscalls: bool,
+    /// Attach mode: the target and how it was seeded.
+    pub attached: Option<Attached>,
+}
+
+/// Attach-mode inputs of [`Report::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attached {
+    /// The target process.
+    pub pid: u32,
+    /// Threads blocked at attach whose syscall `/proc` would not show.
+    pub unreadable: usize,
 }
 
 impl Report {
@@ -163,6 +180,22 @@ impl Report {
             .collect();
 
         let mut notes = Vec::new();
+        if let Some(attached) = meta.attached {
+            notes.push(format!(
+                "attached to running pid {}: time before attach is not covered, and each \
+                 pre-existing thread's first interval is classified from /proc",
+                attached.pid
+            ));
+            if attached.unreadable > 0 {
+                notes.push(format!(
+                    "{} thread(s) blocked at attach in a syscall /proc would not show (no \
+                     ptrace access, e.g. kernel.yama.ptrace_scope); that first interval is \
+                     \"other\": run whytime with sudo, or add cap_sys_ptrace to its file \
+                     capabilities",
+                    attached.unreadable
+                ));
+            }
+        }
         if lines.iter().any(|line| line.class == Class::Net) {
             notes.push(
                 "network subjects are ip:port; hostname/DNS correlation is a later milestone"
@@ -175,8 +208,15 @@ impl Report {
                     .to_owned(),
             );
         }
-        if meta.ended_by == EndedBy::Duration {
-            notes.push("--duration elapsed; the command was still running".to_owned());
+        match meta.ended_by {
+            EndedBy::Duration => {
+                notes.push("--duration elapsed; the command was still running".to_owned());
+            }
+            EndedBy::Interrupt => notes.push(
+                "observation interrupted (SIGINT/SIGTERM/SIGHUP); the process kept running"
+                    .to_owned(),
+            ),
+            EndedBy::Exit => {}
         }
         if meta.dropped > 0 {
             notes.push(format!(
@@ -187,6 +227,7 @@ impl Report {
         Self {
             schema: Self::SCHEMA,
             command: meta.command,
+            attached_pid: meta.attached.map(|attached| attached.pid),
             wall_ns: meta.wall_ns,
             ended_by: meta.ended_by,
             exit_code: meta.exit_code,

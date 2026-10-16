@@ -31,5 +31,9 @@ path = "src/bin/wt-futex.rs"
 name = "wt-tcp"
 path = "src/bin/wt-tcp.rs"
 
+[[bin]]
+name = "wt-attach"
+path = "src/bin/wt-attach.rs"
+
 [lints]
 workspace = true

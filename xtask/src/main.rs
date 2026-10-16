@@ -17,6 +17,10 @@ use serde_json::Value;
 const USAGE: &str = "usage: cargo xtask test-e2e";
 /// Delay of the scenario-6 server between accept and reply.
 const SERVER_DELAY: Duration = Duration::from_millis(300);
+/// Seconds the attach scenarios let their target run before whytime attaches.
+const ATTACH_DELAY: &str = "0.3";
+/// A pid above any `pid_max`, so no process has it.
+const NO_PID: &str = "4194304";
 
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -60,6 +64,7 @@ fn test_e2e() -> anyhow::Result<()> {
     let fsync_dir = work.display().to_string();
     let server_arg = server.to_string();
     let trace_file = work.join("replay.wt");
+    let attach_trace = work.join("attach.wt");
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -123,6 +128,71 @@ fn test_e2e() -> anyhow::Result<()> {
                 move |out: &Output| check_replay(out, &whytime, &trace, &work)
             }),
         ),
+        (
+            "attach-blocked",
+            attach_cmd(whytime, &[&bin("wt-sleep"), "30000"], &["--duration", "1s"], None),
+            Box::new(check_attach_blocked),
+        ),
+        (
+            "attach-running",
+            attach_cmd(whytime, &[&bin("wt-burn"), "30000"], &["--duration", "1s"], None),
+            Box::new(check_attach_running),
+        ),
+        (
+            "attach-threads",
+            attach_cmd(whytime, &[&bin("wt-futex"), "30000"], &["--duration", "1s"], None),
+            Box::new(check_attach_threads),
+        ),
+        (
+            "attach-exit",
+            attach_cmd(
+                whytime,
+                &["sh", "-c", "\"$0\" 1200; exit 3", &bin("wt-sleep")],
+                &[],
+                None,
+            ),
+            Box::new(check_attach_exit),
+        ),
+        (
+            "attach-spawn",
+            attach_cmd(whytime, &[&bin("wt-attach"), "1500", "800"], &[], None),
+            Box::new(check_attach_spawn),
+        ),
+        (
+            "attach-interrupt",
+            attach_cmd(whytime, &[&bin("wt-sleep"), "30000"], &[], Some("1")),
+            Box::new(check_attach_interrupt),
+        ),
+        (
+            "attach-nopid",
+            {
+                let mut cmd = Command::new(whytime);
+                cmd.args(["--json", "-p", NO_PID]);
+                cmd
+            },
+            Box::new(check_attach_nopid),
+        ),
+        (
+            // A shell looping short wt-fsync runs: seeds (the shell, maybe a child), then
+            // fork/exec/exit and fsync records, and file lookups, all inside the window.
+            "attach-record",
+            attach_cmd(
+                whytime,
+                &[
+                    "sh",
+                    "-c",
+                    "while :; do \"$0\" \"$1\" 20; done",
+                    &bin("wt-fsync"),
+                    &fsync_dir,
+                ],
+                &["--duration", "1s", "--record", &attach_trace.display().to_string()],
+                None,
+            ),
+            Box::new({
+                let (whytime, trace, work) = (whytime.clone(), attach_trace.clone(), work.clone());
+                move |out: &Output| check_attach_record(out, &whytime, &trace, &work)
+            }),
+        ),
     ];
 
     let mut failed = 0;
@@ -178,7 +248,14 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         }
     }
     for name in [
-        "whytime", "wt-sleep", "wt-burn", "wt-fsync", "wt-child", "wt-futex", "wt-tcp",
+        "whytime",
+        "wt-sleep",
+        "wt-burn",
+        "wt-fsync",
+        "wt-child",
+        "wt-futex",
+        "wt-tcp",
+        "wt-attach",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -225,6 +302,47 @@ fn setcap_copy(whytime: &Path, work: &Path, sleep: &str) -> anyhow::Result<Comma
     let mut cmd = Command::new(copy);
     cmd.args(["--json", "--", sleep, "300"]);
     Ok(cmd)
+}
+
+/// An `sh` script that starts `target` in the background, waits [`ATTACH_DELAY`], and runs
+/// `sudo -n whytime --json -p PID` with `args` on it; with `interrupt`, it sends whytime
+/// SIGINT that many seconds later. Afterwards it prints `target alive` on stdout if the
+/// target still runs (whytime must never stop it), stops it, and exits with whytime's
+/// status. Running in the background, whytime inherits SIGINT ignored, as from scripts.
+fn attach_cmd(whytime: &Path, target: &[&str], args: &[&str], interrupt: Option<&str>) -> Command {
+    // Single-quoted for sh: a trace file path may contain spaces.
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', r"'\''")))
+        .collect();
+    let args = args.join(" ");
+    let run = match interrupt {
+        None => format!("sudo -n \"$w\" --json -p \"$t\" {args}; s=$?"),
+        // Without a terminal, sudo runs whytime as its direct child.
+        Some(after) => format!(
+            "sudo -n \"$w\" --json -p \"$t\" {args} & j=$!\n\
+             sleep {after}\n\
+             sudo -n pkill -INT -P \"$j\"\n\
+             wait \"$j\"; s=$?"
+        ),
+    };
+    let script = format!(
+        "w=$1; shift\n\
+         \"$@\" & t=$!\n\
+         sleep {ATTACH_DELAY}\n\
+         {run}\n\
+         state=$(sed 's/.*) //' \"/proc/$t/stat\" 2>/dev/null | cut -c1)\n\
+         if [ -n \"$state\" ] && [ \"$state\" != Z ]; then echo target alive; kill \"$t\"; fi\n\
+         wait \"$t\"\n\
+         exit \"$s\""
+    );
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(whytime)
+        .args(target);
+    cmd
 }
 
 /// The JSON report at the end of stderr.
@@ -429,4 +547,151 @@ fn check_replay(
         bytes.len(),
         live["quality"]["events"]
     ))
+}
+
+/// The report of an attach scenario that exited 0 and ended by `ended_by`.
+fn attached(out: &Output, ended_by: &str) -> anyhow::Result<Value> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    ensure!(report["attached_pid"].is_u64(), "no attached_pid");
+    ensure!(
+        report["ended_by"] == ended_by,
+        "ended_by {} (want {ended_by})",
+        report["ended_by"]
+    );
+    Ok(report)
+}
+
+/// Whether the attach script found the target still running after whytime finished.
+fn target_alive(out: &Output) -> bool {
+    String::from_utf8_lossy(&out.stdout).contains("target alive")
+}
+
+fn check_attach_blocked(out: &Output) -> anyhow::Result<String> {
+    let report = attached(out, "duration")?;
+    ensure!(target_alive(out), "the target did not survive whytime");
+    let sleep = class_share(&report, "sleep", |_| true);
+    let wall = wall_secs(&report);
+    ensure!(sleep >= 0.9, "sleep share {sleep:.3} < 0.9");
+    ensure!(
+        (0.9..=1.1).contains(&wall),
+        "wall {wall:.3}s not within 1.0s ± 10%"
+    );
+    Ok(format!(
+        "blocked before attach: wall {wall:.3}s, sleep {:.1}%",
+        sleep * 100.0
+    ))
+}
+
+fn check_attach_running(out: &Output) -> anyhow::Result<String> {
+    let report = attached(out, "duration")?;
+    ensure!(target_alive(out), "the target did not survive whytime");
+    let cpu = class_share(&report, "cpu", |_| true);
+    ensure!(cpu >= 0.9, "on-CPU share {cpu:.3} < 0.9");
+    Ok(format!(
+        "running at attach: wall {:.3}s, on-CPU {:.1}%",
+        wall_secs(&report),
+        cpu * 100.0
+    ))
+}
+
+fn check_attach_threads(out: &Output) -> anyhow::Result<String> {
+    let report = attached(out, "duration")?;
+    ensure!(target_alive(out), "the target did not survive whytime");
+    let futex = class_share(&report, "futex", |_| true);
+    ensure!(futex >= 0.9, "futex share {futex:.3} < 0.9");
+    Ok(format!(
+        "two threads: wall {:.3}s, futex {:.1}%",
+        wall_secs(&report),
+        futex * 100.0
+    ))
+}
+
+/// Whether `processes[]` has a `comm` process whose parent is the attached target.
+fn has_child(report: &Value, comm: &str) -> bool {
+    let target = report["attached_pid"].as_u64();
+    report["processes"].as_array().is_some_and(|procs| {
+        procs
+            .iter()
+            .any(|p| p["comm"] == comm && p["ppid"].as_u64() == target)
+    })
+}
+
+fn check_attach_exit(out: &Output) -> anyhow::Result<String> {
+    let report = attached(out, "exit")?;
+    ensure!(!target_alive(out), "the target outlived its reported exit");
+    ensure!(
+        report["exit_code"] == 3,
+        "exit_code {} (want 3)",
+        report["exit_code"]
+    );
+    ensure!(
+        has_child(&report, "wt-sleep"),
+        "the pre-existing child wt-sleep is not in processes[]"
+    );
+    let sleep = class_share(&report, "sleep", |_| true);
+    ensure!(sleep >= 0.9, "sleep share {sleep:.3} < 0.9");
+    Ok(format!(
+        "sh waiting on a pre-existing child: wall {:.3}s, sleep {:.1}%, exit_code 3",
+        wall_secs(&report),
+        sleep * 100.0
+    ))
+}
+
+fn check_attach_spawn(out: &Output) -> anyhow::Result<String> {
+    let report = attached(out, "exit")?;
+    ensure!(
+        report["exit_code"] == 0,
+        "exit_code {} (want 0)",
+        report["exit_code"]
+    );
+    ensure!(
+        has_child(&report, "wt-burn"),
+        "the child started after attach is not in processes[]"
+    );
+    let child = class_share(&report, "child", |s| s == "wt-burn");
+    ensure!(child >= 0.3, "waiting on child wt-burn {child:.3} < 0.3");
+    Ok(format!(
+        "child forked after attach: wall {:.3}s, waiting on child: wt-burn {:.1}%",
+        wall_secs(&report),
+        child * 100.0
+    ))
+}
+
+fn check_attach_interrupt(out: &Output) -> anyhow::Result<String> {
+    let report = attached(out, "interrupt")?;
+    ensure!(target_alive(out), "the target did not survive whytime");
+    let sleep = class_share(&report, "sleep", |_| true);
+    let wall = wall_secs(&report);
+    ensure!(sleep >= 0.9, "sleep share {sleep:.3} < 0.9");
+    ensure!((0.1..=1.0).contains(&wall), "wall {wall:.3}s not within 0.1..1s");
+    Ok(format!(
+        "SIGINT after 1s: wall {wall:.3}s, sleep {:.1}%",
+        sleep * 100.0
+    ))
+}
+
+fn check_attach_nopid(out: &Output) -> anyhow::Result<String> {
+    exited(out, 1)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("no process"))
+        .context("no \"no process\" message on stderr")?;
+    Ok(format!("exit 1, {}", line.trim()))
+}
+
+/// `-p PID --record`: the attached report (ended by `--duration`, target alive, records
+/// seen), then the same replay checks as `--record` in wrap mode.
+fn check_attach_record(
+    out: &Output,
+    whytime: &Path,
+    trace: &Path,
+    work: &Path,
+) -> anyhow::Result<String> {
+    let live = attached(out, "duration")?;
+    ensure!(target_alive(out), "the target did not survive whytime");
+    let events = live["quality"]["events"].as_u64().unwrap_or(0);
+    ensure!(events > 0, "no records in the window: nothing to replay but the seeds");
+    check_replay(out, whytime, trace, work).map(|summary| format!("attached: {summary}"))
 }

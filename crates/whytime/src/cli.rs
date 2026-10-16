@@ -10,7 +10,8 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// Runs COMMAND, traces it and every process it starts with eBPF, and prints to stderr where
 /// its wall time went: on-CPU, waiting on children, sleeping, fsync, network peers, locks.
-/// COMMAND's own output passes through, and whytime exits with COMMAND's exit code.
+/// COMMAND's own output passes through, and whytime exits with COMMAND's exit code. With
+/// `-p PID`, observes a running process and its descendants instead.
 #[derive(Debug, Parser)]
 #[command(
     name = "whytime",
@@ -18,7 +19,8 @@ use clap::{Args, Parser, Subcommand};
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
     after_help = "Exit status: COMMAND's; 125 if whytime could not start tracing; \
-                  126/127 if COMMAND is not executable / not found."
+                  126/127 if COMMAND is not executable / not found. With -p: 0 after the \
+                  report, 1 if PID cannot be attached to, 125 if tracing could not start."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -28,15 +30,15 @@ pub struct Cli {
     pub run: RunArgs,
 }
 
-/// Wrap mode.
+/// Wrap and attach mode.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Print the report as JSON (schema whytime.report/1).
     #[arg(long)]
     pub json: bool,
 
-    /// Stop observing after D (e.g. 500ms, 30s, 2m) and report; COMMAND keeps running and
-    /// whytime still exits with its code.
+    /// Stop observing after D (e.g. 500ms, 30s, 2m) and report; COMMAND (or PID) keeps
+    /// running, and whytime still exits with COMMAND's code.
     #[arg(long, value_name = "D", value_parser = parse_duration)]
     pub duration: Option<Duration>,
 
@@ -44,11 +46,21 @@ pub struct RunArgs {
     /// report offline.
     #[arg(long, value_name = "FILE")]
     pub record: Option<PathBuf>,
+    /// Attach to the running process PID and its descendants instead of running COMMAND;
+    /// report when it exits, --duration elapses or on Ctrl-C (never signals PID).
+    #[arg(
+        short = 'p',
+        long = "pid",
+        value_name = "PID",
+        conflicts_with = "command",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub pid: Option<u32>,
 
     /// The command to run, and its arguments.
     #[arg(
         value_name = "COMMAND",
-        required = true,
+        required_unless_present = "pid",
         trailing_var_arg = true,
         allow_hyphen_values = true
     )]
@@ -141,5 +153,18 @@ mod tests {
             cli.sub,
             Some(Sub::Report { ref file, json: true }) if file.as_os_str() == "t.wt"
         ));
+    }
+
+    #[test]
+    fn pid_replaces_the_command_and_excludes_it() {
+        let cli = Cli::try_parse_from(["whytime", "-p", "42", "--json"]).unwrap();
+        assert_eq!(cli.run.pid, Some(42));
+        assert!(cli.run.json);
+        assert!(cli.run.command.is_empty());
+        let cli = Cli::try_parse_from(["whytime", "-p", "42", "--record", "t.wt"]).unwrap();
+        assert_eq!(cli.run.record, Some(PathBuf::from("t.wt")));
+        assert!(Cli::try_parse_from(["whytime", "--pid", "42", "--", "ls"]).is_err());
+        assert!(Cli::try_parse_from(["whytime", "-p", "0"]).is_err());
+        assert!(Cli::try_parse_from(["whytime", "--json"]).is_err());
     }
 }

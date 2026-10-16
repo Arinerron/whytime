@@ -21,6 +21,8 @@ locks, polling, waiting for a CPU. Shares always add up to 100% of the wall time
 $ whytime -- ./build.sh            # report on stderr; the command's output passes through
 $ whytime --json -- make -j8       # schema whytime.report/1
 $ whytime --duration 30s -- ./server   # report after 30 s; the server keeps running
+$ whytime -p 4242                  # attach to a running process; report on exit or Ctrl-C
+$ whytime -p 4242 --duration 10s   # ... or after 10 s
 $ whytime doctor                   # can it run here? exact fixes if not
 $ whytime --record ci.wt -- make   # also save a trace file...
 $ whytime report ci.wt [--json]    # ...and print the same report from it later, offline
@@ -29,10 +31,35 @@ $ whytime report ci.wt [--json]    # ...and print the same report from it later,
 whytime exits with the command's exit code (125 if tracing could not start, 126/127 if the
 command is not executable / not found).
 
-A trace file holds the raw kernel records and every lookup the report used, so
-`whytime report` reproduces the report exactly, offline and without privileges (attach it to
-a bug report or a CI artifact). It exits 2 if the file is damaged or was recorded by a
-whytime with a different record layout. Under `sudo`, the file belongs to you.
+A trace file holds the raw kernel records and every lookup the report used (with `-p`, also
+what whytime read from `/proc` when it attached), so `whytime report` reproduces the report
+exactly, offline and without privileges (attach it to a bug report or a CI artifact). It
+exits 2 if the file is damaged or was recorded by a whytime with a different record layout.
+Under `sudo`, the file belongs to you.
+
+## Attaching to a running process
+
+`whytime -p PID` traces PID and its descendants (existing ones, and every process they
+start) from the moment it attaches until PID exits, `--duration` elapses, or you press
+Ctrl-C; then it reports and exits 0. PID itself is never signalled.
+
+```
+$ bash -c 'while true; do sleep 0.2; dd if=/dev/zero of=/dev/null bs=1M count=3000 2>/dev/null; done' &
+$ sudo whytime -p $! --duration 3s
+wall 3.00s
+  55%  waiting on child: dd
+  44%  timer sleep (sleep)
+   1%  other
+critical path: 16 processes · 0 events lost
+note: attached to running pid 1414887: time before attach is not covered, and each pre-existing thread's first interval is classified from /proc
+note: --duration elapsed; the command was still running
+```
+
+Time before the attach is not covered. What each thread was doing when whytime attached
+(its syscall, and the file, pipe or peer it waits on) is read from `/proc`; without root
+that needs ptrace access to the process (`kernel.yama.ptrace_scope`), else that first
+stretch is reported as `other` with a note. Without root, whytime attaches only to your
+own processes.
 
 ## Install
 
@@ -49,7 +76,7 @@ Needs Linux ≥ 5.18 with BTF (`/sys/kernel/btf/vmlinux`).
 
 ## Status: MVP
 
-Wrap mode with off-CPU/on-CPU attribution across the process tree, and trace files
-(`--record`, `whytime report`). Not yet: attaching to a running process (`-p`), flamegraphs,
-hostnames for network peers (DNS correlation). The attribution model, its limits, and the
-developer guide are in [AGENTS.md](AGENTS.md).
+Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, and trace
+files for both (`--record`, `whytime report`). Not yet: flamegraphs, hostnames for network
+peers (DNS correlation). The attribution model, its limits, and the developer guide are in
+[AGENTS.md](AGENTS.md).

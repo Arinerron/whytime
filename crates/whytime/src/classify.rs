@@ -77,6 +77,8 @@ pub enum Subject {
     NoSyscall,
     /// Stopped by a signal or a tracer.
     Stopped,
+    /// Blocked since before attach, in a syscall `/proc` would not show.
+    Unreadable,
 }
 
 impl fmt::Display for Subject {
@@ -91,6 +93,7 @@ impl fmt::Display for Subject {
             Self::UnknownSyscall(nr) => write!(f, "in syscall {nr}"),
             Self::NoSyscall => f.write_str("outside syscalls (page faults, kernel locks)"),
             Self::Stopped => f.write_str("stopped (signal or tracer)"),
+            Self::Unreadable => f.write_str("blocked since attach, syscall unreadable"),
         }
     }
 }
@@ -119,6 +122,9 @@ const TASK_STOPPED: u32 = 0x4;
 const TASK_TRACED: u32 = 0x8;
 /// `O_DSYNC`; `O_SYNC` includes it.
 const O_DSYNC: u32 = 0o10_000;
+/// [`SysInfo::nr`] of a thread found blocked at attach whose `/proc/<tid>/syscall` could not
+/// be read. Only attach mode writes it; the kernel side never does.
+pub const NR_UNREADABLE: i32 = -2;
 
 /// What a descriptor's `/proc` link names: the classifier's only external lookup.
 pub trait FdTarget: fmt::Debug {
@@ -175,6 +181,9 @@ impl Classifier {
             subject,
             socket: None,
         };
+        if sys.nr == NR_UNREADABLE {
+            return plain(Class::Other, Subject::Unreadable);
+        }
         if sys.nr == NR_NONE {
             let subject = if block_state & (TASK_STOPPED | TASK_TRACED) != 0 {
                 Subject::Stopped

@@ -7,10 +7,12 @@
 //! `/proc/<pid>/fd/<fd>` resolution, keyed by `(dev, ino)` like its cache), the final sweep of
 //! the `tasks` map, and the run's context (command line, root pid, home directory for `~`,
 //! syscall probe availability, `AT_CLKTCK` for procctx, architecture for syscall numbers, how
-//! the window ended, dropped records). procctx needs nothing else: whytime only calls its
-//! event handlers and `get_key`, which never read `/proc`.
+//! the window ended, dropped records). Attach mode (`-p`) adds what it read from `/proc`
+//! before the window: the [`ProcSeed`]s it fed [`Trace::seed`], the window start, and how
+//! many blocked threads had an unreadable syscall. procctx needs nothing else: whytime only
+//! calls its event handlers and `get_key`, which never read `/proc`.
 //!
-//! # Format (version 1)
+//! # Format (version 2)
 //!
 //! Little-endian. A 24-byte preamble, then frames.
 //!
@@ -26,11 +28,12 @@
 //!
 //! | Kind | Frame | Payload |
 //! |---|---|---|
-//! | 1 | header: first, once | root pid `u32`, syscall probes attached `u8`, `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes` |
+//! | 1 | header: first, once | root pid `u32`, syscall probes attached `u8`, `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
 //! | 2 | record | one ring buffer record, verbatim |
 //! | 3 | lookup | dev `u32`, ino `u64`, found `u8`, then the link target (rest of the payload) |
 //! | 4 | task | tid `u32`, `task_state` (one entry of the final `tasks` sweep) |
-//! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration), exit code `opt i32`, dropped `u64` |
+//! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration, 2 interrupt), exit code `opt i32`, dropped `u64` |
+//! | 6 | seed: attach mode only, once, before any record | window start `u64`, count `u32`, then per process: pid `u32`, start `u64` (procctx key), ppid `u32`, seeded at `u64`, comm `bytes`, argv `bytes` (NUL-separated), thread count `u32`, threads × (tid `u32`, entry time `u64`) |
 //!
 //! Frames are written as the run goes; tasks and the end frame when the window ends, so a
 //! file without an end frame was cut short and is rejected. Bump [`VERSION`] when the
@@ -48,17 +51,20 @@ use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use procctx::ProcKey;
 use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget};
-use crate::report::EndedBy;
+use crate::report::{Attached, EndedBy};
 use crate::sys::SyscallTable;
-use crate::timeline::{self, Trace};
+use crate::timeline::{self, ProcSeed, Trace};
 
 /// Trace file magic.
 const MAGIC: [u8; 8] = *b"WHYTRACE";
+/// Preamble length (magic, version, zero, ABI hash): the header frame's offset.
+const PREAMBLE: usize = MAGIC.len() + 16;
 /// Format version written and read.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Architecture whose syscall numbers this build classifies.
 const ARCH: &str = std::env::consts::ARCH;
 
@@ -67,15 +73,16 @@ const F_RECORD: u32 = 2;
 const F_LOOKUP: u32 = 3;
 const F_TASK: u32 = 4;
 const F_END: u32 = 5;
+const F_SEED: u32 = 6;
 
-/// What the recording run knew when COMMAND started.
+/// What the recording run knew when the window opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     /// `std::env::consts::ARCH` of the recording whytime: syscall numbers depend on it.
     pub arch: String,
-    /// The command line.
+    /// The command line (attach mode: the target's).
     pub command: Vec<OsString>,
-    /// COMMAND's pid.
+    /// COMMAND's pid (attach mode: the target's).
     pub root_pid: u32,
     /// Home directory abbreviated to `~`.
     pub home: Option<PathBuf>,
@@ -83,12 +90,23 @@ pub struct Header {
     pub syscalls: bool,
     /// `AT_CLKTCK`, procctx's start clock resolution.
     pub ticks_per_sec: NonZeroU64,
+    /// Attach mode: the target (`root_pid`) and how it was seeded.
+    pub attached: Option<Attached>,
+}
+
+/// Attach mode's start: what `/proc` showed of the running tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Seeding {
+    /// Window start, the end of seeding.
+    start: u64,
+    /// The processes [`Trace::seed`] was given, parents first.
+    procs: Vec<ProcSeed>,
 }
 
 /// How the window ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct End {
-    /// Window start the live trace saw (the root's exec), if any.
+    /// Window start the live trace saw (the root's exec, or the end of attach's seeding).
     pub start: Option<u64>,
     /// Window end: the time the sweep closed open intervals at.
     pub end: u64,
@@ -205,7 +223,31 @@ impl Recorder {
         for arg in &header.command {
             p.bytes(arg.as_bytes());
         }
+        let unreadable = header
+            .attached
+            .map(|attached| u64::try_from(attached.unreadable).unwrap_or(u64::MAX));
+        p.opt(unreadable, Enc::u64);
         self.frame(F_HEADER, &[&p.0]);
+    }
+
+    /// Writes attach mode's seeding: the arguments of [`Trace::seed`].
+    pub fn seed(&self, seeds: &[ProcSeed], start: u64) {
+        let mut p = Enc::default();
+        p.u64(start)
+            .u32(u32::try_from(seeds.len()).unwrap_or(u32::MAX));
+        for seed in seeds {
+            p.u32(seed.key.pid)
+                .u64(seed.key.start)
+                .u32(seed.ppid)
+                .u64(seed.birth)
+                .bytes(seed.comm.as_bytes())
+                .bytes(&seed.argv)
+                .u32(u32::try_from(seed.threads.len()).unwrap_or(u32::MAX));
+            for &(tid, birth) in &seed.threads {
+                p.u32(tid).u64(birth);
+            }
+        }
+        self.frame(F_SEED, &[&p.0]);
     }
 
     /// Writes one ring buffer record.
@@ -233,6 +275,7 @@ impl Recorder {
             .u8(match end.ended_by {
                 EndedBy::Exit => 0,
                 EndedBy::Duration => 1,
+                EndedBy::Interrupt => 2,
             })
             .opt(end.exit_code, Enc::i32)
             .u64(end.dropped);
@@ -306,6 +349,8 @@ impl FdTarget for Replayed {
 struct Recording<'a> {
     /// Header frame.
     header: Header,
+    /// Seed frame (attach mode).
+    seeding: Option<Seeding>,
     /// Ring buffer records in arrival order.
     records: Vec<&'a [u8]>,
     /// Lookup answers by `(dev, ino)`.
@@ -351,6 +396,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
     }
 
     let mut header = None;
+    let mut seeding = None;
     let mut end = None;
     let mut records = Vec::new();
     let mut lookups = HashMap::new();
@@ -368,6 +414,12 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
             F_HEADER if header.is_none() => header = Some(p.header()?),
             F_HEADER => return Err(malformed(at, "second header frame")),
             _ if header.is_none() => return Err(malformed(at, "first frame is not the header")),
+            F_SEED if header.as_ref().is_some_and(|h| h.attached.is_none()) => {
+                return Err(malformed(at, "seed frame in a trace that did not attach"));
+            }
+            F_SEED if seeding.is_some() => return Err(malformed(at, "second seed frame")),
+            F_SEED if !records.is_empty() => return Err(malformed(at, "seed frame after a record")),
+            F_SEED => seeding = Some(p.seeding()?),
             F_RECORD => records.push(payload),
             F_LOOKUP => {
                 let key = (p.u32()?, p.u64()?);
@@ -389,8 +441,12 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
     let (Some(header), Some(end)) = (header, end) else {
         return Err(Error::Truncated);
     };
+    if header.attached.is_some() && seeding.is_none() {
+        return Err(malformed(PREAMBLE, "attached trace without a seed frame"));
+    }
     Ok(Recording {
         header,
+        seeding,
         records,
         lookups,
         tasks,
@@ -402,6 +458,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
 pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
     let Recording {
         header,
+        seeding,
         records,
         lookups,
         tasks,
@@ -420,6 +477,9 @@ pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
         classifier,
         timeline::proc_table(header.ticks_per_sec),
     );
+    if let Some(seeding) = seeding {
+        trace.seed(&seeding.procs, seeding.start);
+    }
     let mut scratch = Vec::new();
     for record in records {
         trace.ingest(aligned(&mut scratch, record));
@@ -592,6 +652,14 @@ impl<'a> Dec<'a> {
         for _ in 0..argc {
             command.push(OsString::from_vec(self.blob()?.to_vec()));
         }
+        let attached = match self.opt(Self::u64)? {
+            Some(unreadable) => Some(Attached {
+                pid: root_pid,
+                unreadable: usize::try_from(unreadable)
+                    .map_err(|_| malformed(self.at - 8, "unreadable count overflow"))?,
+            }),
+            None => None,
+        };
         self.done()?;
         Ok(Header {
             arch,
@@ -600,7 +668,40 @@ impl<'a> Dec<'a> {
             home,
             syscalls,
             ticks_per_sec,
+            attached,
         })
+    }
+
+    fn seeding(&mut self) -> Result<Seeding, Error> {
+        let start = self.u64()?;
+        let count = self.u32()?;
+        // Not preallocated: the counts are untrusted until every entry has been read.
+        let mut procs = Vec::new();
+        for _ in 0..count {
+            let key = ProcKey {
+                pid: self.u32()?,
+                start: self.u64()?,
+            };
+            let ppid = self.u32()?;
+            let birth = self.u64()?;
+            let comm = String::from_utf8(self.blob()?.to_vec())
+                .map_err(|_| malformed(self.at, "comm is not UTF-8"))?;
+            let argv = self.blob()?.to_vec();
+            let mut threads = Vec::new();
+            for _ in 0..self.u32()? {
+                threads.push((self.u32()?, self.u64()?));
+            }
+            procs.push(ProcSeed {
+                key,
+                ppid,
+                comm,
+                argv,
+                birth,
+                threads,
+            });
+        }
+        self.done()?;
+        Ok(Seeding { start, procs })
     }
 
     fn end(&mut self) -> Result<End, Error> {
@@ -609,6 +710,7 @@ impl<'a> Dec<'a> {
         let ended_by = match self.u8()? {
             0 => EndedBy::Exit,
             1 => EndedBy::Duration,
+            2 => EndedBy::Interrupt,
             _ => return Err(malformed(self.at - 1, "unknown window end reason")),
         };
         let exit_code = self.opt(Self::i32)?;
@@ -650,9 +752,9 @@ mod tests {
         }
     }
 
-    /// Records a small run the way `whytime --record` does; returns the live JSON report and
-    /// the trace file.
-    fn record_run(name: &str, arch: &str) -> (String, Vec<u8>) {
+    /// Records a small run the way `whytime --record` does (with `attached`, the way
+    /// `whytime -p 100 --record` does); returns the live JSON report and the trace file.
+    fn record_run(name: &str, arch: &str, attached: bool) -> (String, Vec<u8>) {
         let path = std::env::temp_dir().join(format!(
             "whytime-record-test-{}-{name}.wt",
             std::process::id()
@@ -665,19 +767,40 @@ mod tests {
             home: Some(PathBuf::from("/home/u")),
             syscalls: true,
             ticks_per_sec: NonZeroU64::new(100).expect("non-zero"),
+            attached: attached.then_some(Attached {
+                pid: 100,
+                unreadable: 1,
+            }),
         };
         recorder.header(&header);
         let files = Logged::new(OneFile, recorder.clone());
         let classifier = Classifier::new(SyscallTable::new(), header.home.clone(), Box::new(files));
         let mut trace = Trace::new(100, classifier, timeline::proc_table(header.ticks_per_sec));
+        let live = |trace: &mut Trace, bytes: &[u8]| crate::ingest(trace, Some(&recorder), bytes);
+        if attached {
+            let seed = |pid, ppid, comm: &str, threads| ProcSeed {
+                key: ProcKey { pid, start: 500 },
+                ppid,
+                comm: comm.to_owned(),
+                argv: format!("{comm}\0--flag\0").into_bytes(),
+                birth: 900,
+                threads,
+            };
+            let seeds = [
+                seed(100, 1, "app", vec![(100, 910), (101, 920)]),
+                seed(200, 100, "helper", vec![(200, 930)]),
+            ];
+            recorder.seed(&seeds, 1_000);
+            trace.seed(&seeds, 1_000);
+        } else {
+            live(&mut trace, wire::as_bytes(&exec(1_000, 100, 100, "app", seg(1_000, 0, 0))));
+        }
 
         let mut fsync = sys(SYS_fsync);
         fsync.fd = 3;
         fsync.mode = 0o100_000;
         fsync.dev = DEV;
         fsync.ino = INO;
-        let live = |trace: &mut Trace, bytes: &[u8]| crate::ingest(trace, Some(&recorder), bytes);
-        live(&mut trace, wire::as_bytes(&exec(1_000, 100, 100, "app", seg(1_000, 0, 0))));
         let first = episode(100, 100, seg(1_000, 100, 0), fsync, [1_100, 1_900, 1_900]);
         live(&mut trace, wire::as_bytes(&first));
         // Undecodable records are counted in the report, so they are recorded too.
@@ -691,14 +814,18 @@ mod tests {
         let end = End {
             start: trace.window.start,
             end: 3_000,
-            ended_by: EndedBy::Duration,
+            ended_by: if attached {
+                EndedBy::Interrupt
+            } else {
+                EndedBy::Duration
+            },
             exit_code: None,
             dropped: 2,
         };
         recorder.finish(&tasks, &end).expect("writing the trace file");
 
         let mut json = Vec::new();
-        let meta = crate::meta(&header.command, header.syscalls, &end);
+        let meta = crate::meta(&header, &end);
         crate::write_report(&mut json, &trace, end.end, meta, true).expect("rendering");
         let bytes = std::fs::read(&path).expect("reading the trace file back");
         std::fs::remove_file(&path).expect("removing the trace file");
@@ -707,16 +834,22 @@ mod tests {
 
     fn replayed_json(bytes: &[u8]) -> String {
         let replay = replay(bytes).expect("replaying");
-        let meta = crate::meta(&replay.header.command, replay.header.syscalls, &replay.end);
+        let meta = crate::meta(&replay.header, &replay.end);
         let mut json = Vec::new();
         crate::write_report(&mut json, &replay.trace, replay.end.end, meta, true)
             .expect("rendering");
         String::from_utf8(json).expect("UTF-8 JSON")
     }
 
+    /// Offset of the frame after the one at `at`.
+    fn next_frame(bytes: &[u8], at: usize) -> usize {
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes"));
+        at + 8 + usize::try_from(len).expect("frame length")
+    }
+
     #[test]
     fn a_recorded_run_replays_to_the_identical_report() {
-        let (live, bytes) = record_run("identical", ARCH);
+        let (live, bytes) = record_run("identical", ARCH, false);
         let replayed = replayed_json(&bytes);
         assert_eq!(replayed, live);
         // The path came from the recorded lookup and the recorded home, not this machine.
@@ -725,8 +858,21 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_run_replays_its_seeded_tree_to_the_identical_report() {
+        let (live, bytes) = record_run("attached", ARCH, true);
+        let replayed = replayed_json(&bytes);
+        assert_eq!(replayed, live);
+        assert!(replayed.contains("\"attached_pid\": 100"), "{replayed}");
+        assert!(replayed.contains("\"ended_by\": \"interrupt\""), "{replayed}");
+        // The seeded child, its argv from /proc, and the unreadable-syscall note.
+        assert!(replayed.contains("\"comm\": \"helper\""), "{replayed}");
+        assert!(replayed.contains("\"--flag\""), "{replayed}");
+        assert!(replayed.contains("1 thread(s) blocked at attach"), "{replayed}");
+    }
+
+    #[test]
     fn a_trace_from_another_record_layout_names_both_hashes() {
-        let (_, mut bytes) = record_run("abi", ARCH);
+        let (_, mut bytes) = record_run("abi", ARCH, false);
         bytes[16] ^= 0xff;
         let err = replay(&bytes).expect_err("an ABI mismatch");
         let Error::Abi { file, ours } = err else {
@@ -741,19 +887,22 @@ mod tests {
 
     #[test]
     fn a_trace_from_another_architecture_is_refused() {
-        let (_, bytes) = record_run("arch", "riscv64");
+        let (_, bytes) = record_run("arch", "riscv64", false);
         assert!(matches!(replay(&bytes), Err(Error::Arch(arch)) if arch == "riscv64"));
     }
 
     #[test]
     fn cut_short_files_are_truncated_and_damaged_ones_malformed() {
-        let (_, bytes) = record_run("damaged", ARCH);
-        for len in 0..bytes.len() {
-            assert!(
-                matches!(replay(&bytes[..len]), Err(Error::Truncated)),
-                "a file cut to {len} of {} bytes",
-                bytes.len()
-            );
+        let (_, bytes) = record_run("damaged", ARCH, false);
+        let (_, attached) = record_run("damaged-attached", ARCH, true);
+        for bytes in [&bytes, &attached] {
+            for len in 0..bytes.len() {
+                assert!(
+                    matches!(replay(&bytes[..len]), Err(Error::Truncated)),
+                    "a file cut to {len} of {} bytes",
+                    bytes.len()
+                );
+            }
         }
 
         let mut magic = bytes.clone();
@@ -769,5 +918,18 @@ mod tests {
         trailing.extend_from_slice(&F_RECORD.to_le_bytes());
         trailing.extend_from_slice(&0_u32.to_le_bytes());
         assert!(matches!(replay(&trailing), Err(Error::Malformed { at, .. }) if at == bytes.len()));
+
+        // The seed frame follows the header; an attached trace needs it, others refuse it.
+        let seed_at = next_frame(&attached, PREAMBLE);
+        let seed = seed_at..next_frame(&attached, seed_at);
+        let mut unseeded = attached.clone();
+        unseeded.drain(seed.clone());
+        assert!(matches!(replay(&unseeded), Err(Error::Malformed { at: PREAMBLE, .. })));
+        let mut wrapped = bytes.clone();
+        let after_header = next_frame(&bytes, PREAMBLE);
+        wrapped.splice(after_header..after_header, attached[seed].iter().copied());
+        assert!(
+            matches!(replay(&wrapped), Err(Error::Malformed { at, .. }) if at == after_header)
+        );
     }
 }

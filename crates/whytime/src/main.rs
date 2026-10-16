@@ -2,9 +2,13 @@
 //!
 //! Wrap mode loads the BPF programs, forks COMMAND parked on a pipe, adds it to the tracked
 //! set, releases it, and turns the record stream into per-thread timelines until COMMAND
-//! exits (or `--duration` elapses). The timelines are then attributed along the critical path
-//! and reported on stderr. See `AGENTS.md` for the model and its limits.
+//! exits (or `--duration` elapses). Attach mode (`-p PID`, [`attach`]) seeds the same state
+//! for a running process tree from `/proc` instead. The timelines are then attributed along
+//! the critical path and reported on stderr. In either mode `--record FILE` also saves every
+//! input of the report to a trace file, which `whytime report FILE` replays ([`record`]).
+//! See `AGENTS.md` for the model and its limits.
 
+mod attach;
 mod attribute;
 mod classify;
 mod cli;
@@ -12,6 +16,7 @@ mod doctor;
 mod logger;
 mod record;
 mod report;
+mod snapshot;
 mod spawn;
 mod sys;
 #[cfg(test)]
@@ -19,8 +24,9 @@ mod testkit;
 mod timeline;
 mod tracer;
 
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io::{self, Write as _};
+use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -30,6 +36,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bpfdoctor::{Doctor, RealEnv, ids_for_errno};
 use clap::Parser as _;
+use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget, ProcFd};
 use crate::cli::{Cli, RunArgs, Sub};
@@ -37,7 +44,7 @@ use crate::record::{End, Header, Logged, Recorder};
 use crate::report::{EndedBy, Meta, Report};
 use crate::spawn::{Child, Credentials, StartError};
 use crate::sys::SyscallTable;
-use crate::timeline::Trace;
+use crate::timeline::{Trace, proc_table};
 use crate::tracer::Tracer;
 
 /// whytime could not start tracing (or failed before COMMAND ran).
@@ -54,7 +61,10 @@ fn main() -> ExitCode {
             EXIT_SETUP
         }),
         Some(Sub::Report { file, json }) => replay(&file, json),
-        None => wrap(&cli.run),
+        None => match cli.run.pid {
+            Some(pid) => attach::run(pid, &cli.run),
+            None => wrap(&cli.run),
+        },
     };
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
 }
@@ -62,37 +72,68 @@ fn main() -> ExitCode {
 /// Runs and reports COMMAND; returns the exit code.
 fn wrap(args: &RunArgs) -> i32 {
     let tool = doctor::tool();
-    let preflight = Doctor::preflight().run(&RealEnv, &tool);
-    if preflight.has_fail() {
-        doctor::print(&preflight);
-        eprintln!("whytime: cannot trace on this system (details: whytime doctor)");
+    if !preflight(&tool) {
         return EXIT_SETUP;
     }
     match Session::start(args) {
         Ok(Started::Running(session)) => session.finish(args),
         Ok(Started::Failed(code)) => code,
-        Err(err) => {
-            eprintln!("whytime: {}", doctor::describe(&err));
-            let ids = tracer::errno(&err).map_or(&[][..], ids_for_errno);
-            if !ids.is_empty() {
-                let report = doctor::full().run_ids(&RealEnv, &tool, ids);
-                if report
-                    .checks
-                    .iter()
-                    .any(|c| c.status != bpfdoctor::Status::Pass)
-                {
-                    doctor::print(&report);
-                }
-            }
-            EXIT_SETUP
+        Err(err) => start_failed(&err, &tool),
+    }
+}
+
+/// Runs the bpfdoctor preflight; on failure prints the diagnosis and returns false.
+fn preflight(tool: &bpfdoctor::Tool) -> bool {
+    let preflight = Doctor::preflight().run(&RealEnv, tool);
+    if preflight.has_fail() {
+        doctor::print(&preflight);
+        eprintln!("whytime: cannot trace on this system (details: whytime doctor)");
+        return false;
+    }
+    true
+}
+
+/// Reports a failure to start tracing, with the doctor checks its errno points at; returns
+/// [`EXIT_SETUP`].
+fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
+    eprintln!("whytime: {}", doctor::describe(err));
+    let ids = tracer::errno(err).map_or(&[][..], ids_for_errno);
+    if !ids.is_empty() {
+        let report = doctor::full().run_ids(&RealEnv, tool, ids);
+        if report
+            .checks
+            .iter()
+            .any(|c| c.status != bpfdoctor::Status::Pass)
+        {
+            doctor::print(&report);
         }
     }
+    EXIT_SETUP
+}
+
+/// Loads and attaches the programs; the flag says whether the syscall pair is attached.
+fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, bool)> {
+    let loaded = Tracer::load(syscalls)?;
+    if let Err(err) = &loaded.syscalls {
+        log::warn!("syscall tracepoints unavailable ({err:#}); blocked time will not be classified");
+    }
+    Ok((loaded.tracer, loaded.syscalls.is_ok()))
+}
+
+/// Kernel `USER_HZ`, the unit of `/proc` start times.
+fn ticks_per_sec() -> anyhow::Result<NonZeroU64> {
+    // Not ProcFs::clock_ticks_per_sec: /proc/self/auxv is unreadable when whytime runs
+    // with file capabilities (non-dumpable), while the in-memory auxv always works.
+    // SAFETY: getauxval only reads the process's saved auxiliary vector.
+    let ticks = unsafe { libc::getauxval(libc::AT_CLKTCK) };
+    NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")
 }
 
 /// A traced COMMAND that has exec'd.
 struct Session {
     tracer: Tracer,
-    syscalls: bool,
+    /// The run's context; recorded as the trace file's header.
+    header: Header,
     command: Wrapped,
     trace: Trace,
     recorder: Option<Recorder>,
@@ -126,27 +167,9 @@ impl Session {
             restore_user_env(home.as_deref());
         }
         let syscalls = SyscallTable::new();
-        let loaded = Tracer::load(&syscalls)?;
-        if let Err(err) = &loaded.syscalls {
-            log::warn!(
-                "syscall tracepoints unavailable ({err:#}); blocked time will not be classified"
-            );
-        }
-        let mut tracer = loaded.tracer;
-        // Not ProcFs::clock_ticks_per_sec: /proc/self/auxv is unreadable when whytime runs
-        // with file capabilities (non-dumpable), while the in-memory auxv always works.
-        // SAFETY: getauxval only reads the process's saved auxiliary vector.
-        let ticks = unsafe { libc::getauxval(libc::AT_CLKTCK) };
-        let ticks_per_sec =
-            std::num::NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")?;
-        let recorder = args
-            .record
-            .as_deref()
-            .map(|path| {
-                Recorder::create(path, creds.as_ref().map(|c| (c.uid, c.gid)))
-                    .with_context(|| format!("creating the trace file {}", path.display()))
-            })
-            .transpose()?;
+        let (mut tracer, syscalls_attached) = load(&syscalls)?;
+        let ticks_per_sec = ticks_per_sec()?;
+        let recorder = recorder(args, creds.as_ref())?;
 
         let signals = take_signals().context("setting up signal handling")?;
         let mut child = Child::spawn(&args.command, creds.as_ref()).context("forking")?;
@@ -165,29 +188,26 @@ impl Session {
                 return Ok(Started::Failed(EXIT_SETUP));
             }
         }
-        let syscalls_attached = loaded.syscalls.is_ok();
-        let files: Box<dyn FdTarget> = match &recorder {
-            Some(recorder) => {
-                recorder.header(&Header {
-                    arch: std::env::consts::ARCH.to_owned(),
-                    command: args.command.clone(),
-                    root_pid: child.pid(),
-                    home: home.clone(),
-                    syscalls: syscalls_attached,
-                    ticks_per_sec,
-                });
-                Box::new(Logged::new(ProcFd, recorder.clone()))
-            }
-            None => Box::new(ProcFd),
+        let header = Header {
+            arch: std::env::consts::ARCH.to_owned(),
+            command: args.command.clone(),
+            root_pid: child.pid(),
+            home: home.clone(),
+            syscalls: syscalls_attached,
+            ticks_per_sec,
+            attached: None,
         };
+        if let Some(recorder) = &recorder {
+            recorder.header(&header);
+        }
         let trace = Trace::new(
             child.pid(),
-            Classifier::new(syscalls, home, files),
-            timeline::proc_table(ticks_per_sec),
+            Classifier::new(syscalls, home, files(recorder.as_ref())),
+            proc_table(ticks_per_sec),
         );
         Ok(Started::Running(Box::new(Self {
             tracer,
-            syscalls: syscalls_attached,
+            header,
             command: Wrapped { child, signals },
             trace,
             recorder,
@@ -215,15 +235,12 @@ impl Session {
         // Detach first so the task states stop changing, then collect what is in flight.
         let Self {
             tracer,
-            syscalls,
+            header,
             command,
             mut trace,
             recorder,
         } = self;
-        let mut maps = tracer.detach();
-        // Programs still running on other CPUs commit within microseconds.
-        std::thread::sleep(Duration::from_millis(2));
-        maps.drain(|record| ingest(&mut trace, recorder.as_ref(), record));
+        let maps = collect(tracer, &mut trace, recorder.as_ref());
         let tasks = maps.tasks();
         trace.sweep(&tasks, end);
         let end = End {
@@ -234,13 +251,9 @@ impl Session {
             dropped: maps.dropped(),
         };
         drop(maps);
-        if let (Some(recorder), Some(path)) = (recorder, &args.record)
-            && let Err(err) = recorder.finish(&tasks, &end)
-        {
-            eprintln!("whytime: writing the trace file {}: {err}", path.display());
-        }
+        save(recorder.as_ref(), args, &tasks, &end);
 
-        report(&trace, end.end, meta(&args.command, syscalls, &end), args.json);
+        report(&trace, end.end, meta(&header, &end), args.json);
         match outcome {
             Outcome::Exited(code) => code,
             Outcome::Deadline(_) => command.wait_forwarding(),
@@ -271,9 +284,7 @@ impl Session {
             {
                 return Ok(Outcome::Deadline(deadline));
             }
-            let timeout = deadline.map_or(-1, |deadline| {
-                i32::try_from((deadline - now).div_ceil(1_000_000)).unwrap_or(i32::MAX)
-            });
+            let timeout = wait_timeout(deadline, now);
             for token in epoll.wait(timeout)? {
                 match token {
                     CHILD => return self.command.child.wait().map(Outcome::Exited),
@@ -285,6 +296,26 @@ impl Session {
     }
 }
 
+/// With `--record FILE`, creates the trace file, owned by the invoking user under sudo.
+/// Called before anything is observed, so a bad path fails fast.
+fn recorder(args: &RunArgs, creds: Option<&Credentials>) -> anyhow::Result<Option<Recorder>> {
+    args.record
+        .as_deref()
+        .map(|path| {
+            Recorder::create(path, creds.map(|c| (c.uid, c.gid)))
+                .with_context(|| format!("creating the trace file {}", path.display()))
+        })
+        .transpose()
+}
+
+/// The classifier's descriptor lookups: `/proc`, each answer recorded when `--record` is on.
+fn files(recorder: Option<&Recorder>) -> Box<dyn FdTarget> {
+    match recorder {
+        Some(recorder) => Box::new(Logged::new(ProcFd, recorder.clone())),
+        None => Box::new(ProcFd),
+    }
+}
+
 /// Applies one ring buffer record, recording it first when `--record` is on.
 fn ingest(trace: &mut Trace, recorder: Option<&Recorder>, record: &[u8]) {
     if let Some(recorder) = recorder {
@@ -293,10 +324,22 @@ fn ingest(trace: &mut Trace, recorder: Option<&Recorder>, record: &[u8]) {
     trace.ingest(record);
 }
 
-/// The report's inputs besides the trace; the same for a live run and its replay.
-fn meta(command: &[OsString], syscalls: bool, end: &End) -> Meta {
+/// With `--record`, writes the final sweep and the end frame. A write error is printed now,
+/// before the report, which must stay last on stderr.
+fn save(recorder: Option<&Recorder>, args: &RunArgs, tasks: &[(u32, TaskState)], end: &End) {
+    if let (Some(recorder), Some(path)) = (recorder, &args.record)
+        && let Err(err) = recorder.finish(tasks, end)
+    {
+        eprintln!("whytime: writing the trace file {}: {err}", path.display());
+    }
+}
+
+/// The report's inputs besides the trace, from the header and end frames: the same for a
+/// live run and its replay.
+fn meta(header: &Header, end: &End) -> Meta {
     Meta {
-        command: command
+        command: header
+            .command
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect(),
@@ -304,7 +347,8 @@ fn meta(command: &[OsString], syscalls: bool, end: &End) -> Meta {
         ended_by: end.ended_by,
         exit_code: end.exit_code,
         dropped: end.dropped,
-        syscalls,
+        syscalls: header.syscalls,
+        attached: header.attached,
     }
 }
 
@@ -349,7 +393,7 @@ fn replay(path: &Path, json: bool) -> i32 {
         .and_then(|bytes| record::replay(&bytes).map_err(|err| err.to_string()));
     match replayed {
         Ok(replay) => {
-            let meta = meta(&replay.header.command, replay.header.syscalls, &replay.end);
+            let meta = meta(&replay.header, &replay.end);
             report(&replay.trace, replay.end.end, meta, json);
             0
         }
@@ -358,6 +402,23 @@ fn replay(path: &Path, json: bool) -> i32 {
             EXIT_REPLAY
         }
     }
+}
+
+/// Detaches every program (the task states stop changing), then feeds the records still in
+/// flight to `trace` (and the trace file); the returned maps hold what the final sweep needs.
+fn collect(tracer: Tracer, trace: &mut Trace, recorder: Option<&Recorder>) -> tracer::Maps {
+    let mut maps = tracer.detach();
+    // Programs still running on other CPUs commit within microseconds.
+    std::thread::sleep(Duration::from_millis(2));
+    maps.drain(|record| ingest(trace, recorder, record));
+    maps
+}
+
+/// Milliseconds from `now` until `deadline` (rounded up) for `epoll_wait`; -1 for none.
+fn wait_timeout(deadline: Option<u64>, now: u64) -> i32 {
+    deadline.map_or(-1, |deadline| {
+        i32::try_from(deadline.saturating_sub(now).div_ceil(1_000_000)).unwrap_or(i32::MAX)
+    })
 }
 
 impl Wrapped {

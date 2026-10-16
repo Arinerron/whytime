@@ -3,7 +3,8 @@
 //! Every tracked thread's life is a gap-free sequence of [`Seg`]ments: mixed on-CPU/preempted
 //! stretches (accumulated in kernel), blocks (classified on arrival), and wake-to-run runqueue
 //! waits. Processes own threads and know their parent, so the critical-path walk in
-//! [`crate::attribute`] can descend from the wrapped command into its descendants.
+//! [`crate::attribute`] can descend from the wrapped command into its descendants. Attach
+//! mode starts the trace from [`ProcSeed`]s, what `/proc` showed of the running tree.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -22,9 +23,10 @@ pub type ProcId = usize;
 /// Index into [`Trace::threads`].
 pub type ThreadId = usize;
 
-/// The process table a [`Trace`] keeps, comparing process starts at clock-tick (`AT_CLKTCK`)
-/// resolution. whytime only feeds it events and looks records up by key, which never reads
-/// `/proc`, so a replayed trace rebuilds it exactly.
+/// The process table a [`Trace`] keeps, keyed by `start_boottime` nanoseconds like the
+/// kernel's records and comparing process starts at clock-tick (`AT_CLKTCK`) resolution.
+/// whytime only feeds it events and looks records up by key, which never reads `/proc`, so a
+/// replayed trace rebuilds it exactly.
 pub fn proc_table(ticks_per_sec: NonZeroU64) -> ProcTable<ProcFs> {
     ProcTable::new(
         ProcFs::new(),
@@ -79,7 +81,7 @@ pub struct Thread {
     pub tid: u32,
     /// Owning process.
     pub proc: ProcId,
-    /// Fork (or first exec) time.
+    /// Fork (or first exec, or for a thread that predates attach, entry creation) time.
     pub birth: u64,
     /// Exit time, if it exited.
     pub death: Option<u64>,
@@ -92,7 +94,8 @@ pub struct Thread {
 pub struct Proc {
     /// procctx identity: tgid and `start_boottime`.
     pub key: ProcKey,
-    /// Fork (or, for the wrapped command, exec) time.
+    /// Fork (or, for the wrapped command, exec; for a process that predates attach, the
+    /// time attach seeded it) time.
     pub birth: u64,
     /// Exit time of the whole thread group.
     pub death: Option<u64>,
@@ -119,12 +122,30 @@ impl Proc {
     }
 }
 
-/// The observation window: the wrapped command's first exec to its exit (or a deadline).
+/// A process that existed before attach, as attach mode found it in `/proc`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcSeed {
+    /// Thread-group id and start time (from `/proc` ticks, in the procctx clock).
+    pub key: ProcKey,
+    /// Parent process id.
+    pub ppid: u32,
+    /// `comm`.
+    pub comm: String,
+    /// NUL-separated arguments (`/proc/<pid>/cmdline`).
+    pub argv: Vec<u8>,
+    /// When attach seeded it.
+    pub birth: u64,
+    /// Threads attach created `tasks` entries for: `(tid, entry time)`.
+    pub threads: Vec<(u32, u64)>,
+}
+
+/// The observation window: the wrapped command's first exec (or the attach) to its exit (or
+/// a deadline).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Window {
-    /// The wrapped command's exec.
+    /// The wrapped command's exec, or the end of attach's seeding.
     pub start: Option<u64>,
-    /// Exit of the wrapped command's last thread.
+    /// Exit of the wrapped command's (or attach target's) last thread.
     pub exit: Option<u64>,
 }
 
@@ -135,7 +156,7 @@ pub struct Trace {
     pub procs: Vec<Proc>,
     /// Threads in order of appearance.
     pub threads: Vec<Thread>,
-    /// The wrapped command, once its exec record arrived.
+    /// The wrapped command, once its exec record arrived (attach: the target).
     pub root: Option<ProcId>,
     /// Observation window.
     pub window: Window,
@@ -152,7 +173,7 @@ pub struct Trace {
 }
 
 impl Trace {
-    /// An empty trace for the wrapped command `root_pid`.
+    /// An empty trace for the wrapped command or attach target `root_pid`.
     pub fn new(root_pid: u32, classifier: Classifier, table: ProcTable<ProcFs>) -> Self {
         Self {
             procs: Vec::new(),
@@ -167,6 +188,36 @@ impl Trace {
             live_threads: HashMap::new(),
             classifier,
         }
+    }
+
+    /// Starts an attached trace: adds the processes and threads that existed before attach
+    /// (parents before children; the target, `root_pid`, becomes the root) and opens the
+    /// window at `start`, once every seeded thread has its in-kernel entry.
+    pub fn seed(&mut self, seeds: &[ProcSeed], start: u64) {
+        for seed in seeds {
+            let root = seed.key.pid == self.root_pid;
+            let parent = if root {
+                None
+            } else {
+                self.live_procs.get(&seed.ppid).copied()
+            };
+            let proc = self.new_proc(seed.key, parent, seed.birth, Arc::from(seed.comm.as_str()));
+            if root && self.root.is_none() {
+                self.root = Some(proc);
+            }
+            for &(tid, birth) in &seed.threads {
+                self.new_thread(tid, proc, birth);
+            }
+            // procctx has no "already running" event; an exec carrying what /proc showed
+            // records it without the table reading /proc again.
+            self.table.on_exec(ExecEvent {
+                ppid: Some(seed.ppid),
+                comm: Some(seed.comm.as_bytes()),
+                argv: Some(&seed.argv),
+                ..ExecEvent::new(seed.birth, seed.key)
+            });
+        }
+        self.window.start = Some(start);
     }
 
     /// Decodes and applies one ring buffer record.
@@ -186,10 +237,21 @@ impl Trace {
 
     fn on_fork(&mut self, r: &ForkRecord) {
         let ts = r.hdr.ts;
+        // A fork before the window can only come from attach's seeding, which may have
+        // already added the new task from /proc.
+        let seeded = self.window.start.is_some_and(|start| ts < start);
         if r.child_tgid == r.hdr.tgid {
             if let Some(&proc) = self.live_procs.get(&r.hdr.tgid) {
-                self.new_thread(r.child_tid, proc, ts);
+                if seeded {
+                    self.thread(r.child_tid, proc, ts);
+                } else {
+                    self.new_thread(r.child_tid, proc, ts);
+                }
             }
+            return;
+        }
+        if seeded && let Some(&proc) = self.live_procs.get(&r.child_tgid) {
+            self.thread(r.child_tid, proc, ts);
             return;
         }
         let parent = self.live_procs.get(&r.hdr.tgid).copied();
@@ -215,9 +277,10 @@ impl Trace {
             pid: hdr.tgid,
             start: r.start,
         };
-        let proc = if let Some(&proc) = self.live_procs.get(&hdr.tgid) {
+        let (proc, key) = if let Some(&proc) = self.live_procs.get(&hdr.tgid) {
             self.procs[proc].comms.push((hdr.ts, Arc::clone(&comm)));
-            proc
+            // Keep the known key: one seeded at attach comes from /proc at tick precision.
+            (proc, self.procs[proc].key)
         } else {
             // The wrapped command (forked before tracking began), or a process whose fork
             // record was lost: its timeline starts here.
@@ -226,7 +289,7 @@ impl Trace {
                 self.root = Some(proc);
                 self.window.start = Some(hdr.ts);
             }
-            proc
+            (proc, key)
         };
         if r.old_tid != hdr.tid
             && let Some(thread) = self.live_threads.remove(&r.old_tid)

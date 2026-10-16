@@ -4,9 +4,10 @@ use std::io;
 use std::os::fd::{AsRawFd as _, RawFd};
 
 use anyhow::Context as _;
-use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+use aya::maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf};
 use aya::programs::{BtfTracePoint, ProgramError};
-use aya::{Btf, Ebpf, EbpfLoader};
+use aya::sys::SyscallError;
+use aya::{Btf, Ebpf, EbpfLoader, Pod};
 use whytime_abi::{STAT_NR, TaskState};
 
 use crate::sys::SyscallTable;
@@ -24,6 +25,9 @@ pub const SCHED: [(&str, &str); 5] = [
 /// its own it only clears state, while `sys_enter` alone would leave stale syscalls behind.
 pub const SYSCALLS: [(&str, &str); 2] =
     [("on_sys_exit", "sys_exit"), ("on_sys_enter", "sys_enter")];
+
+/// `bpf_map_update_elem` flag: fail with `EEXIST` instead of replacing an entry.
+const BPF_NOEXIST: u64 = 1;
 
 /// The loaded, attached BPF object.
 pub struct Tracer {
@@ -108,6 +112,35 @@ impl Tracer {
             .with_context(|| format!("tracking pid {tgid}"))
     }
 
+    /// Starts tracing process `tgid` (attach mode) unless the kernel side already tracks it;
+    /// `Ok(false)` means it does: a tracked parent forked it, and its fork record is queued.
+    pub fn track_existing(&mut self, tgid: u32) -> anyhow::Result<bool> {
+        insert_new(&mut self.maps.tracked, tgid, &1)
+            .with_context(|| format!("tracking pid {tgid}"))
+    }
+
+    /// Stops tracing `tgid`: it exited before attach created its threads' entries, so no
+    /// exit record removes it.
+    pub fn untrack(&mut self, tgid: u32) {
+        // Absent when its exit did clean up.
+        let _ = self.maps.tracked.remove(&tgid);
+    }
+
+    /// Creates the `tasks` entry of a thread that existed before attach unless the kernel
+    /// side already created one (the thread was just forked, or exec'd); `Ok(false)` means
+    /// it did.
+    pub fn seed_task(&mut self, tid: u32, state: &TaskState) -> anyhow::Result<bool> {
+        insert_new(&mut self.maps.tasks, tid, state)
+            .with_context(|| format!("tracking thread {tid}"))
+    }
+
+    /// Removes the entry [`seed_task`](Self::seed_task) created for a thread that turned
+    /// out to have exited before it.
+    pub fn forget_task(&mut self, tid: u32) {
+        // Absent when its exit did clean up.
+        let _ = self.maps.tasks.remove(&tid);
+    }
+
     /// The ring buffer's pollable descriptor.
     pub fn ring_fd(&self) -> RawFd {
         self.maps.ring.as_raw_fd()
@@ -190,6 +223,23 @@ fn attach(ebpf: &mut Ebpf, btf: &Btf, prog: &str, tracepoint: &str) -> anyhow::R
         .attach()
         .with_context(|| format!("attaching tp_btf/{tracepoint}"))?;
     Ok(())
+}
+
+/// Inserts `key` unless present; `Ok(false)` when it was.
+fn insert_new<V: Pod>(
+    map: &mut HashMap<MapData, u32, V>,
+    key: u32,
+    value: &V,
+) -> Result<bool, MapError> {
+    match map.insert(key, value, BPF_NOEXIST) {
+        Ok(()) => Ok(true),
+        Err(MapError::SyscallError(SyscallError { io_error, .. }))
+            if io_error.raw_os_error() == Some(libc::EEXIST) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Raises the `RLIMIT_MEMLOCK` soft limit to the hard limit. Kernels before 5.11 charge BPF
