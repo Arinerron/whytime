@@ -12,11 +12,15 @@
 //!
 //! `cargo xtask man [DIR]` writes `whytime.1` and one page per subcommand to DIR (default
 //! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
+//!
+//! `cargo xtask licenses [FILE]` writes the release binary's third-party notices (see
+//! [`licenses`]).
 
 /// The binary's CLI, compiled in from its source so the man pages cannot drift from it.
 #[path = "../../crates/whytime/src/cli.rs"]
 #[allow(dead_code)]
 mod cli;
+mod licenses;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -29,14 +33,17 @@ use anyhow::{Context as _, bail, ensure};
 use clap::CommandFactory as _;
 use serde_json::Value;
 
-const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask record-fixtures | cargo xtask man [DIR]";
+const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask record-fixtures | cargo xtask man [DIR] \
+                     | cargo xtask licenses [FILE]";
 /// What each command does, after [`USAGE`] for `--help`.
 const HELP: &str = concat!(
     "  test-e2e         build release whytime and the testbins, run the sudo end-to-end suite\n",
     "  record-fixtures  build them, record the replay fixtures (sudo) into\n",
     "                   crates/whytime/tests/fixtures with their expected `whytime report`\n",
     "                   outputs, which `cargo test` compares byte for byte\n",
-    "  man [DIR]        write the man pages to DIR (default $CARGO_TARGET_DIR/man)",
+    "  man [DIR]        write the man pages to DIR (default $CARGO_TARGET_DIR/man)\n",
+    "  licenses [FILE]  write the release binary's third-party notices to FILE\n",
+    "                   (default $CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md)",
 );
 /// Where `record-fixtures` runs its workloads: nothing under it names this machine's user
 /// (unlike `$HOME` or the cargo target directory, which recorded paths would show), and it is
@@ -90,6 +97,7 @@ fn main() -> anyhow::Result<()> {
         Some("test-e2e") => test_e2e(),
         Some("record-fixtures") => record_fixtures(),
         Some("man") => man(args.next().map(PathBuf::from)),
+        Some("licenses") => licenses::licenses(args.next().map(PathBuf::from)),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}\n{HELP}");
             Ok(())

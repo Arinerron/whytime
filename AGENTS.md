@@ -41,6 +41,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | aarch64 | `cargo check --target aarch64-unknown-linux-musl --workspace`; `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (static, linked by `rust-lld`; smoke with `qemu-aarch64 …/whytime --version`) |
 | Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` (stdout) |
 | Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`) |
+| Third-party notices | `cargo xtask licenses [FILE]` (default `$CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md`): the license texts of every crate in the binary's graph (both release targets) and of the vendored libbpf headers; fails if a dependency ships no license file |
 | Run | `sudo $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime -- sleep 1` |
 | Attach | `sudo whytime -p PID [--duration 30s] [--record t.wt]` (report on exit, deadline or Ctrl-C; exit 0) |
 | Doctor | `whytime doctor [--json]` (exit 0 ready, 3 cannot run) |
@@ -58,13 +59,19 @@ BPF side is C, compiled by clang (22 here; any clang with BPF CO-RE works, overr
 
 License: MIT (`LICENSE`). The BPF object's `SEC("license")` string stays `Dual MIT/GPL`: the
 verifier only lets GPL-compatible programs call GPL-only helpers (`bpf_probe_read_kernel`,
-`bpf_get_current_task_btf`, ...). Vendored libbpf headers are `LGPL-2.1 OR BSD-2-Clause`.
+`bpf_get_current_task_btf`, ...). Vendored libbpf headers are `LGPL-2.1 OR BSD-2-Clause`
+(their `LICENSE` and `LICENSE.BSD-2-Clause` are copied from the libbpf release beside them).
+Release tarballs carry `THIRD_PARTY_LICENSES.md` (`cargo xtask licenses`, in
+`xtask/src/licenses.rs`): crates reached through normal dependencies of `whytime` and through
+first-party build dependencies (the BPF header generation), proc macros included, with the
+license files found in each package's source directory, identical texts printed once.
 
-CI (`.github/workflows/ci.yml`): x86_64 build + unit tests + completions/man smoke, aarch64
-check/build/qemu smoke, and `cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: a
-`v*` tag publishes `whytime-vX.Y.Z-{x86_64,aarch64}-linux-musl.tar.gz` (binary, `LICENSE`,
-`README.md`, `completions/`, `man/`) with a `.sha256` each and generated release notes; the
-README's install snippet depends on these names. Both check out with
+CI (`.github/workflows/ci.yml`): x86_64 build + unit tests + completions/man smoke +
+`cargo xtask licenses`, aarch64 check/build/qemu smoke, and `cargo xtask test-e2e` inside a
+virtme-ng VM. `release.yml`: a `v*` tag publishes
+`whytime-vX.Y.Z-{x86_64,aarch64}-linux-musl.tar.gz` (binary, `LICENSE`,
+`THIRD_PARTY_LICENSES.md`, `README.md`, `completions/`, `man/`) with a `.sha256` each and
+generated release notes; the README's install snippet depends on these names. Both check out with
 `submodules: recursive`; `.github/actions/setup` installs clang and the toolchain.
 
 `crates/whytime/src/cli.rs` is also compiled into xtask (`#[path]`, for `cargo xtask man`):
@@ -86,7 +93,7 @@ crates/whytime-bpf/        build.rs + bpf/ ; src/lib.rs exports OBJECT, STACKS_O
                            .o) and ABI_HASH
   bpf/whytime.bpf.c        the BPF programs (C CO-RE)
   bpf/vmlinux_min.h        hand-curated preserve_access_index subset of vmlinux.h (pt_regs per arch)
-  bpf/include/bpf/         vendored libbpf v1.8.0 headers
+  bpf/include/bpf/         vendored libbpf v1.8.0 headers and their license files
 crates/whytime/            the binary
   src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling,
                            helpers shared with attach (preflight, load, collect, recording,
@@ -124,7 +131,7 @@ crates/whytime-testbins/   e2e workloads (src/bin/): wt-sleep, wt-burn, wt-fsync
                            wt-futex, wt-tcp, wt-attach, wt-threads, wt-vfork, wt-flock,
                            wt-syscalls, wt-poll, wt-fault, wt-fifo, wt-dns (DNS client and the
                            suite's DNS server), wt-flame; src/lib.rs: argument and timing helpers
-xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR]
+xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR] | licenses [FILE]
 .github/                   workflows ci.yml, release.yml; actions/setup (clang, rustup);
                            ISSUE_TEMPLATE (bug, feature forms), pull_request_template.md,
                            dependabot.yml

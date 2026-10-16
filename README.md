@@ -71,7 +71,8 @@ I have to make faster for this to finish sooner", not "what was busy".
 
 Static binaries for x86_64 and aarch64 are published on the
 [releases page](https://github.com/Arinerron/whytime/releases/latest). Each tarball holds
-the binary, `LICENSE`, `README.md`, `completions/` and `man/`:
+the binary, `LICENSE`, `THIRD_PARTY_LICENSES.md` (the licenses of the code compiled into
+it), `README.md`, `completions/` and `man/`:
 
 ```sh
 tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/Arinerron/whytime/releases/latest)
@@ -561,4 +562,5 @@ GPL-compatible license string (MIT code may be distributed under the GPL). The v
 libbpf headers in `crates/whytime-bpf/bpf/include/bpf/` keep their own license,
 `LGPL-2.1 OR BSD-2-Clause`. The SVG flamegraph is drawn by whytime itself; every Rust
 dependency is MIT, Apache-2.0, Zlib or Unicode-3.0 licensed (or dual-licensed with one of
-them).
+them). Release tarballs carry their license texts in `THIRD_PARTY_LICENSES.md`, which
+`cargo xtask licenses` generates.

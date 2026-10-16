@@ -32,6 +32,9 @@ jobs:
           done
           cargo xtask man target/man
           test -s target/man/whytime.1
+      - name: Third-party license notices
+        # Fails if a dependency of the binary ships no license text.
+        run: cargo xtask licenses target/THIRD_PARTY_LICENSES.md
 
   aarch64:
     name: aarch64 check, build and qemu smoke

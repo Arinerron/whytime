@@ -57,6 +57,7 @@ is static and lands under `target/x86_64-unknown-linux-musl/`.
 | End-to-end suite | `cargo xtask test-e2e` |
 | aarch64 | `cargo build --release -p whytime --target aarch64-unknown-linux-musl` |
 | Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`, or `target/man`) |
+| Third-party notices | `cargo xtask licenses [FILE]` (default `$CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md`, or `target/...`; shipped in release tarballs) |
 | Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (includes the verifier log on load failures) |
 

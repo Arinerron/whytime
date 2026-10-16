@@ -63,7 +63,8 @@ First release.
 - `whytime completions SHELL` (bash, zsh, fish, elvish, PowerShell) and man pages.
 - `WHYTIME_LOG=debug` for debug logging, including the BPF verifier log on load failures.
 - Static musl binaries for x86_64 and aarch64, published as release tarballs with
-  completions, man pages and SHA-256 checksums.
+  completions, man pages, the license texts of the code compiled into them
+  (`THIRD_PARTY_LICENSES.md`) and SHA-256 checksums.
 
 [Unreleased]: https://github.com/Arinerron/whytime/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Arinerron/whytime/releases/tag/v0.1.0
