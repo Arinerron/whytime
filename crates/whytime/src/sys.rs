@@ -192,6 +192,12 @@ impl SyscallTable {
             (flags != 0).then_some((nr, flags))
         })
     }
+
+    /// The `SYSF_*` bits of syscall `nr` (0 when unknown): what the BPF program describes
+    /// at its entry, and attach mode describes from `/proc` for threads blocked in it.
+    pub fn flags(&self, nr: i32) -> u32 {
+        self.get(nr).map_or(0, |syscall| syscall.kind.bpf_flags())
+    }
 }
 
 #[cfg(test)]

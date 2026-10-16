@@ -2,15 +2,18 @@
 //!
 //! Wrap mode loads the BPF programs, forks COMMAND parked on a pipe, adds it to the tracked
 //! set, releases it, and turns the record stream into per-thread timelines until COMMAND
-//! exits (or `--duration` elapses). The timelines are then attributed along the critical path
-//! and reported on stderr. See `AGENTS.md` for the model and its limits.
+//! exits (or `--duration` elapses). Attach mode (`-p PID`, [`attach`]) seeds the same state
+//! for a running process tree from `/proc` instead. The timelines are then attributed along
+//! the critical path and reported on stderr. See `AGENTS.md` for the model and its limits.
 
+mod attach;
 mod attribute;
 mod classify;
 mod cli;
 mod doctor;
 mod logger;
 mod report;
+mod snapshot;
 mod spawn;
 mod sys;
 mod timeline;
@@ -18,6 +21,7 @@ mod tracer;
 
 use std::ffi::{CStr, CString, OsStr};
 use std::io::{self, Write as _};
+use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
@@ -27,14 +31,13 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bpfdoctor::{Doctor, RealEnv, ids_for_errno};
 use clap::Parser as _;
-use procctx::{Config, ProcFs, ProcTable, StartClock};
 
 use crate::classify::Classifier;
 use crate::cli::{Cli, RunArgs, Sub};
 use crate::report::{EndedBy, Meta, Report};
 use crate::spawn::{Child, Credentials, StartError};
 use crate::sys::SyscallTable;
-use crate::timeline::Trace;
+use crate::timeline::{Trace, proc_table};
 use crate::tracer::Tracer;
 
 /// whytime could not start tracing (or failed before COMMAND ran).
@@ -48,7 +51,10 @@ fn main() -> ExitCode {
             eprintln!("whytime: {err}");
             EXIT_SETUP
         }),
-        None => wrap(&cli.run),
+        None => match cli.run.pid {
+            Some(pid) => attach::run(pid, &cli.run),
+            None => wrap(&cli.run),
+        },
     };
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
 }
@@ -56,31 +62,61 @@ fn main() -> ExitCode {
 /// Runs and reports COMMAND; returns the exit code.
 fn wrap(args: &RunArgs) -> i32 {
     let tool = doctor::tool();
-    let preflight = Doctor::preflight().run(&RealEnv, &tool);
-    if preflight.has_fail() {
-        doctor::print(&preflight);
-        eprintln!("whytime: cannot trace on this system (details: whytime doctor)");
+    if !preflight(&tool) {
         return EXIT_SETUP;
     }
     match Session::start(args) {
         Ok(Started::Running(session)) => session.finish(args),
         Ok(Started::Failed(code)) => code,
-        Err(err) => {
-            eprintln!("whytime: {}", doctor::describe(&err));
-            let ids = tracer::errno(&err).map_or(&[][..], ids_for_errno);
-            if !ids.is_empty() {
-                let report = doctor::full().run_ids(&RealEnv, &tool, ids);
-                if report
-                    .checks
-                    .iter()
-                    .any(|c| c.status != bpfdoctor::Status::Pass)
-                {
-                    doctor::print(&report);
-                }
-            }
-            EXIT_SETUP
+        Err(err) => start_failed(&err, &tool),
+    }
+}
+
+/// Runs the bpfdoctor preflight; on failure prints the diagnosis and returns false.
+fn preflight(tool: &bpfdoctor::Tool) -> bool {
+    let preflight = Doctor::preflight().run(&RealEnv, tool);
+    if preflight.has_fail() {
+        doctor::print(&preflight);
+        eprintln!("whytime: cannot trace on this system (details: whytime doctor)");
+        return false;
+    }
+    true
+}
+
+/// Reports a failure to start tracing, with the doctor checks its errno points at; returns
+/// [`EXIT_SETUP`].
+fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
+    eprintln!("whytime: {}", doctor::describe(err));
+    let ids = tracer::errno(err).map_or(&[][..], ids_for_errno);
+    if !ids.is_empty() {
+        let report = doctor::full().run_ids(&RealEnv, tool, ids);
+        if report
+            .checks
+            .iter()
+            .any(|c| c.status != bpfdoctor::Status::Pass)
+        {
+            doctor::print(&report);
         }
     }
+    EXIT_SETUP
+}
+
+/// Loads and attaches the programs; the flag says whether the syscall pair is attached.
+fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, bool)> {
+    let loaded = Tracer::load(syscalls)?;
+    if let Err(err) = &loaded.syscalls {
+        log::warn!("syscall tracepoints unavailable ({err:#}); blocked time will not be classified");
+    }
+    Ok((loaded.tracer, loaded.syscalls.is_ok()))
+}
+
+/// Kernel `USER_HZ`, the unit of `/proc` start times.
+fn ticks_per_sec() -> anyhow::Result<NonZeroU64> {
+    // Not ProcFs::clock_ticks_per_sec: /proc/self/auxv is unreadable when whytime runs
+    // with file capabilities (non-dumpable), while the in-memory auxv always works.
+    // SAFETY: getauxval only reads the process's saved auxiliary vector.
+    let ticks = unsafe { libc::getauxval(libc::AT_CLKTCK) };
+    NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")
 }
 
 /// A traced COMMAND that has exec'd.
@@ -119,28 +155,8 @@ impl Session {
             restore_user_env(home.as_deref());
         }
         let syscalls = SyscallTable::new();
-        let loaded = Tracer::load(&syscalls)?;
-        if let Err(err) = &loaded.syscalls {
-            log::warn!(
-                "syscall tracepoints unavailable ({err:#}); blocked time will not be classified"
-            );
-        }
-        let mut tracer = loaded.tracer;
-        // Not ProcFs::clock_ticks_per_sec: /proc/self/auxv is unreadable when whytime runs
-        // with file capabilities (non-dumpable), while the in-memory auxv always works.
-        // SAFETY: getauxval only reads the process's saved auxiliary vector.
-        let ticks = unsafe { libc::getauxval(libc::AT_CLKTCK) };
-        let ticks_per_sec =
-            std::num::NonZeroU64::new(ticks).context("AT_CLKTCK missing from auxv")?;
-        let procfs = ProcFs::new();
-        let table = ProcTable::new(
-            procfs,
-            Config {
-                start_clock: StartClock::BootNs { ticks_per_sec },
-                read_environ: false,
-                ..Config::default()
-            },
-        );
+        let (mut tracer, syscalls_attached) = load(&syscalls)?;
+        let table = proc_table(ticks_per_sec()?);
 
         let signals = take_signals().context("setting up signal handling")?;
         let mut child = Child::spawn(&args.command, creds.as_ref()).context("forking")?;
@@ -162,7 +178,7 @@ impl Session {
         let trace = Trace::new(child.pid(), Classifier::new(syscalls, home), table);
         Ok(Started::Running(Box::new(Self {
             tracer,
-            syscalls: loaded.syscalls.is_ok(),
+            syscalls: syscalls_attached,
             command: Wrapped { child, signals },
             trace,
         })))
@@ -193,10 +209,7 @@ impl Session {
             command,
             mut trace,
         } = self;
-        let mut maps = tracer.detach();
-        // Programs still running on other CPUs commit within microseconds.
-        std::thread::sleep(Duration::from_millis(2));
-        maps.drain(|record| trace.ingest(record));
+        let maps = collect(tracer, &mut trace);
         trace.sweep(&maps.tasks(), end);
         let meta = Meta {
             command: args
@@ -209,6 +222,7 @@ impl Session {
             exit_code,
             dropped: maps.dropped(),
             syscalls,
+            attached: None,
         };
         drop(maps);
 
@@ -242,9 +256,7 @@ impl Session {
             {
                 return Ok(Outcome::Deadline(deadline));
             }
-            let timeout = deadline.map_or(-1, |deadline| {
-                i32::try_from((deadline - now).div_ceil(1_000_000)).unwrap_or(i32::MAX)
-            });
+            let timeout = wait_timeout(deadline, now);
             for token in epoll.wait(timeout)? {
                 match token {
                     CHILD => return self.command.child.wait().map(Outcome::Exited),
@@ -278,6 +290,23 @@ fn report(trace: &Trace, end: u64, mut meta: Meta, json: bool) {
     if let Err(e) = written.and_then(|()| err.flush()) {
         log::error!("writing the report: {e}");
     }
+}
+
+/// Detaches every program (the task states stop changing), then feeds the records still in
+/// flight to `trace`; the returned maps hold what the final sweep needs.
+fn collect(tracer: Tracer, trace: &mut Trace) -> tracer::Maps {
+    let mut maps = tracer.detach();
+    // Programs still running on other CPUs commit within microseconds.
+    std::thread::sleep(Duration::from_millis(2));
+    maps.drain(|record| trace.ingest(record));
+    maps
+}
+
+/// Milliseconds from `now` until `deadline` (rounded up) for `epoll_wait`; -1 for none.
+fn wait_timeout(deadline: Option<u64>, now: u64) -> i32 {
+    deadline.map_or(-1, |deadline| {
+        i32::try_from(deadline.saturating_sub(now).div_ceil(1_000_000)).unwrap_or(i32::MAX)
+    })
 }
 
 impl Wrapped {

@@ -3,12 +3,13 @@
 `whytime -- COMMAND` runs COMMAND, traces it and every process it starts with eBPF, and
 prints to stderr where its wall-clock time went (on-CPU, waiting on children, timer sleep,
 fsync, network peers, locks, ...). COMMAND's output passes through; whytime exits with
-COMMAND's code.
+COMMAND's code. `whytime -p PID` does the same for a running process and its descendants,
+from the attach until PID exits, `--duration` elapses or Ctrl-C.
 
 **Name.** The repo directory is `why`, but the crate and binary are `whytime`: the `why`
 crate name is taken on crates.io. Use `whytime` everywhere in code, docs and output.
 
-**Status: MVP.** Wrap mode only. Attach mode (`-p PID`), flamegraphs, and hostname/DNS
+**Status: MVP.** Wrap mode and attach mode (`-p PID`). Flamegraphs and hostname/DNS
 correlation for network subjects are later milestones.
 
 ## Commands
@@ -27,6 +28,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | Unit tests | `cargo test --workspace` |
 | End-to-end suite | `cargo xtask test-e2e` (needs passwordless `sudo -n`) |
 | Run | `sudo $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime -- sleep 1` |
+| Attach | `sudo whytime -p PID [--duration 30s]` (report on exit, deadline or Ctrl-C; exit 0) |
 | Doctor | `whytime doctor [--json]` (exit 0 ready, 3 cannot run) |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (prints the verifier log on load failures) |
 
@@ -49,7 +51,10 @@ crates/whytime-bpf/        build.rs + bpf/ ; exports OBJECT (the .o) and ABI_HAS
   bpf/vmlinux_min.h        hand-curated preserve_access_index subset of vmlinux.h
   bpf/include/bpf/         vendored libbpf v1.8.0 headers
 crates/whytime/            the binary
-  src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling
+  src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling,
+                           helpers shared with attach (preflight, load, collect, report)
+  src/attach.rs            attach flow: target checks, tree membership, seeding, event loop
+  src/snapshot.rs          /proc → task_state of pre-existing threads (syscall, fd, peers)
   src/cli.rs               clap derive CLI, --duration parser
   src/tracer.rs            aya loader: load, attach, maps, detach
   src/spawn.rs             fork, park-on-pipe, priv drop, exec with error pipe, pidfd
@@ -60,7 +65,8 @@ crates/whytime/            the binary
   src/report.rs            whytime.report/1 JSON + human rendering
   src/doctor.rs            bpfdoctor Tool, probe.sched / probe.syscalls checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
-crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp
+crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp,
+                           wt-attach
 xtask/                     cargo xtask test-e2e
 ```
 
@@ -123,6 +129,54 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
    to close every still-open interval at the window end. Attribute, report, return
    COMMAND's code (with `--duration`, keep forwarding signals until it exits).
 
+Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
+
+1. Check the target before anything privileged (exit 1 with a `fix:` line when refused):
+   `/proc/PID` exists and is a thread-group leader (a thread id → "use -p TGID"), not a
+   zombie, not whytime itself (it would trace its own event loop) and not pid 1 (everything
+   descends from init: a whole-system trace with init's event loop as the critical path).
+   Without root, the target's real/effective/saved uid and gid must all be the invoking
+   user's (the ptrace rule; file capabilities must not let users watch each other), unless
+   whytime has `CAP_SYS_PTRACE`. Then `pidfd_open` the target.
+2. Preflight and load as in wrap mode (exit 125 on failure). Block SIGINT/SIGTERM/SIGHUP
+   into a signalfd: from here on they end the observation; the target is never signalled.
+3. **Membership** (`track_tree`): scan `/proc/*/stat`, walk parent links from the target
+   (skipping whytime), insert each live process into `tracked` with `BPF_NOEXIST`; repeat
+   until a scan inserts nothing. `EEXIST` means a tracked parent forked it after its insert:
+   the kernel side owns it (its FORK record is queued). Termination: a process still
+   untracked after a scan was forked by a parent before that parent's insert, so the next
+   scan sees it; a scan that inserts nothing proves every live member was tracked before
+   it began. Lost only: a process forked in that race whose parent exits before the next
+   scan (reparented out of the tree). Capped at 32 scans (warning).
+4. **Threads** (`seed_threads`), after membership so new threads are already created in
+   kernel: for every thread in `/proc/PID/task`, build a `task_state`
+   (`snapshot::task_state`, the one function to adapt when `task_state` changes) and insert
+   it with `BPF_NOEXIST` (`EEXIST`: the kernel created it on a fork or exec; its records
+   describe it). Re-read the thread's stat afterwards; if it exited meanwhile, delete the
+   entry (no exit record would). A member with no live thread left is untracked.
+5. **Trace** (`Trace::seed`, pure: replay can feed it recorded `ProcSeed`s): one `Proc` per
+   member (target = root, parents linked by ppid), one `Thread` per seeded entry, and a
+   procctx record per member through `on_exec` with the comm, ppid and argv read from
+   `/proc`; key = `(pid, StartClock::ticks_to_start(starttime))`, which is tick precision
+   (10 ms at `USER_HZ` 100) instead of the kernel's exact `start_boottime`. Later records
+   never re-key a process: `on_exec` keeps the known key, and a FORK recorded before the
+   window start names a task the seeding may already have added (it reuses it).
+6. The window starts after seeding (monotonic now) and ends at the target's thread-group
+   exit (EXIT record, or the pidfd), `--duration` after the start, or the first
+   SIGINT/SIGTERM/SIGHUP (`ended_by: interrupt`). If the target's exit record shows up in
+   the final drain before the deadline/signal time, the window ends there (`exit`). Detach,
+   drain, sweep and report as in wrap mode; whytime exits 0. `exit_code` is the target's
+   (from its EXIT record) when it exited in the window.
+
+`task_state` from `/proc` (`snapshot.rs`), per `/proc/TID/stat` state letter:
+
+| State | Entry | Fields set (all others zero, as in a fresh kernel entry) |
+|---|---|---|
+| `R` | `ST_RUNNING` | `seg.start`/`last_ts` = now, `sys` = none. A thread that was queued, not on a CPU, gets its first queue wait folded into the first mixed segment (split proportionally) |
+| `S` `D` `I` `P` ... | `ST_BLOCKED` | also `block_ts` = now, `block_state` (`S`→1, `D`→2, `I`→0x402, `P`→0x40), `sys` from `/proc/TID/syscall`: `nr`, and for `SYSF_FD0` syscalls `fd` = arg0 described like `describe_fd` (`stat` of `/proc/TGID/task/TID/fd/N` → `S_IFMT`, ino, dev re-encoded as `major << 20 \| minor`; `flags:` from `fdinfo`; sockets: family/peer from `/proc/TGID/net/{tcp,udp}{,6}` and `unix`, cached per network namespace). `running` there → `ST_RUNNING`; `-1` → no syscall; unreadable (no ptrace access) → `nr = NR_UNREADABLE` (-2, user space only) → `other` "blocked since attach, syscall unreadable", counted in a report note |
+| `T` / `t` | `ST_BLOCKED` | `block_state` `TASK_STOPPED` / `TASK_TRACED`, `sys` = none (stops happen after `sys_exit`) → `other` "stopped" |
+| `Z` `X` | none | exited |
+
 ## Probes (verified BTF prototypes on 7.2.6)
 
 | Program | Attach point | Prototype (`btf_trace_*`) | Does | Fallback |
@@ -165,7 +219,8 @@ so a CPU-bound task emits nothing until it blocks or exits.
 
 ## Attribution model (what the numbers mean)
 
-The window is `[exec of COMMAND, exit of COMMAND's last thread)`; `wall_ns` is its length.
+The window is `[exec of COMMAND, exit of COMMAND's last thread)` (attach mode: `[end of
+seeding, exit of the target's last thread / deadline / signal)`); `wall_ns` is its length.
 Every nanosecond is assigned to exactly one `(class, subject)` line, so shares sum to 1
 (the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rounding). The walk
 (`attribute.rs`):
@@ -207,17 +262,33 @@ Honesty limits (state them when presenting results):
   that whole off-CPU gap counts as blocked (µs scale), and child descent falls back to the
   exit-time heuristic.
 - Mixed segments split on-CPU vs. preempted proportionally when clipped to a sub-interval.
+- Attach mode does not see time before the attach. Each pre-existing thread's first
+  interval is classified from `/proc` at attach (state letter, `/proc/TID/syscall`, fd
+  description), sampled a few µs before its entry exists: a thread that changes state in
+  between has that first interval misread (µs-scale race). A thread running inside a
+  syscall at attach that then blocks in it shows that block as `other` (outside syscalls),
+  because its `sys_enter` predates the attach. Without ptrace access to the target
+  (`kernel.yama.ptrace_scope` ≥ 1 under file capabilities), `/proc/TID/syscall` is
+  unreadable and blocked threads' first interval is `other` (a note says so).
+- Attach-mode procctx keys are `/proc` start times (tick precision, see above), and a
+  process forked by a not-yet-tracked member in the scan race, whose parent exits before
+  the next scan, is not traced.
 
 ## Report
 
 Human (stderr): `wall`, then lines ≥ 1% (max 8), `other` collecting the rest and every
 `other`-class line, then `critical path: N processes · M events lost` and notes.
-JSON (`--json`, stderr): `{schema: "whytime.report/1", command, wall_ns, ended_by,
-exit_code, lines: [{class, share, ns, subject, connections?}], processes: [{pid, ppid, comm,
-argv, cpu_ns, exit_code, critical}], quality: {events, dropped, syscalls}, notes}`.
+JSON (`--json`, stderr): `{schema: "whytime.report/1", command, attached_pid?, wall_ns,
+ended_by, exit_code, lines: [{class, share, ns, subject, connections?}], processes: [{pid,
+ppid, comm, argv, cpu_ns, exit_code, critical}], quality: {events, dropped, syscalls},
+notes}`. `ended_by` is `exit`, `duration` or (attach only) `interrupt`; `attached_pid` is
+present only in attach mode, where `command` is the target's argv (its comm if empty) and
+`exit_code` is the target's if it exited in the window, else `null`.
 
 Exit codes: COMMAND's (128 + signal if killed); 125 whytime failed before/at start (with
 doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run.
+Attach mode: 0 after the report, 1 PID cannot be attached to (missing, thread, zombie,
+whytime, pid 1, another user's), 125 as above.
 
 ## Privileges
 
@@ -229,7 +300,11 @@ Required: `CAP_BPF` + `CAP_PERFMON` (verified sufficient), or root. Two ways:
   caps are ignored on `nosuid` mounts (`/tmp` here): install to an ext4 path. Exec drops
   the caps for COMMAND (non-root exec without ambient caps).
 
-Optional: `CAP_SYS_PTRACE` to resolve file paths of descendants running as another user.
+Optional: `CAP_SYS_PTRACE` to resolve file paths of descendants running as another user,
+and, in attach mode without root, to read `/proc/TID/syscall` of the target's threads
+under Yama `ptrace_scope` ≥ 1 (else their first interval is `other`) and to attach to
+processes of other users. Without root or it, attach mode only accepts the invoking
+user's own processes.
 
 ## Doctor checks
 
@@ -243,8 +318,8 @@ memcg) plus:
 | `probe.syscalls` | no | attaches `sys_exit` then `sys_enter`; WARN impact "blocked time is reported as other"; SKIP if the scheduler probe failed |
 
 `kernel.kptr_restrict` is not checked: the MVP reads no kernel addresses (relevant once
-flamegraphs symbolize kernel stacks). Wrap mode runs `Doctor::preflight()` first, and after a
-load failure re-runs `ids_for_errno(errno)` and prints the non-passing checks.
+flamegraphs symbolize kernel stacks). Wrap and attach mode run `Doctor::preflight()` first,
+and after a load failure re-run `ids_for_errno(errno)` and print the non-passing checks.
 
 ## Performance budget
 
@@ -278,6 +353,25 @@ Targets, to be measured (not yet benchmarked):
 9. `setcap`: copy to `~/.cache/whytime-e2e/bin`, `setcap cap_bpf,cap_perfmon+ep`, run
    unprivileged on `wt-sleep 300` → `sleep` ≥ 0.9
 
+Attach scenarios run an `sh` script (`attach_cmd`): start the target in the background,
+wait 0.3 s, `sudo -n whytime --json -p $!` with the scenario's flags, then print `target
+alive` if the target still runs (it must, unless it exited by itself), stop it, and exit
+with whytime's status (must be 0):
+
+10. `attach-blocked`: `wt-sleep 30000`, `--duration 1s` → `ended_by` duration, `sleep` ≥
+    0.9 (classified from `/proc` at attach), wall 1.0 s ± 10%, target alive
+11. `attach-running`: `wt-burn 30000`, `--duration 1s` → `cpu` ≥ 0.9, target alive
+12. `attach-threads`: `wt-futex 30000` (two threads), `--duration 1s` → `futex` ≥ 0.9
+13. `attach-exit`: `sh -c '"$0" 1200; exit 3' wt-sleep` (pre-existing child) → `ended_by`
+    exit, `exit_code` 3, `wt-sleep` in `processes[]` with ppid = target, `sleep` ≥ 0.9
+14. `attach-spawn`: `wt-attach 1500 800` (sleeps, then forks `wt-burn 800` after the
+    attach) → `ended_by` exit, `wt-burn` in `processes[]`, `child` subject `wt-burn` ≥ 0.3
+15. `attach-interrupt`: `wt-sleep 30000`, `sudo -n pkill -INT -P <sudo pid>` after 1 s
+    (whytime inherits SIGINT ignored from the background job) → `ended_by` interrupt,
+    `sleep` ≥ 0.9, target alive
+16. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
+    process"
+
 ## Gotchas
 
 - clang folds `if (!p && !n)` on two map-value pointers into `p | n`; the verifier rejects
@@ -291,5 +385,20 @@ Targets, to be measured (not yet benchmarked):
 - Under sudo, `sh -c '... of=~/x'` does not expand `~` after `of=` (POSIX `sh`); use `$HOME`.
 - The report is the last thing on stderr; the e2e harness locates it by the
   `"schema": "whytime.report/1"` prefix, so test workloads must not write JSON to stderr.
-- Tracking membership is inserted in kernel at fork; user space inserts only COMMAND's pid,
-  before releasing it. Never add user-space insertion at fork (it races the child).
+- Tracking membership is inserted in kernel at fork; user space inserts only COMMAND's pid
+  before releasing it, or (attach) processes that already exist. Never add user-space
+  insertion at fork (it races the child).
+- Attach mode seeds `tracked` and `tasks` from user space with `BPF_NOEXIST` only, after
+  the programs are attached: the kernel side may already have created an entry (fork,
+  exec), and overwriting it would lose that state. `EEXIST` means "the records describe
+  it"; do not seed the trace for it either.
+- A pre-existing process's procctx key comes from `/proc` ticks, not `start_boottime`;
+  exec/fork handling in `timeline.rs` keeps the first key of a live process, so procctx
+  sees one lifetime. Compare starts in ticks (`StartClock::start_to_ticks`), never in ns.
+- `/proc/TID/syscall` needs ptrace *attach* access (Yama applies), while `/proc/TID/fd`,
+  `fdinfo` and `stat` need only read access: under file capabilities the syscall may be
+  unreadable while everything else works.
+- A non-interactive shell's background job inherits SIGINT ignored. Attach mode blocks
+  SIGINT into a signalfd, and blocked signals are queued even when ignored, so it still
+  sees Ctrl-C/`kill -INT`; never switch that to a handler-based approach without resetting
+  the disposition.
