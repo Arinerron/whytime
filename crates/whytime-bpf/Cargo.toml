@@ -3,8 +3,18 @@ name = "whytime-bpf"
 description = "whytime's BPF object (C CO-RE, compiled by clang in build.rs) and its ABI hash"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# The vendored libbpf headers in bpf/include/bpf are compiled into the objects.
+license = "MIT AND (LGPL-2.1-only OR BSD-2-Clause)"
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["ebpf", "bpf", "whytime"]
+categories = ["os::linux-apis", "development-tools::profiling"]
+
+[package.metadata.docs.rs]
+# build.rs supports x86_64 and aarch64 only; under docs.rs it skips clang (see build.rs).
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 # `include_bytes_aligned!` for the embedded object.

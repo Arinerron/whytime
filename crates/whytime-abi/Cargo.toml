@@ -5,6 +5,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["ebpf", "bpf", "whytime"]
+categories = ["os::linux-apis", "development-tools::profiling"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+# `header()` (linked from the crate docs) is behind `std`.
+features = ["std"]
 
 [features]
 # C header generation for the BPF build script.
