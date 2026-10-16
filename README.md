@@ -15,7 +15,10 @@ critical path: 3 processes · 0 events lost
 whytime runs a command, traces it and every process it starts with eBPF, and splits the
 wall-clock time along the command's critical path: on-CPU, waiting on a child that was
 computing, timer sleeps, fsync (per directory), file I/O, network peers (`ip:port`), pipes,
-locks, polling, waiting for a CPU. Shares always add up to 100% of the wall time.
+locks, polling, waiting for a CPU. Shares always add up to 100% of the wall time. When the
+command waits on another of its threads or processes (joining workers, a contended lock, a
+pipe, a child), the time is explained by what that task was doing: a main thread joining
+CPU-bound workers is on-CPU, a lock held across a sleep is the sleep.
 
 ```
 $ whytime -- ./build.sh            # report on stderr; the command's output passes through

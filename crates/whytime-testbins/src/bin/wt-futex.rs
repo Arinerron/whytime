@@ -1,5 +1,6 @@
-//! `wt-futex MS`: a second thread takes a mutex and holds it for MS milliseconds; the main
-//! thread blocks on the same mutex (a futex wait) until it is released.
+//! `wt-futex MS`: a lock holder. A second thread takes a mutex and sleeps MS milliseconds
+//! holding it; the main thread blocks on the same mutex (a futex wait) until it is released,
+//! so the holder's sleep is what the main thread waits for.
 
 use std::sync::{Arc, Barrier, Mutex};
 

@@ -7,6 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+libc.workspace = true
+
 [[bin]]
 name = "wt-sleep"
 path = "src/bin/wt-sleep.rs"
@@ -30,6 +33,14 @@ path = "src/bin/wt-futex.rs"
 [[bin]]
 name = "wt-tcp"
 path = "src/bin/wt-tcp.rs"
+
+[[bin]]
+name = "wt-threads"
+path = "src/bin/wt-threads.rs"
+
+[[bin]]
+name = "wt-vfork"
+path = "src/bin/wt-vfork.rs"
 
 [lints]
 workspace = true

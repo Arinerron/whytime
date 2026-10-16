@@ -118,6 +118,7 @@ impl Report {
         let wall = meta.wall_ns.max(1);
         #[allow(clippy::cast_precision_loss)] // shares are presentation values
         let share = |ns: u64| ns as f64 / wall as f64;
+        let critical = attribution.critical();
         let lines: Vec<ReportLine> = attribution
             .lines
             .into_iter()
@@ -157,7 +158,7 @@ impl Report {
                         .and_then(|info| info.exit)
                         .and_then(|exit| exit.code)
                         .map(exit_code),
-                    critical: attribution.critical.contains(&id),
+                    critical: critical.contains(&id),
                 }
             })
             .collect();
