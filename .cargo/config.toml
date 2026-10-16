@@ -1,0 +1,7 @@
+[alias]
+# `cargo xtask test-e2e`: builds the release binaries and runs the sudo end-to-end suite.
+xtask = "run --quiet --package xtask --"
+
+[build]
+# whytime ships as one static binary; tests and xtask build for the same target.
+target = "x86_64-unknown-linux-musl"

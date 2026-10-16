@@ -1,0 +1,17 @@
+[package]
+name = "whytime-bpf"
+description = "whytime's BPF object (C CO-RE, compiled by clang in build.rs) and its ABI hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `include_bytes_aligned!` for the embedded object.
+aya.workspace = true
+
+[build-dependencies]
+whytime-abi = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

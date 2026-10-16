@@ -1,0 +1,20 @@
+[package]
+name = "whytime-abi"
+description = "Kernel/user ABI of whytime: ring buffer records, the per-task map value and shared constants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# C header generation for the BPF build script.
+std = ["wire/std"]
+# `aya::Pod` impls so the loader can use the records as map keys and values.
+user = ["dep:aya"]
+
+[dependencies]
+wire.workspace = true
+aya = { workspace = true, optional = true }
+
+[lints]
+workspace = true

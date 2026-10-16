@@ -1,0 +1,114 @@
+//! Command-line interface.
+
+use std::ffi::OsString;
+use std::time::Duration;
+
+use clap::{Args, Parser, Subcommand};
+
+/// Explain where a command's wall-clock time went.
+///
+/// Runs COMMAND, traces it and every process it starts with eBPF, and prints to stderr where
+/// its wall time went: on-CPU, waiting on children, sleeping, fsync, network peers, locks.
+/// COMMAND's own output passes through, and whytime exits with COMMAND's exit code.
+#[derive(Debug, Parser)]
+#[command(
+    name = "whytime",
+    version,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    after_help = "Exit status: COMMAND's; 125 if whytime could not start tracing; \
+                  126/127 if COMMAND is not executable / not found."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub sub: Option<Sub>,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+/// Wrap mode.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Print the report as JSON (schema whytime.report/1).
+    #[arg(long)]
+    pub json: bool,
+
+    /// Stop observing after D (e.g. 500ms, 30s, 2m) and report; COMMAND keeps running and
+    /// whytime still exits with its code.
+    #[arg(long, value_name = "D", value_parser = parse_duration)]
+    pub duration: Option<Duration>,
+
+    /// The command to run, and its arguments.
+    #[arg(
+        value_name = "COMMAND",
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub command: Vec<OsString>,
+}
+
+/// Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Sub {
+    /// Check whether whytime can run on this system and print exact fixes.
+    Doctor {
+        /// Print the report as JSON (schema bpfdoctor/1).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Parses `500ms`, `30s`, `1.5s`, `2m`, `1h`; a bare number is seconds.
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid duration {text:?}: expected e.g. 500ms, 30s, 2m"))?;
+    let scale = match unit {
+        "ms" => 1e-3,
+        "" | "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        _ => return Err(format!("invalid duration unit {unit:?}: use ms, s, m or h")),
+    };
+    Duration::try_from_secs_f64(value * scale)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| format!("invalid duration {text:?}: must be positive"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_parse_with_units_and_reject_zero_or_junk() {
+        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("1.5s"), Ok(Duration::from_millis(1500)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("3"), Ok(Duration::from_secs(3)));
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("5d").is_err());
+        assert!(parse_duration("s").is_err());
+    }
+
+    #[test]
+    fn command_words_after_the_command_belong_to_it() {
+        let cli = Cli::try_parse_from(["whytime", "--json", "ls", "--json", "-l"]).unwrap();
+        assert!(cli.sub.is_none());
+        assert!(cli.run.json);
+        assert_eq!(cli.run.command, ["ls", "--json", "-l"]);
+
+        let cli = Cli::try_parse_from(["whytime", "--", "doctor"]).unwrap();
+        assert!(cli.sub.is_none());
+        assert_eq!(cli.run.command, ["doctor"]);
+
+        let cli = Cli::try_parse_from(["whytime", "doctor", "--json"]).unwrap();
+        assert!(matches!(cli.sub, Some(Sub::Doctor { json: true })));
+    }
+}

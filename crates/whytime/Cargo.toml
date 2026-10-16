@@ -1,0 +1,24 @@
+[package]
+name = "whytime"
+description = "Explains where a command's wall-clock time went: off-CPU and on-CPU attribution across its process tree, from eBPF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+whytime-abi = { workspace = true, features = ["user"] }
+whytime-bpf.workspace = true
+wire.workspace = true
+procctx.workspace = true
+bpfdoctor.workspace = true
+aya.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,35 @@
+[package]
+name = "whytime-testbins"
+description = "Small workloads with known wall-time profiles for whytime's end-to-end suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "wt-sleep"
+path = "src/bin/wt-sleep.rs"
+
+[[bin]]
+name = "wt-burn"
+path = "src/bin/wt-burn.rs"
+
+[[bin]]
+name = "wt-fsync"
+path = "src/bin/wt-fsync.rs"
+
+[[bin]]
+name = "wt-child"
+path = "src/bin/wt-child.rs"
+
+[[bin]]
+name = "wt-futex"
+path = "src/bin/wt-futex.rs"
+
+[[bin]]
+name = "wt-tcp"
+path = "src/bin/wt-tcp.rs"
+
+[lints]
+workspace = true
