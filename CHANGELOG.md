@@ -16,13 +16,17 @@ First release.
 - Wrap mode, `whytime -- COMMAND`: runs COMMAND, traces it and every process it starts
   with eBPF, and splits its wall-clock time along the critical path across the whole
   process tree. Shares always add up to 100% of the wall time. COMMAND's output passes
-  through and whytime exits with its exit code.
-- Attach mode, `whytime -p PID`: traces a running process and its descendants from the
-  attach until it exits, `--duration` elapses or Ctrl-C, without signalling it. The state
-  of each pre-existing thread at attach time is read from `/proc`.
+  through, the report goes to stderr, and whytime exits with COMMAND's exit code (125 if
+  tracing could not start, 126/127 if COMMAND is not executable / not found).
+- Attach mode, `whytime -p PID` (`--pid`): traces a running process and its descendants
+  from the attach until it exits, `--duration` elapses or Ctrl-C, without signalling it.
+  The state of each pre-existing thread at attach time is read from `/proc`. Exits 0 after
+  the report, 1 if PID cannot be attached to.
+- `--duration D` (`500ms`, `30s`, `2m`, ...) in both modes: report after D while COMMAND or
+  PID keeps running.
 - Trace files: `--record FILE` saves a run (wrap or attach mode), and `whytime report FILE`
   replays it offline, without privileges, into the identical report, with any of the report
-  options below.
+  options below (exit 2 if the file cannot be replayed).
 - Follow-the-waker attribution: when the critical path waits on another thread or process
   (futexes, pipes and other IPC, poll, `wait` on a child, `vfork`), the time is explained by
   what that task was doing.
@@ -32,26 +36,34 @@ First release.
   the directory even for processes that have exited by report time.
 - Poll, select and epoll waits are attributed to the descriptor that became ready (for
   example the network peer) instead of `poll`.
-- Page-fault attribution to the directory of the mapped file.
+- Page-fault attribution to the directory of the mapped file, or to anonymous memory.
 - Out-of-tree wakers are named (`woken by dbus-daemon`) when a process outside the traced
   tree ends a pipe or poll wait.
 - Network peers are named after the host the traced tree looked up, read from its resolver
   traffic (DNS wire format over UDP and TCP on port 53, and systemd-resolved varlink as used
-  by glibc's `getaddrinfo`); the numeric address stays available in the JSON report.
-- Runqueue time reports the process that held the CPU.
-- Flamegraphs of the critical path: `--flamegraph FILE` (SVG) and `--folded FILE` (folded
-  stacks in microseconds), with on-CPU samples and the stacks where threads blocked.
+  by glibc's `getaddrinfo`); the numeric address stays available in the JSON report
+  (`addr`).
+- Processes that share a name but not their arguments get separate lines, named by the
+  shortest distinguishing tail of their arguments (`sort -R`, `sort -n`).
+- Runqueue lines name the task that held the CPU (`held_by` in JSON, `— mostly X N%` in
+  the text report).
+- A parallelism summary: CPU time of the whole tree in the window and the average number
+  of busy CPUs (`parallelism` in JSON).
+- `--timeline`: the window in 10 equal slices, each with its largest lines.
 - `--perfetto FILE`: export to the Chrome Trace Event format for Perfetto
   (`ui.perfetto.dev`) and `chrome://tracing`, with every traced thread and the critical path.
-- `--timeline`: a time-bucketed timeline of the report; a parallelism summary.
+- Flamegraphs of the critical path: `--flamegraph FILE` (SVG) and `--folded FILE` (folded
+  stacks in microseconds), with on-CPU samples at 199 Hz and the stacks where threads
+  blocked; in wrap and attach mode, and from trace files recorded with either flag.
 - JSON output, `--json`, with schema `whytime.report/1`.
-- `whytime doctor`: checks whether whytime can run on this system and prints the exact fix
-  for each problem.
+- `whytime doctor` (`--json` for schema `bpfdoctor/1`): checks whether whytime can run on
+  this system, loads every probe set, and prints the exact fix for each problem.
 - Under `sudo`, COMMAND runs as the invoking user (uid, groups and `HOME`); alternatively,
   file capabilities (`setcap cap_bpf,cap_perfmon+ep`) let whytime run without `sudo`.
 - `whytime completions SHELL` (bash, zsh, fish, elvish, PowerShell) and man pages.
+- `WHYTIME_LOG=debug` for debug logging, including the BPF verifier log on load failures.
 - Static musl binaries for x86_64 and aarch64, published as release tarballs with
-  completions and man pages.
+  completions, man pages and SHA-256 checksums.
 
 [Unreleased]: https://github.com/Arinerron/whytime/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Arinerron/whytime/releases/tag/v0.1.0

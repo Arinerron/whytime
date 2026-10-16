@@ -87,8 +87,10 @@ sensitive before attaching them to a public issue. They can contain:
   port 53 and systemd-resolved varlink requests and replies) that is stored verbatim;
 - process names (`comm`) of processes outside the traced tree that woke a traced thread or
   held its CPU;
+- with `--flamegraph` or `--folded`, the symbolized call stacks of the traced processes
+  (function names and the names of the binaries and libraries they ran);
 - in attach mode, what whytime read from `/proc` when it attached.
 
-Under `sudo`, the trace file is created by root and then handed to the invoking user. Review
-or redact what you share; a maintainer can usually work with a trace of a minimal
-reproduction instead of a production workload.
+Under `sudo`, trace, Perfetto and flamegraph files are created by root and then handed to
+the invoking user. Review or redact what you share; a maintainer can usually work with a
+trace of a minimal reproduction instead of a production workload.
