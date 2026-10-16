@@ -28,6 +28,10 @@ const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask man [DIR]";
 const SERVER_DELAY: Duration = Duration::from_millis(300);
 /// Seconds the attach scenarios let their target run before whytime attaches.
 const ATTACH_DELAY: &str = "0.3";
+/// Seconds of slack on the attach-interrupt window around the span the script measured
+/// (ready → `kill`): `/proc/uptime` ticks (10 ms), the 10 ms poll for ready, and whytime's
+/// wakeup on the signalfd (measured ≤ 1.3 ms after the signal).
+const INTERRUPT_SLACK: f64 = 0.1;
 /// A pid above any `pid_max`, so no process has it.
 const NO_PID: &str = "4194304";
 /// One-byte reads `wt-syscalls` does in the overhead scenario.
@@ -107,7 +111,7 @@ fn test_e2e() -> anyhow::Result<()> {
     let lock_arg = lock_dir.display().to_string();
     let overhead_whytime = whytime.clone();
     let syscalls = bin("wt-syscalls");
-    // wt-fault touch drops the file's cached pages itself; it only needs a synced file.
+    // wt-fault write leaves the file synced and out of the page cache (touch checks it).
     let fault_file = work.join("fault.bin").display().to_string();
     let wrote = run(Command::new(bin("wt-fault")).args(["write", &fault_file, "128"]))?;
     ensure!(wrote.status.success(), "wt-fault write {fault_file} failed");
@@ -435,10 +439,16 @@ fn setcap_copy(whytime: &Path, work: &Path, sleep: &str) -> anyhow::Result<Comma
 }
 
 /// An `sh` script that starts `target` in the background, waits [`ATTACH_DELAY`], and runs
-/// `sudo -n whytime --json -p PID` with `args` on it; with `interrupt`, it sends whytime
-/// SIGINT that many seconds later. Afterwards it prints `target alive` on stdout if the
-/// target still runs (whytime must never stop it), stops it, and exits with whytime's
-/// status. Running in the background, whytime inherits SIGINT ignored, as from scripts.
+/// `sudo -n whytime --json -p PID` with `args` on it. With `interrupt`, it waits until
+/// whytime observes: sudo's child (`/proc/PID/task/PID/children`) is `whytime`, has blocked
+/// SIGINT for its signalfd and sleeps (`SigBlk`, `State` in `/proc/PID/status`; it blocks
+/// SIGINT before the 2 `/proc` scans of seeding, ~0.1 s on a loaded host, and seeding does
+/// not sleep, so this is the window start). Then it sends whytime SIGINT that many seconds
+/// later and prints `interrupt READY BEFORE AFTER` (`/proc/uptime` when ready, before and
+/// after the `kill`; see [`check_attach_interrupt`]). Afterwards it prints `target alive` on
+/// stdout if the target still runs (whytime must never stop it), stops it, and exits with
+/// whytime's status. Running in the background, whytime inherits SIGINT ignored, as from
+/// scripts: a SIGINT before it is ready would be lost.
 fn attach_cmd(whytime: &Path, target: &[&str], args: &[&str], interrupt: Option<&str>) -> Command {
     // Single-quoted for sh: a trace file path may contain spaces.
     let args: Vec<String> = args
@@ -448,11 +458,35 @@ fn attach_cmd(whytime: &Path, target: &[&str], args: &[&str], interrupt: Option<
     let args = args.join(" ");
     let run = match interrupt {
         None => format!("sudo -n \"$w\" --json -p \"$t\" {args}; s=$?"),
-        // Without a terminal, sudo runs whytime as its direct child.
+        // Without a terminal, sudo runs whytime as its direct child. Builtins only in the
+        // poll (no fork per probe); SIGTERM, not ignored, ends a whytime that never got ready.
         Some(after) => format!(
             "sudo -n \"$w\" --json -p \"$t\" {args} & j=$!\n\
-             sleep {after}\n\
-             sudo -n pkill -INT -P \"$j\"\n\
+             i=0 ready=\n\
+             while [ -z \"$ready\" ] && [ $i -lt 500 ]; do\n\
+               i=$((i + 1)) p= name= st= mask=\n\
+               read -r p _ 2>/dev/null < \"/proc/$j/task/$j/children\"\n\
+               if [ -n \"$p\" ]; then\n\
+                 while read -r key value _; do\n\
+                   case $key in\n\
+                     Name:) name=$value ;;\n\
+                     State:) st=$value ;;\n\
+                     SigBlk:) mask=$value; break ;;\n\
+                   esac\n\
+                 done 2>/dev/null < \"/proc/$p/status\"\n\
+               fi\n\
+               if [ \"$name\" = whytime ] && [ \"$st\" = S ] &&\n\
+                 [ $((0x${{mask:-0}} & 2)) -ne 0 ]; then ready=1\n\
+               else sleep 0.01; fi\n\
+             done\n\
+             if [ -n \"$ready\" ]; then\n\
+               read -r ready _ < /proc/uptime\n\
+               sleep {after}\n\
+               read -r before _ < /proc/uptime\n\
+               sudo -n kill -INT \"$p\"\n\
+               read -r after _ < /proc/uptime\n\
+               echo \"interrupt $ready $before $after\"\n\
+             else sudo -n pkill -TERM -P \"$j\"; fi\n\
              wait \"$j\"; s=$?"
         ),
     };
@@ -463,7 +497,7 @@ fn attach_cmd(whytime: &Path, target: &[&str], args: &[&str], interrupt: Option<
          {run}\n\
          state=$(sed 's/.*) //' \"/proc/$t/stat\" 2>/dev/null | cut -c1)\n\
          if [ -n \"$state\" ] && [ \"$state\" != Z ]; then echo target alive; kill \"$t\"; fi\n\
-         wait \"$t\"\n\
+         wait \"$t\" 2>/dev/null\n\
          exit \"$s\""
     );
     let mut cmd = Command::new("sh");
@@ -818,15 +852,36 @@ fn check_attach_spawn(out: &Output) -> anyhow::Result<String> {
     ))
 }
 
+/// SIGINT ends the window when it arrives: `wall_ns` spans whytime getting ready to the
+/// `kill`, as the script measured them (`interrupt READY BEFORE AFTER`, see [`attach_cmd`]),
+/// within [`INTERRUPT_SLACK`].
 fn check_attach_interrupt(out: &Output) -> anyhow::Result<String> {
     let report = attached(out, "interrupt")?;
     ensure!(target_alive(out), "the target did not survive whytime");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stamps: Vec<f64> = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("interrupt "))
+        .context("no `interrupt` line on stdout (whytime never got ready)")?
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .context("parsing the `interrupt` line")?;
+    let [ready, before, after] = stamps[..] else {
+        bail!("`interrupt` line has {} timestamps (want 3)", stamps.len());
+    };
+    let (sent_from, sent_to) = (before - ready, after - ready);
+    let (lo, hi) = (sent_from - INTERRUPT_SLACK, sent_to + INTERRUPT_SLACK);
     let sleep = class_share(&report, "sleep", |_| true);
     let wall = wall_secs(&report);
     ensure!(sleep >= 0.9, "sleep share {sleep:.3} < 0.9");
-    ensure!((0.1..=1.0).contains(&wall), "wall {wall:.3}s not within 0.1..1s");
+    ensure!(
+        (lo..=hi).contains(&wall),
+        "wall {wall:.3}s not within {lo:.3}..{hi:.3}s (SIGINT {sent_from:.2}..{sent_to:.2}s \
+         after ready ± {INTERRUPT_SLACK}s)"
+    );
     Ok(format!(
-        "SIGINT after 1s: wall {wall:.3}s, sleep {:.1}%",
+        "SIGINT {sent_from:.2}..{sent_to:.2}s after ready: wall {wall:.3}s, sleep {:.1}%",
         sleep * 100.0
     ))
 }
@@ -949,16 +1004,28 @@ fn check_poll(out: &Output, server: SocketAddr) -> anyhow::Result<String> {
     ))
 }
 
-/// Page faults on a file whose pages were dropped are `fault` on its directory.
+/// Page faults on a file whose pages were dropped are `fault` on its directory: nearly all
+/// of the time `wt-fault` is blocked (neither `cpu` nor `runqueue`; checks the
+/// classification), and a fair part of the wall time (catches fault waits leaking into
+/// `cpu` or `runqueue`). The rest of the wall is the faults' own CPU work (~25 µs each
+/// traced, next to a ~60 µs NVMe read) and waits for a CPU after each wakeup, which grow
+/// with load: fault was 60–75% of the wall at load 10–15 on 22 cores, 29–55% with 3
+/// runnable tasks per CPU, while staying 100% of the blocked time.
 fn check_fault(out: &Output, dir: &str) -> anyhow::Result<String> {
     exited(out, 0)?;
     let report = report(out)?;
     let fault = class_share(&report, "fault", |s| s == dir);
-    ensure!(fault >= 0.5, "fault share on {dir} {fault:.3} < 0.5");
+    ensure!(fault >= 0.2, "fault share on {dir} {fault:.3} < 0.2");
+    let running =
+        class_share(&report, "cpu", |_| true) + class_share(&report, "runqueue", |_| true);
+    // At least 0.2 of the shares (summing to 1) are fault, so `1 - running` is too.
+    let of_blocked = fault / (1.0 - running);
+    ensure!(of_blocked >= 0.9, "fault on {dir} {of_blocked:.3} of the blocked time < 0.9");
     Ok(format!(
-        "wall {:.3}s, page faults on {dir} {:.1}%",
+        "wall {:.3}s, page faults on {dir} {:.1}% ({:.1}% of blocked time)",
         wall_secs(&report),
-        fault * 100.0
+        fault * 100.0,
+        of_blocked * 100.0
     ))
 }
 

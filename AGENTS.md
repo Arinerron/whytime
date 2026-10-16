@@ -599,10 +599,14 @@ Targets (not benchmarked unless noted):
 15. `poll-ready`: same server; `wt-poll ADDR 4` waits for each reply in `epoll_wait` and
     `poll` in turn → `net` subject = server `ip:port` ≥ 0.6 (readiness probes; without
     them these waits are `poll`)
-16. `fault`: xtask runs `wt-fault write $WORK/fault.bin 128` (synced), then
-    `wt-fault touch FILE` drops its pages (`posix_fadvise(DONTNEED)`), maps it and reads
-    every page last-to-first (synchronous read-around; a forward scan's async readahead
-    hides the I/O) → `fault` subject = the `~`-abbreviated work directory ≥ 0.5
+16. `fault`: xtask runs `wt-fault write $WORK/fault.bin 128` (synced, pages dropped), then
+    `wt-fault touch FILE` drops them again, maps it with `MADV_RANDOM` (no fault
+    read-around), checks with `mincore` that no page is cached, and reads one byte every 16
+    pages last-to-first (2048 major faults, each waiting for its own page) → `fault` subject
+    = the `~`-abbreviated work directory ≥ 0.9 of the blocked time (all but `cpu` and
+    `runqueue`; measured 100%) and ≥ 0.2 of the wall. The wall share is machine- and
+    load-bound: ~25 µs of traced CPU per fault next to a ~60 µs NVMe read, plus a runqueue
+    wait per wakeup (60–75% at load 10–15 on 22 cores, 29–55% with 3 runnable tasks per CPU)
 17. `waker`: xtask makes `$WORK/waker.fifo` and `$WORK/waker.watched`; `sh` starts
     `wt-fifo write FIFO FILE 8 100` (comm `wt-fifo-writer`, outside the tree) and execs
     whytime on `wt-fifo read FIFO FILE 8`, which alternates `poll` on an inotify watch of
@@ -627,9 +631,11 @@ with whytime's status (must be 0):
     exit, `exit_code` 3, `wt-sleep` in `processes[]` with ppid = target, `sleep` ≥ 0.9
 23. `attach-spawn`: `wt-attach 1500 800` (sleeps, then forks `wt-burn 800` after the
     attach) → `ended_by` exit, `wt-burn` in `processes[]`, `child` subject `wt-burn` ≥ 0.3
-24. `attach-interrupt`: `wt-sleep 30000`, `sudo -n pkill -INT -P <sudo pid>` after 1 s
-    (whytime inherits SIGINT ignored from the background job) → `ended_by` interrupt,
-    `sleep` ≥ 0.9, target alive
+24. `attach-interrupt`: `wt-sleep 30000`; the script polls until whytime observes (sudo's
+    child is `whytime`, SIGINT in `SigBlk`, `State` S: past seeding, in `epoll_wait`; whytime
+    inherits SIGINT ignored from the background job, so an earlier one would be lost), sends
+    `sudo -n kill -INT` 1 s later and prints `/proc/uptime` at ready, before and after the
+    kill → `ended_by` interrupt, `sleep` ≥ 0.9, wall within ready→kill ± 0.1 s, target alive
 25. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
     process"
 26. `attach-record`: `sh -c 'while :; do "$0" "$1" 20; done' wt-fsync DIR` (seeds, then
@@ -660,6 +666,8 @@ with whytime's status (must be 0):
   `i_mode & S_IFMT == 0` on 7.2.
 - `/tmp` is `nosuid` here: file capabilities on a binary there are ignored.
 - Under sudo, `sh -c '... of=~/x'` does not expand `~` after `of=` (POSIX `sh`); use `$HOME`.
+- `dash` (CI's `/bin/sh`) prints `Terminated` on stderr when `wait` reaps a killed job;
+  the attach script silences that `wait`, which would otherwise follow the JSON report.
 - The report is the last thing on stderr; the e2e harness locates it by the
   `"schema": "whytime.report/1"` prefix, so test workloads must not write JSON to stderr.
   A trace-file write error is printed before the report for the same reason.
