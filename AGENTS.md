@@ -11,7 +11,9 @@ crate name is taken on crates.io. Use `whytime` everywhere in code, docs and out
 
 **Status: MVP.** Wrap mode and attach mode (`-p PID`), plus trace files for both:
 `--record FILE` saves a run and `whytime report FILE` replays it offline into the identical
-report. Flamegraphs and hostname/DNS correlation for network subjects are later milestones.
+report. Every mode also takes the report options `--json`, `--timeline` (the window in
+slices) and `--perfetto FILE` (a Chrome Trace Event file of every thread and the critical
+path). Flamegraphs and hostname/DNS correlation for network subjects are later milestones.
 
 ## Commands
 
@@ -35,6 +37,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | Attach | `sudo whytime -p PID [--duration 30s] [--record t.wt]` (report on exit, deadline or Ctrl-C; exit 0) |
 | Doctor | `whytime doctor [--json]` (exit 0 ready, 3 cannot run) |
 | Record / replay | `sudo whytime --record t.wt -- CMD` (or `-p PID --record t.wt`), then `whytime report t.wt [--json]` (no privileges; exit 0, or 2 if the file cannot be replayed) |
+| Timeline / Perfetto | `--timeline` and/or `--perfetto t.json` with any of wrap, `-p PID` or `report FILE` (`cli::OutputArgs`; open `t.json` in ui.perfetto.dev or chrome://tracing) |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (prints the verifier log on load failures) |
 
 Toolchain: `rust-toolchain.toml` pins **stable** with the `x86_64-unknown-linux-musl` and
@@ -83,8 +86,10 @@ crates/whytime/            the binary
   src/classify.rs          (syscall, fd, kernel path, ready fd, fault, waker) → class + subject;
                            FdTarget: /proc fd link and maps fallback
   src/sys.rs               syscall table (libc numbers) → kind + BPF sys_flags bits
-  src/attribute.rs         critical-path walk (follows wakers) → spans that partition the window
-  src/report.rs            whytime.report/1 JSON + human rendering
+  src/attribute.rs         critical-path walk (follows wakers) → spans that partition the window;
+                           names same-comm processes apart; CPU holders of runqueue lines
+  src/report.rs            whytime.report/1 JSON + human rendering, parallelism, timeline slices
+  src/perfetto.rs          --perfetto: Chrome Trace Event JSON writer
   src/record.rs            trace files: Recorder (--record), format, parse + replay
   src/testkit.rs           #[cfg(test)] synthetic records and traces for unit tests
   src/doctor.rs            bpfdoctor Tool, probe.sched / syscalls / readiness / faults checks
@@ -137,6 +142,7 @@ flowchart LR
   RB --> TL[timeline.rs: segments + classify + procctx]
   TS -- final sweep --> TL
   TL --> AT[attribute.rs: critical path] --> RP[report.rs → stderr]
+  AT & TL --> PF[perfetto.rs → --perfetto FILE]
 ```
 
 Wrap-mode startup (`main.rs`, `spawn.rs`):
@@ -164,7 +170,10 @@ Wrap-mode startup (`main.rs`, `spawn.rs`):
    alive), wait 2 ms for in-flight programs, drain the ring, then **sweep** the `tasks` map
    to close every still-open interval at the window end. With `--record`, write the sweep
    and the end frame. Attribute, report, return COMMAND's code (with `--duration`, keep
-   forwarding signals until it exits).
+   forwarding signals until it exits). The report step is one function for all three paths
+   (`main.rs::report(trace, end, meta, &OutputArgs)`): attribute, write the `--perfetto`
+   file if asked (a failure is printed first: the report stays last on stderr), then the
+   report, human or `--json`, with the `--timeline` slices if asked.
 
 Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 
@@ -282,10 +291,10 @@ so a CPU-bound task emits nothing until it blocks or exits.
 The window is `[exec of COMMAND, exit of COMMAND's last thread)` (attach mode: `[end of
 seeding, exit of the target's last thread / deadline / signal)`); `wall_ns` is its length.
 The walk (`attribute.rs`) cuts it into **spans** (`Attribution.spans`: `start, end, class,
-subject, proc, thread, depth`), time-ordered and gap-free; report lines are the spans summed
-by `(class, subject)`, so every nanosecond is in exactly one line and shares sum to 1 (the
-e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rounding). `critical` in JSON
-is "some span came from this process". The walk:
+subject, proc, thread, depth, holder`), time-ordered and gap-free; report lines are the
+spans summed by `(class, subject)`, so every nanosecond is in exactly one line and shares
+sum to 1 (the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rounding).
+`critical` in JSON is "some span came from this process". The walk:
 
 - Follows COMMAND's **main thread**: the original leader while it lives, then whichever
   live thread outlives the rest (covers `pthread_exit` from main and multithreaded exec).
@@ -340,12 +349,44 @@ is "some span came from this process". The walk:
   followed task's lifetime keep the waiting block's line (for waits: `child`, subject the
   child). A task already on the walk stack (mutual waits, A↔B) and anything at
   `MAX_DEPTH` (64) is not followed; the block keeps its own class.
+- **Process names** (`names`/`tell_apart`): a subject that names a process (cpu, child,
+  runqueue, and blocks whose subject is the process, e.g. `sleep`) is formed after the walk
+  from the process **image** it refers to (`Proc.images`: comm and argv per fork/exec/seed;
+  a fork's first image is its parent's, so a child before its exec carries the parent's
+  name and arguments). All images named on the path are grouped by comm; a group with
+  images of two or more processes whose arguments differ (2 to `MAX_VARIANTS` = 4 distinct
+  argument lists) names each by `comm` plus the shortest common-length suffix of its
+  arguments (after `argv[0]`) that tells the lists apart: `sort -R` / `sort -n`,
+  `make … lib all` (`…` = leading arguments left out; suffixes over 40 characters keep
+  their end). Arguments unknown (empty) or cut short in kernel (256 B; equal cut bytes are
+  one variant, as a fork shares its parent's) give `comm[pid]` (the variant's lowest pid),
+  and so do suffixes that clash after shortening. Equal argument lists stay one line
+  (a loop running `sleep 1`), and more than 4 variants stay `comm` (a build's compiler
+  runs). Unique comms are unchanged.
+- **CPU holders** (`Line.held_by`, JSON `held_by` on runqueue lines): the kernel records
+  who held the CPU (`timeline::Holder`, interned per `(tgid, comm)`, `HolderId` on the
+  segment): a mixed segment's longest single preemption's holder (`cpu_segment.preempt_*`;
+  for a still-preempted thread at the sweep, `task_state.pend_*` when that stretch is
+  longer) takes **all** of its preempted part; a woken-not-running `Runq` segment's holder
+  is the task that ran just before the switch-in (`episode_record.run_holder_*`; unknown
+  for a thread still waiting at the sweep). Every runqueue span carries its holder
+  (`Span.holder`), and a line sums them per `(tgid, comm)`; a holder whose tgid is a traced
+  process alive then is named by that process's comm (the kernel's is the thread's), tgid
+  0 is `idle` (an idle CPU's swapper). Time without a recorded holder is in no entry.
+- **Parallelism** (`report::parallelism`): on-CPU time of every traced thread within the
+  window (each mixed segment's `run` clipped proportionally to the window, unlike
+  `processes[].cpu_ns`, which counts whole segments including before the window start),
+  the processes that had any, and `cpu_ns / wall_ns`.
+- **Timeline** (`report::slices`, `--timeline`): `[start, end)` in 10 equal slices (integer
+  boundaries `wall × i / 10`, so they tile it exactly), each with the spans' time inside it
+  summed by `(class, subject)`.
 
 Honesty limits (state them when presenting results):
 
 - One critical path. Work that ran in parallel with the path (threads or children other
-  than the one that ended a wait) does not appear; `processes[].cpu_ns` in JSON shows every
-  process's total CPU. Joining N parallel workers shows the one that finished the wait.
+  than the one that ended a wait) does not appear in the lines; `parallelism` (the `cpu …
+  × parallel` line) sums every traced thread's CPU in the window and `processes[].cpu_ns`
+  each process's total. Joining N parallel workers shows the one that finished the wait.
 - Following trusts the last waker: a futex is followed to the thread that woke it (the
   releasing lock holder, the signalling producer), which is the critical path only if that
   thread was what the waiter needed. A `poll`/`epoll` wait is followed only when a tracked
@@ -372,6 +413,11 @@ Honesty limits (state them when presenting results):
   that whole off-CPU gap counts as blocked (µs scale) with waker 0, so it is not followed
   (child waits fall back to the exit-time heuristic).
 - Mixed segments split on-CPU vs. preempted proportionally when clipped to a sub-interval.
+- A mixed segment's whole preempted time goes to its longest single preemption's holder,
+  and the kernel names the task that took the CPU at the preemption: a CPU-bound thread
+  that never blocks is one segment, so one preemption by an unrelated task followed by the
+  usual competitor's turn can name the unrelated task for all of it. Threads that block
+  often (most programs) have many segments, and the holders add up per segment.
 - Attach mode does not see time before the attach. Each pre-existing thread's first
   interval is classified from `/proc` at attach (state letter, `/proc/TID/syscall`, fd
   description), sampled a few µs before its entry exists: a thread that changes state in
@@ -388,10 +434,14 @@ Honesty limits (state them when presenting results):
 
 ## Report
 
-Human (stderr): `wall`, then lines ≥ 1% (at most 8, `other`-class lines such as
-`other (outside syscalls (page faults, kernel locks))` included), a final `other` collecting
-the rest, then `critical path: N processes · M events lost` and notes (one per unavailable
-optional probe set).
+Human (stderr): `wall`, then `cpu 8.62s across 7 processes · 3.8× parallel` (the
+`parallelism` object; two decimals below 1×), then lines ≥ 1% (at most 8, `other`-class
+lines such as `other (outside syscalls (page faults, kernel locks))` included; a runqueue
+line whose largest CPU holder took at least half of it ends `— mostly chrome 61%`), a final
+`other` collecting the rest, with `--timeline` a `timeline (626ms slices):` section (one
+row per slice: its range, then up to 3 of its lines ≥ 1% of it as `class subject share`),
+then `critical path: N processes · M events lost` and notes (one per unavailable optional
+probe set).
 JSON (`--json`, stderr), schema `whytime.report/1`:
 
 | Field | Type | Meaning |
@@ -402,12 +452,17 @@ JSON (`--json`, stderr), schema `whytime.report/1`:
 | `wall_ns` | u64 | window length: COMMAND's exec (attach: end of seeding) to its exit, the `--duration` deadline or (attach) the signal |
 | `ended_by` | `"exit"` \| `"duration"` \| `"interrupt"` | why the window ended (`interrupt`: attach mode only) |
 | `exit_code` | i32 \| null | COMMAND's code (128 + signal if killed); attach mode: the target's if it exited in the window; null if still running |
+| `parallelism.cpu_ns` | u64 | on-CPU time of every traced thread within the window (mixed segments clipped proportionally) |
+| `parallelism.processes` | usize | processes with on-CPU time in the window |
+| `parallelism.factor` | f64 | `cpu_ns / wall_ns`: CPUs busy on average |
 | `lines[]` | object[] | the breakdown, largest first; `share`s sum to 1 |
 | `lines[].class` | string | `cpu`, `child`, `runqueue`, `sleep`, `fsync`, `file`, `aio`, `net`, `ipc`, `futex`, `lock`, `poll`, `signal`, `tty`, `fault`, `other` (see `classify::Class`) |
 | `lines[].share` | f64 | fraction of `wall_ns` |
 | `lines[].ns` | u64 | nanoseconds |
-| `lines[].subject` | string | what within the class: comm, directory, `ip:port`, syscall |
+| `lines[].subject` | string | what within the class: comm (`comm args…` or `comm[pid]` when processes with different arguments share the comm), directory, `ip:port`, syscall |
 | `lines[].connections` | usize, optional | distinct sockets (`net` lines only) |
+| `lines[].held_by` | object[], `runqueue` lines only | who held the CPU meanwhile, largest first: `{comm, tgid, ns}` (`comm` of the holding thread, or of the process if it is traced; `idle`/0 for an idle CPU); time without a recorded holder is in none |
+| `timeline` | object[], with `--timeline` only | the window in 10 equal slices: `{start_ns, end_ns, lines: [{class, subject, ns}]}`, offsets from the window start, lines largest first summing to `end_ns - start_ns` |
 | `processes[]` | object[] | every process of the tree, in order of appearance |
 | `processes[].pid` / `.ppid` | u32 / u32 \| null | ids |
 | `processes[].comm` / `.argv` | string / string[] | last comm; argv capped at 256 B in kernel |
@@ -431,7 +486,32 @@ Exit codes: COMMAND's (128 + signal if killed); 125 whytime failed before/at sta
 doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run;
 `report`: 0, or 2 if the trace file cannot be replayed. Attach mode: 0 after the report, 1
 PID cannot be attached to (missing, thread, zombie, whytime, pid 1, another user's), 125 as
-above.
+above. A `--perfetto` file that cannot be written prints `whytime: writing the Perfetto
+trace FILE: …` before the report and leaves the exit code alone.
+
+### `--perfetto FILE` (`perfetto.rs`)
+
+Chrome Trace Event JSON (`{"displayTimeUnit":"ms","traceEvents":[…]}`), written after the
+window from the same `Trace` and `Attribution` as the report (so `report FILE --perfetto`
+writes the identical file), created like the trace file (`main.rs::create_owned`: truncated,
+`fchown`ed to `SUDO_UID`/`SUDO_GID` under sudo):
+
+- `critical path`: a synthetic process and thread, pid = tid = 4194304 (`PID_MAX_LIMIT`,
+  never a real id; `process_sort_index` −1), one `X` slice per span: name `class subject`,
+  `cat` the class, args `class, subject, pid, tid, comm, depth` and `cpu_held_by`
+  (`comm (tgid)`) on runqueue spans.
+- One track per traced thread (pid/tid as the kernel numbered them; a later lifetime with an
+  already used pid or tid gets 4194305+), `process_name` = last comm and arguments (≤ 80
+  characters), `thread_name` = comm at the thread's birth; an `X` slice per segment clipped
+  to the window: `cpu` (mixed; args `run_ns`, `preempted_ns`, `cpu_held_by`), `runqueue`
+  (`cpu_held_by`), blocked `class subject` (args `subject`, `syscall`, `waker_tid`, `waker`).
+- Process-scoped instants (`ph: i`, `s: p`): `fork` (birth inside the window of a process
+  whose first image is not an exec; args `parent`), `exec COMM` (every exec image inside
+  the window; args `comm`, `argv`), `exit` (args `code`).
+- Timestamps are integer microseconds from the window start: each slice spans
+  `[floor(start µs), floor(end µs))`, so slices of one track never overlap (viewers drop or
+  mis-nest overlapping `X` events, and float µs round differently per field), the critical
+  path's add up to `wall_ns / 1000`, and stretches inside one microsecond are left out.
 
 ## Trace files (`--record` / `report`)
 
@@ -439,7 +519,11 @@ above.
 the normal run, everything the report is computed from; `whytime report FILE [--json]` feeds
 it through the same `Trace::seed` → `Trace::ingest` → `sweep` → `attribute` → `Report` code
 and prints the identical report (byte for byte: the e2e suite compares the JSON, for both
-modes). Replay needs no BPF, no privileges and none of the traced processes. The format
+modes, with `--timeline`, and the `--perfetto` files). Parallelism, process names, CPU
+holders, the timeline and the Perfetto file derive from records already in the file (the
+holders travel in `cpu_segment`/`episode_record`/`task_state`), so they need no frame of
+their own and files recorded by any whytime with the same `VERSION` and ABI hash replay with
+them. Replay needs no BPF, no privileges and none of the traced processes. The format
 (versioned, little-endian frames) is documented in `record.rs`'s module doc. Contents:
 
 - preamble: magic `WHYTRACE`, format version, `whytime_bpf::ABI_HASH`;
@@ -489,9 +573,15 @@ and attach-seeding tests feed records like the ring buffer would and assert on s
 lines; follow-the-waker tests in `attribute.rs` push `Proc`/`Thread`/`Seg`s into such a
 trace directly and check that the spans tile the window. `classify.rs` tests build
 `SysDetail`s (kernel paths rooted, truncated, anonymous inodes) with an in-memory `FdTarget`.
-`record.rs` tests round-trip a recorded run (wrap and attach) to the identical JSON report and
-reject damaged files. `snapshot.rs` tests read this process's own `/proc` (threads blocked on
-a socket, a pipe and an eventfd).
+`record.rs` tests round-trip a recorded run (wrap and attach) to the identical JSON report
+(with `--timeline`) and reject damaged files. `snapshot.rs` tests read this process's own
+`/proc` (threads blocked on a socket, a pipe and an eventfd). `attribute.rs` also tests
+process naming (`tell_apart`: suffix length, elision, cut and unknown arguments, the
+variant cap) and runqueue `held_by` from records carrying holders; `timeline.rs` that
+holders reach segments (idle CPUs merged, the sweep's pending holder); `report.rs` the
+timeline slicing and rendering and the `mostly HOLDER` threshold; `perfetto.rs` writes a
+testkit trace and checks the JSON (disjoint slices per track, the critical path summing to
+the window, names, instants, holders).
 
 ## Privileges
 
@@ -560,6 +650,12 @@ Targets (not benchmarked unless noted):
 - Ring traffic: one 592-byte record per block cycle of a tracked thread; CPU-bound threads
   emit nothing (on-CPU accumulates in kernel). Measured with 424-byte records (before
   feat/wake): a pipe ping-pong (~200 k episodes in 1.8 s) loses none with the 4 MiB ring.
+- After the window (user space, once): naming, holders, parallelism and the timeline are
+  linear in segments and spans. Measured on a 24 MB trace (`dd bs=4k count=3000000 | cat`,
+  8.7 s, ~110 k segments), best of 3: `whytime report` 0.29 s, with `--timeline` 0.29 s,
+  with `--perfetto` 0.36 s (a 14.8 MB file, ~130 B per slice). serde_json writes a few
+  bytes at a time, and musl's `memcpy` per piece cost 0.55 s here until `perfetto::Chunk`
+  copied short pieces inline.
 
 ## e2e suite
 
@@ -609,9 +705,13 @@ Targets (not benchmarked unless noted):
     FILE and blocking FIFO reads → `poll` subject `woken by wt-fifo-writer` ≥ 0.35 and
     `ipc` subject `woken by wt-fifo-writer` ≥ 0.35 (the out-of-tree writer is not followed,
     so the FIFO wait keeps its classified subject)
-18. `record-replay`: `--json --record F -- wt-child 300`, then unprivileged
-    `whytime report F --json` → JSON identical to the live report (every field), human
-    replay exits 0, F belongs to the invoking user; F cut in half → exit 2, "truncated"
+18. `record-replay`: `--json --timeline --perfetto P --record F -- wt-child 300` → the
+    timeline's slices tile `[0, wall_ns)` and each slice's lines sum to its length; P is
+    Chrome Trace Event JSON whose `critical path` track's slices sum to `wall_ns / 1000` µs
+    with no overlapping slices on any track; then unprivileged `whytime report F --json
+    --timeline --perfetto P2` → JSON identical to the live report (every field) and P2
+    byte-identical to P, human replay exits 0, F and P belong to the invoking user; F cut
+    in half → exit 2, "truncated"
 
 Attach scenarios run an `sh` script (`attach_cmd`): start the target in the background,
 wait 0.3 s, `sudo -n whytime --json -p $!` with the scenario's flags, then print `target
@@ -633,10 +733,22 @@ with whytime's status (must be 0):
 25. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
     process"
 26. `attach-record`: `sh -c 'while :; do "$0" "$1" 20; done' wt-fsync DIR` (seeds, then
-    fork/exec/exit, fsync records and file lookups in the window), `--duration 1s --record
-    F` → `ended_by` duration, target alive, `quality.events` > 0, then the `record-replay`
-    checks: unprivileged `whytime report F --json` identical to the live report, human
-    replay exits 0, F owned by the invoking user, F cut in half → exit 2, "truncated"
+    fork/exec/exit, fsync records and file lookups in the window), `--duration 1s
+    --timeline --perfetto P --record F` → `ended_by` duration, target alive,
+    `quality.events` > 0, then the `record-replay` checks (timeline, Perfetto file, identical
+    replay of both, owners, truncation)
+
+More wrap-mode scenarios:
+
+27. `parallelism`: `wt-threads 4 600` → `parallelism.factor` ≥ 3, `parallelism.processes`
+    = 1
+28. `same-comm`: `sh -c '"$0" 400; "$0" 250; exit 0' wt-burn` (two runs with different
+    arguments, one after the other) → lines with subject `wt-burn 400` ≥ 0.45 and
+    `wt-burn 250` ≥ 0.25 in total, none named plain `wt-burn`
+29. `held-by`: `sh` pins `$WORK/wt-hog` (a symlink to `wt-burn`, so its comm differs) and
+    the traced `taskset -c CPU wt-burn 1500 5` (naps 1 ms every 5 ms, so its time is many
+    segments) to the last CPU of its affinity list → `runqueue` ≥ 0.2, and summed over the
+    runqueue lines' `held_by`, `wt-hog` holds the most
 
 ## Gotchas
 
@@ -700,3 +812,16 @@ with whytime's status (must be 0):
   `PATH` inlined) hangs the guest with no output; the guest's default PATH finds a system
   cargo without the musl target; the guest root is read-only virtiofs, so put
   `WHYTIME_E2E_DIR` on a mounted ext4 image (`/dev/vda`). vng returns the guest's exit code.
+- Report options live in `cli::OutputArgs`, flattened into `RunArgs` and `Sub::Report`, and
+  reach `main.rs::report` as one `&OutputArgs`: an option that changes the output goes there,
+  so wrap, attach and replay all take it (and clap keeps it out of COMMAND's words).
+- Spans name process **images**, not processes: a fork's first image is a copy of its
+  parent's current one (`exec: false`, same comm, same `argv` `Arc`), so a child before its
+  exec carries the parent's comm and arguments, and naming groups it with the parent.
+  Keep `images[0]` on every new `Proc` (`comm_at`/`comm` index it).
+- Chrome/Perfetto JSON importers mis-nest or drop `X` slices of one track that overlap even
+  by a rounding error: derive `ts` and `dur` from integer boundaries (floor of both ends in
+  µs), never from separately rounded floats.
+- The kernel's CPU holder is the task that took the CPU at a preemption (`pend_*`), kept for
+  the segment's longest wait: test contention with a workload that blocks often (`wt-burn
+  MS EVERY_MS`), since a never-blocking thread is one segment and one holder.

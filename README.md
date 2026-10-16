@@ -4,11 +4,12 @@
 
 ```
 $ sudo whytime -- sh -c 'sleep 0.5; dd if=/dev/zero of=$HOME/.cache/wt-demo bs=4k count=2000 oflag=dsync 2>/dev/null'
-wall 13.7s
+wall 16.3s
+cpu 356ms across 3 processes · 0.02× parallel
   94%  fsync on ~/.cache
-   4%  timer sleep (sleep)
+   3%  timer sleep (sleep)
    2%  waiting on child: dd
-  <1%  other
+   1%  other
 critical path: 3 processes · 0 events lost
 ```
 
@@ -35,7 +36,12 @@ $ whytime -p 4242 --duration 10s   # ... or after 10 s
 $ whytime doctor                   # can it run here? exact fixes if not
 $ whytime --record ci.wt -- make   # also save a trace file...
 $ whytime report ci.wt [--json]    # ...and print the same report from it later, offline
+$ whytime --timeline -- make       # add the window in 10 slices, each with its top lines
+$ whytime --perfetto t.json -- make    # also write every thread's timeline for ui.perfetto.dev
 ```
+
+`--json`, `--timeline` and `--perfetto FILE` work alike in wrap mode, with `-p PID` and with
+`whytime report FILE`.
 
 whytime exits with the command's exit code (125 if tracing could not start, 126/127 if the
 command is not executable / not found).
@@ -45,6 +51,62 @@ what whytime read from `/proc` when it attached), so `whytime report` reproduces
 exactly, offline and without privileges (attach it to a bug report or a CI artifact). It
 exits 2 if the file is damaged or was recorded by a whytime with a different record layout.
 Under `sudo`, the file belongs to you.
+
+## Parallelism, same-named processes, CPU holders, timeline
+
+The second line says how much CPU the whole tree used in the window and how many CPUs that
+kept busy on average, including work beside the critical path. Processes that share a name
+but not their arguments get lines of their own, named by the shortest distinguishing tail
+of their arguments (more than four variants, like a build's compiler runs, stay one line):
+
+```
+$ sudo whytime -- sh -c 'seq 1 300000 | sort -R | sort -n | tail -1'
+300000
+wall 6.69s
+cpu 6.72s across 5 processes · 1.0× parallel
+  93%  waiting on child: sort -R
+   5%  waiting on child: sort -n
+   1%  other
+critical path: 5 processes · 0 events lost
+```
+
+Waiting for a CPU says who held it when one task did most of the holding, and `--timeline`
+shows when each line happened (here a busy `wt-hog` and the whole pipeline share CPU 21):
+
+```
+$ taskset -c 21 ./wt-hog 8000 &
+$ sudo whytime --timeline -- taskset -c 21 sh -c 'seq 1 300000 | sort -n | md5sum'
+daef482d6c698625ab13d987d14e8781  -
+wall 519ms
+cpu 270ms across 4 processes · 0.52× parallel
+  43%  waiting for a CPU (sort)
+  40%  waiting on child: sort
+   5%  waiting for a CPU (md5sum) — mostly sort 81%
+   4%  waiting for a CPU (seq) — mostly sort 72%
+   2%  waiting on child: seq
+   2%  waiting on child: md5sum
+   2%  waiting for a CPU (sh) — mostly wt-hog 53%
+   1%  other
+timeline (52ms slices):
+     0–52ms  child sort 27% · runqueue seq 20% · runqueue sh 16%
+   52–104ms  child sort 100%
+  104–156ms  runqueue sort 85% · child sort 15%
+  156–207ms  runqueue sort 56% · runqueue seq 18% · child sort 17%
+  207–259ms  child sort 100%
+  259–311ms  runqueue sort 82% · child sort 18%
+  311–363ms  runqueue sort 59% · child sort 28% · runqueue sh 5%
+  363–415ms  child sort 54% · runqueue sort 46%
+  415–467ms  runqueue sort 54% · runqueue md5sum 21% · child sort 17%
+  467–519ms  runqueue sort 33% · child sort 27% · runqueue md5sum 25%
+critical path: 4 processes · 0 events lost
+```
+
+In JSON these are `parallelism`, the line subjects, `held_by: [{comm, tgid, ns}]` on
+runqueue lines and (with `--timeline`) `timeline`. `--perfetto FILE` writes a Chrome Trace
+Event file (open it in [ui.perfetto.dev](https://ui.perfetto.dev) or chrome://tracing): one
+track per traced thread with its on-CPU, runqueue and blocked stretches (named by class and
+subject; syscall, waker and CPU holder in the arguments), fork/exec/exit markers, and a
+`critical path` track with the stretches the report adds up.
 
 ## Attaching to a running process
 
@@ -56,11 +118,12 @@ Ctrl-C; then it reports and exits 0. PID itself is never signalled.
 $ bash -c 'while true; do sleep 0.2; dd if=/dev/zero of=/dev/null bs=1M count=3000 2>/dev/null; done' &
 $ sudo whytime -p $! --duration 3s
 wall 3.00s
-  55%  waiting on child: dd
-  44%  timer sleep (sleep)
+cpu 1.37s across 18 processes · 0.46× parallel
+  54%  timer sleep (sleep)
+  45%  waiting on child: dd
    1%  other
-critical path: 16 processes · 0 events lost
-note: attached to running pid 1414887: time before attach is not covered, and each pre-existing thread's first interval is classified from /proc
+critical path: 18 processes · 0 events lost
+note: attached to running pid 2158752: time before attach is not covered, and each pre-existing thread's first interval is classified from /proc
 note: --duration elapsed; the command was still running
 ```
 
@@ -123,7 +186,7 @@ code may be distributed under the GPL). The vendored libbpf headers in
 
 ## Status: MVP
 
-Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, and trace
-files for both (`--record`, `whytime report`). Not yet: flamegraphs, hostnames for network
-peers (DNS correlation). The attribution model, its limits, and the developer guide are in
-[AGENTS.md](AGENTS.md).
+Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, trace files
+for both (`--record`, `whytime report`), timeline and Perfetto export. Not yet:
+flamegraphs, hostnames for network peers (DNS correlation). The attribution model, its
+limits, and the developer guide are in [AGENTS.md](AGENTS.md).

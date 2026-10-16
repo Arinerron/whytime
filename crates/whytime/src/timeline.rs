@@ -8,7 +8,7 @@
 //! [`ProcSeed`]s, what `/proc` showed of the running tree.
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
 use procctx::{Config, ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable, StartClock};
@@ -49,9 +49,12 @@ pub enum SegKind {
         run: u64,
         /// Preempted (runnable, off-CPU) nanoseconds.
         rq: u64,
+        /// Who held the CPU during the longest single preemption.
+        holder: Option<HolderId>,
     },
-    /// Woken, waiting to be scheduled.
-    Runq,
+    /// Woken, waiting to be scheduled; the task that ran on the CPU just before it, when
+    /// known.
+    Runq(Option<HolderId>),
     /// Blocked on something.
     Blocked(Box<Block>),
 }
@@ -68,7 +71,22 @@ pub struct Block {
     pub waker_tgid: u32,
     /// `comm` of the waker when it is a process-context task outside the traced tree.
     pub waker_comm: Option<Arc<str>>,
+    /// Name of the syscall it blocked in, when it was in one whytime knows.
+    pub syscall: Option<&'static str>,
 }
+
+/// A task that held a CPU while a tracked thread waited for it, as the kernel saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holder {
+    /// Thread-group id; 0 for an idle CPU.
+    pub tgid: u32,
+    /// `comm` of the holding thread; `idle` for an idle CPU.
+    pub comm: Arc<str>,
+}
+
+/// A [`Holder`] interned in a [`Trace`] ([`Trace::holder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HolderId(NonZeroU32);
 
 /// A half-open interval `[start, end)` of `CLOCK_MONOTONIC` nanoseconds on one thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +114,31 @@ pub struct Thread {
     pub segs: Vec<Seg>,
 }
 
+/// One program a process ran: inherited at its fork, started by an exec, or found by attach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// When it began: the fork, exec or seeding time.
+    pub from: u64,
+    /// `comm`.
+    pub comm: Arc<str>,
+    /// NUL-separated arguments (at most 256 bytes from an exec record).
+    pub argv: Arc<[u8]>,
+    /// The kernel cut `argv` short.
+    pub argv_truncated: bool,
+    /// It began with an exec.
+    pub exec: bool,
+}
+
+impl Image {
+    /// The arguments after `argv[0]`.
+    pub fn args(&self) -> impl Iterator<Item = &[u8]> {
+        self.argv
+            .split(|&b| b == 0)
+            .filter(|arg| !arg.is_empty())
+            .skip(1)
+    }
+}
+
 /// One process lifetime in the traced tree.
 #[derive(Debug)]
 pub struct Proc {
@@ -106,8 +149,8 @@ pub struct Proc {
     pub birth: u64,
     /// Exit time of the whole thread group.
     pub death: Option<u64>,
-    /// `comm` history: each entry holds from its timestamp on.
-    pub comms: Vec<(u64, Arc<str>)>,
+    /// Programs it ran, in time order; each holds from its `from` on, the first from birth.
+    pub images: Vec<Image>,
     /// Threads, the original leader first.
     pub threads: Vec<ThreadId>,
     /// Child processes.
@@ -117,15 +160,21 @@ pub struct Proc {
 }
 
 impl Proc {
+    /// Index into `images` of the one running at `ts`.
+    pub fn image_at(&self, ts: u64) -> usize {
+        self.images
+            .partition_point(|image| image.from <= ts)
+            .saturating_sub(1)
+    }
+
     /// `comm` at time `ts`.
     pub fn comm_at(&self, ts: u64) -> &Arc<str> {
-        let i = self.comms.partition_point(|(from, _)| *from <= ts);
-        &self.comms[i.saturating_sub(1)].1
+        &self.images[self.image_at(ts)].comm
     }
 
     /// The latest `comm`.
     pub fn comm(&self) -> &Arc<str> {
-        &self.comms[self.comms.len() - 1].1
+        &self.images[self.images.len() - 1].comm
     }
 }
 
@@ -179,6 +228,10 @@ pub struct Trace {
     classifier: Classifier,
     /// Interned waker `comm`s.
     comms: HashMap<[u8; 16], Arc<str>>,
+    /// Interned CPU holders; [`HolderId`] `n` is entry `n - 1`.
+    holders: Vec<Holder>,
+    /// `(tgid, raw comm)` → its interned holder.
+    holder_ids: HashMap<(u32, [u8; 16]), HolderId>,
 }
 
 impl Trace {
@@ -197,7 +250,14 @@ impl Trace {
             live_threads: HashMap::new(),
             classifier,
             comms: HashMap::new(),
+            holders: Vec::new(),
+            holder_ids: HashMap::new(),
         }
+    }
+
+    /// The CPU holder `id` names.
+    pub fn holder(&self, id: HolderId) -> &Holder {
+        &self.holders[id.0.get() as usize - 1]
     }
 
     /// Starts an attached trace: adds the processes and threads that existed before attach
@@ -211,7 +271,14 @@ impl Trace {
             } else {
                 self.live_procs.get(&seed.ppid).copied()
             };
-            let proc = self.new_proc(seed.key, parent, seed.birth, Arc::from(seed.comm.as_str()));
+            let image = Image {
+                from: seed.birth,
+                comm: Arc::from(seed.comm.as_str()),
+                argv: Arc::from(seed.argv.as_slice()),
+                argv_truncated: false,
+                exec: false,
+            };
+            let proc = self.new_proc(seed.key, parent, seed.birth, image);
             if root && self.root.is_none() {
                 self.root = Some(proc);
             }
@@ -265,12 +332,26 @@ impl Trace {
             return;
         }
         let parent = self.live_procs.get(&r.hdr.tgid).copied();
-        let comm = parent.map_or_else(|| Arc::from("?"), |p| Arc::clone(self.procs[p].comm()));
+        // The child runs its parent's program until it execs.
+        let image = match parent {
+            Some(p) => Image {
+                from: ts,
+                exec: false,
+                ..self.procs[p].images[self.procs[p].images.len() - 1].clone()
+            },
+            None => Image {
+                from: ts,
+                comm: Arc::from("?"),
+                argv: Arc::from([]),
+                argv_truncated: false,
+                exec: false,
+            },
+        };
         let key = ProcKey {
             pid: r.child_tgid,
             start: r.child_start,
         };
-        let proc = self.new_proc(key, parent, ts, comm);
+        let proc = self.new_proc(key, parent, ts, image);
         self.new_thread(r.child_tid, proc, ts);
         self.table.on_fork(ForkEvent {
             ts_ns: ts,
@@ -282,19 +363,27 @@ impl Trace {
 
     fn on_exec(&mut self, r: &ExecRecord) {
         let ExecRecord { hdr, seg, .. } = *r;
-        let comm: Arc<str> = Arc::from(String::from_utf8_lossy(cstr(&r.comm)).as_ref());
+        let argv_len = usize::try_from(r.argv_len).map_or(0, |n| n.min(r.argv.len()));
+        let argv = &r.argv[..argv_len];
+        let image = Image {
+            from: hdr.ts,
+            comm: Arc::from(String::from_utf8_lossy(cstr(&r.comm)).as_ref()),
+            argv: Arc::from(argv),
+            argv_truncated: argv_len == r.argv.len(),
+            exec: true,
+        };
         let key = ProcKey {
             pid: hdr.tgid,
             start: r.start,
         };
         let (proc, key) = if let Some(&proc) = self.live_procs.get(&hdr.tgid) {
-            self.procs[proc].comms.push((hdr.ts, Arc::clone(&comm)));
+            self.procs[proc].images.push(image);
             // Keep the known key: one seeded at attach comes from /proc at tick precision.
             (proc, self.procs[proc].key)
         } else {
             // The wrapped command (forked before tracking began), or a process whose fork
             // record was lost: its timeline starts here.
-            let proc = self.new_proc(key, None, hdr.ts, Arc::clone(&comm));
+            let proc = self.new_proc(key, None, hdr.ts, image);
             if hdr.tgid == self.root_pid && self.root.is_none() {
                 self.root = Some(proc);
                 self.window.start = Some(hdr.ts);
@@ -311,8 +400,6 @@ impl Trace {
         let thread = self.thread(hdr.tid, proc, seg.start);
         self.push_mixed(thread, &seg, hdr.ts);
 
-        let argv_len = usize::try_from(r.argv_len).map_or(0, |n| n.min(r.argv.len()));
-        let argv = &r.argv[..argv_len];
         self.table.on_exec(ExecEvent {
             ppid: Some(r.ppid),
             comm: Some(cstr(&r.comm)),
@@ -354,9 +441,11 @@ impl Trace {
             waker_tid: r.waker_tid,
             waker_tgid: r.waker_tgid,
             waker_comm,
+            syscall: self.classifier.syscall_name(r.sys.nr),
         };
         self.push_block(thread, block_ts, wake_ts, block);
-        self.push(thread, wake_ts, run_ts, SegKind::Runq);
+        let holder = self.intern_holder(r.run_holder_tgid, &r.run_holder_comm);
+        self.push(thread, wake_ts, run_ts, SegKind::Runq(holder));
     }
 
     fn on_exit(&mut self, r: &ExitRecord) {
@@ -392,11 +481,19 @@ impl Trace {
             let open = |extra_run: bool| {
                 let since = end.saturating_sub(state.last_ts);
                 let (run, rq) = if extra_run { (since, 0) } else { (0, since) };
-                CpuSegment {
+                let mut seg = CpuSegment {
                     run_ns: state.seg.run_ns + run,
                     rq_ns: state.seg.rq_ns + rq,
                     ..state.seg
+                };
+                // Still preempted: the task that took the CPU holds it, as the kernel's
+                // `note_preemption` would have recorded at the switch-in.
+                if rq > seg.preempt_max_ns && state.pend_comm[0] != 0 {
+                    seg.preempt_max_ns = rq;
+                    seg.preempt_tgid = state.pend_tgid;
+                    seg.preempt_comm = state.pend_comm;
                 }
+                seg
             };
             match state.state {
                 ST_RUNNING => self.push_mixed(thread, &open(true), end),
@@ -426,9 +523,11 @@ impl Trace {
                         waker_tid: state.waker_tid,
                         waker_tgid: state.waker_tgid,
                         waker_comm,
+                        syscall: self.classifier.syscall_name(state.sys.nr),
                     };
                     self.push_block(thread, state.block_ts, wake, block);
-                    self.push(thread, wake, end, SegKind::Runq);
+                    // Woken but not yet run: who holds the CPU is not known.
+                    self.push(thread, wake, end, SegKind::Runq(None));
                 }
                 _ => {}
             }
@@ -440,14 +539,14 @@ impl Trace {
         key: ProcKey,
         parent: Option<ProcId>,
         birth: u64,
-        comm: Arc<str>,
+        image: Image,
     ) -> ProcId {
         let id = self.procs.len();
         self.procs.push(Proc {
             key,
             birth,
             death: None,
-            comms: vec![(birth, comm)],
+            images: vec![image],
             threads: Vec::new(),
             children: Vec::new(),
             cpu_ns: 0,
@@ -484,15 +583,17 @@ impl Trace {
     fn push_mixed(&mut self, thread: ThreadId, seg: &CpuSegment, end: u64) {
         let proc = self.threads[thread].proc;
         self.procs[proc].cpu_ns += seg.run_ns;
-        self.push(
-            thread,
-            seg.start,
-            end,
-            SegKind::Mixed {
-                run: seg.run_ns,
-                rq: seg.rq_ns,
-            },
-        );
+        let holder = if seg.rq_ns > 0 && seg.preempt_max_ns > 0 {
+            self.intern_holder(seg.preempt_tgid, &seg.preempt_comm)
+        } else {
+            None
+        };
+        let kind = SegKind::Mixed {
+            run: seg.run_ns,
+            rq: seg.rq_ns,
+            holder,
+        };
+        self.push(thread, seg.start, end, kind);
     }
 
     /// Appends `block` over `[start, end)`.
@@ -510,6 +611,27 @@ impl Trace {
             .entry(*raw)
             .or_insert_with(|| Arc::from(String::from_utf8_lossy(cstr(raw)).as_ref()));
         Some(Arc::clone(comm))
+    }
+
+    /// The CPU holder `(tgid, comm)` from a kernel record, interned; `None` when the comm is
+    /// empty (nothing recorded). Every idle task (tgid 0, `swapper/N`) is one holder, `idle`.
+    fn intern_holder(&mut self, tgid: u32, raw: &[u8; 16]) -> Option<HolderId> {
+        if raw[0] == 0 {
+            return None;
+        }
+        let key = if tgid == 0 { (0, [0; 16]) } else { (tgid, *raw) };
+        if let Some(&id) = self.holder_ids.get(&key) {
+            return Some(id);
+        }
+        let comm = if tgid == 0 {
+            Arc::from("idle")
+        } else {
+            Arc::from(String::from_utf8_lossy(cstr(raw)).as_ref())
+        };
+        self.holders.push(Holder { tgid, comm });
+        let id = HolderId(NonZeroU32::new(u32::try_from(self.holders.len()).ok()?)?);
+        self.holder_ids.insert(key, id);
+        Some(id)
     }
 
     /// Appends a segment, trimming any overlap with the previous one; empty segments are
@@ -564,7 +686,7 @@ mod tests {
         let segs = &thread.segs;
         assert!(matches!(segs[0].kind, SegKind::Mixed { run: 300, rq: 100, .. }));
         assert_eq!(blocked_class(&segs[1]), Some(Class::Sleep));
-        assert_eq!(segs[2].kind, SegKind::Runq);
+        assert_eq!(segs[2].kind, SegKind::Runq(None));
         assert!(matches!(segs[3].kind, SegKind::Mixed { run: 900, rq: 0, .. }));
         assert_eq!(t.procs[0].cpu_ns, 1_200);
         assert_eq!(
@@ -593,7 +715,7 @@ mod tests {
         );
         assert_eq!(blocked_class(&thread.segs[1]), Some(Class::Sleep));
         assert_eq!(blocked_class(&thread.segs[3]), Some(Class::Sleep));
-        assert!(thread.segs.iter().all(|s| s.kind != SegKind::Runq));
+        assert!(thread.segs.iter().all(|s| !matches!(s.kind, SegKind::Runq(_))));
     }
 
     #[test]
@@ -681,11 +803,68 @@ mod tests {
             spans(woken),
             [(1_100, 1_500), (1_500, 9_000), (9_000, 10_000)]
         );
-        assert_eq!(woken.segs[2].kind, SegKind::Runq);
+        assert_eq!(woken.segs[2].kind, SegKind::Runq(None));
         assert_eq!(spans(running), [(1_200, 10_000)]);
         assert!(matches!(running.segs[0].kind, SegKind::Mixed { run: 800, rq: 0, .. }));
         assert_eq!(spans(preempted), [(1_300, 10_000)]);
         assert!(matches!(preempted.segs[0].kind, SegKind::Mixed { run: 300, rq: 500, .. }));
         assert_eq!(t.procs[0].cpu_ns, 500 + 400 + 800 + 300);
+    }
+
+    /// `comm` as the kernel's NUL-padded buffer.
+    fn comm(name: &str) -> [u8; 16] {
+        let mut raw = [0; 16];
+        raw[..name.len()].copy_from_slice(name.as_bytes());
+        raw
+    }
+
+    /// The holder `(tgid, comm)` of a mixed or runqueue segment.
+    fn holder(t: &Trace, seg: &Seg) -> Option<(u32, String)> {
+        let id = match seg.kind {
+            SegKind::Mixed { holder, .. } | SegKind::Runq(holder) => holder,
+            SegKind::Blocked(_) => None,
+        }?;
+        let holder = t.holder(id);
+        Some((holder.tgid, holder.comm.to_string()))
+    }
+
+    #[test]
+    fn cpu_holders_reach_the_segments_they_delayed() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        // Preempted for 100 ns in all, the longest stretch by tgid 777; then, woken, it ran
+        // after an idle CPU's swapper.
+        let mut preempted = seg(1_000, 300, 100);
+        (preempted.preempt_max_ns, preempted.preempt_tgid) = (60, 777);
+        preempted.preempt_comm = comm("hog");
+        let sleep = sys(SYS_nanosleep);
+        let mut first = episode(100, 100, preempted, sleep, [1_400, 2_000, 2_100]);
+        first.run_holder_comm = comm("swapper/3");
+        feed(&mut t, &first);
+        // Then a runqueue wait behind the same hog, and one behind another idle CPU.
+        let mut second = episode(100, 100, seg(2_100, 100, 0), sleep, [2_200, 2_300, 2_400]);
+        (second.run_holder_tgid, second.run_holder_comm) = (777, comm("hog"));
+        feed(&mut t, &second);
+        let mut third = episode(100, 100, seg(2_400, 100, 0), sleep, [2_500, 2_600, 2_700]);
+        third.run_holder_comm = comm("swapper/5");
+        feed(&mut t, &third);
+        // Still preempted at the sweep, behind chrome, longer than any earlier stretch.
+        let mut queued = task(100, ST_RUNNABLE, seg(2_700, 50, 0));
+        queued.last_ts = 2_750;
+        (queued.pend_tgid, queued.pend_comm) = (888, comm("chrome"));
+        t.sweep(&[(100, queued)], 3_000);
+
+        let segs = &t.threads[0].segs;
+        let hog = Some((777, "hog".to_owned()));
+        let idle = Some((0, "idle".to_owned()));
+        assert_eq!(holder(&t, &segs[0]), hog);
+        assert_eq!(holder(&t, &segs[2]), idle);
+        assert_eq!(holder(&t, &segs[5]), hog);
+        assert_eq!(holder(&t, &segs[8]), idle);
+        assert_eq!(holder(&t, &segs[9]), Some((888, "chrome".to_owned())));
+        // Never preempted: no holder.
+        assert_eq!(holder(&t, &segs[3]), None);
+        // Two idle CPUs and the hog's two waits are each one holder.
+        assert_eq!(t.holders.len(), 3);
     }
 }

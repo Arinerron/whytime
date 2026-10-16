@@ -15,6 +15,7 @@ mod cli;
 mod doctor;
 mod logger;
 mod percpu;
+mod perfetto;
 mod record;
 mod report;
 mod snapshot;
@@ -40,7 +41,7 @@ use clap::{CommandFactory as _, Parser as _};
 use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget, ProcFd};
-use crate::cli::{Cli, RunArgs, Sub};
+use crate::cli::{Cli, OutputArgs, RunArgs, Sub};
 use crate::record::{End, Header, Logged, Probes, Recorder};
 use crate::report::{EndedBy, Meta, Report};
 use crate::spawn::{Child, Credentials, StartError};
@@ -61,7 +62,7 @@ fn main() -> ExitCode {
             eprintln!("whytime: {err}");
             EXIT_SETUP
         }),
-        Some(Sub::Report { file, json }) => replay(&file, json),
+        Some(Sub::Report { file, output }) => replay(&file, &output),
         Some(Sub::Completions { shell }) => {
             // Buffered: clap_complete panics on write errors (e.g. a closed pipe).
             let mut script = Vec::new();
@@ -285,7 +286,7 @@ impl Session {
         drop(maps);
         save(recorder.as_ref(), args, &tasks, &end);
 
-        report(&trace, end.end, meta(&header, &end), args.json);
+        report(&trace, end.end, meta(&header, &end), &args.output);
         match outcome {
             Outcome::Exited(code) => code,
             Outcome::Deadline(_) => command.wait_forwarding(),
@@ -375,7 +376,6 @@ fn meta(header: &Header, end: &End) -> Meta {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect(),
-        wall_ns: 0,
         ended_by: end.ended_by,
         exit_code: end.exit_code,
         dropped: end.dropped,
@@ -386,22 +386,23 @@ fn meta(header: &Header, end: &End) -> Meta {
     }
 }
 
-/// Attributes the window `[exec, end)` and writes the report to stderr.
-fn report(trace: &Trace, end: u64, meta: Meta, json: bool) {
+/// Attributes the window `[exec, end)` and writes the report to stderr, plus the extras
+/// `output` asks for.
+fn report(trace: &Trace, end: u64, meta: Meta, output: &OutputArgs) {
     let mut err = io::stderr().lock();
-    if let Err(e) = write_report(&mut err, trace, end, meta, json).and_then(|()| err.flush()) {
+    if let Err(e) = write_report(&mut err, trace, end, meta, output).and_then(|()| err.flush()) {
         log::error!("writing the report: {e}");
     }
 }
 
-/// Attributes the window `[exec, end)` and writes the report to `w`. `meta.wall_ns` is
-/// filled in here.
+/// Attributes the window `[exec, end)`, writes the files `output` names (a failure is
+/// printed to `w` first: the report stays last) and the report, human or JSON, to `w`.
 fn write_report(
     w: &mut dyn io::Write,
     trace: &Trace,
     end: u64,
-    mut meta: Meta,
-    json: bool,
+    meta: Meta,
+    output: &OutputArgs,
 ) -> io::Result<()> {
     let (Some(root), Some(start)) = (trace.root, trace.window.start) else {
         return writeln!(
@@ -411,9 +412,18 @@ fn write_report(
         );
     };
     let end = end.max(start);
-    meta.wall_ns = end - start;
-    let report = Report::new(trace, attribute::attribute(trace, root, start, end), meta);
-    if json {
+    let attribution = attribute::attribute(trace, root, start, end);
+    if let Some(path) = &output.perfetto
+        && let Err(err) = create_owned(path, sudo_owner()).and_then(|file| {
+            let mut out = io::BufWriter::new(file);
+            perfetto::write(&mut out, trace, &attribution, (start, end))?;
+            out.flush()
+        })
+    {
+        writeln!(w, "whytime: writing the Perfetto trace {}: {err}", path.display())?;
+    }
+    let report = Report::new(trace, attribution, (start, end), meta, output.timeline);
+    if output.json {
         report.render_json(w)
     } else {
         report.render_human(w)
@@ -421,14 +431,14 @@ fn write_report(
 }
 
 /// `whytime report FILE`: replays a trace file and prints its report; returns the exit code.
-fn replay(path: &Path, json: bool) -> i32 {
+fn replay(path: &Path, output: &OutputArgs) -> i32 {
     let replayed = std::fs::read(path)
         .map_err(|err| err.to_string())
         .and_then(|bytes| record::replay(&bytes).map_err(|err| err.to_string()));
     match replayed {
         Ok(replay) => {
             let meta = meta(&replay.header, &replay.end);
-            report(&replay.trace, replay.end.end, meta, json);
+            report(&replay.trace, replay.end.end, meta, output);
             0
         }
         Err(err) => {
@@ -520,22 +530,40 @@ fn take_signals() -> io::Result<OwnedFd> {
 
 /// Under `sudo`, the invoking user's credentials: COMMAND runs as them, not as root.
 fn sudo_credentials() -> anyhow::Result<Option<Credentials>> {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(None);
-    }
-    let id = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok());
-    let (Some(uid), Some(gid)) = (id("SUDO_UID"), id("SUDO_GID")) else {
+    let Some((uid, gid)) = sudo_owner() else {
         return Ok(None);
     };
-    if uid == 0 {
-        return Ok(None);
-    }
     let groups = match std::env::var_os("SUDO_USER") {
         Some(user) => group_list(&user, gid).context("looking up the invoking user's groups")?,
         None => vec![gid],
     };
     Ok(Some(Credentials { uid, gid, groups }))
+}
+
+/// Under `sudo` (root, with `SUDO_UID`/`SUDO_GID` naming another user), that user's uid and
+/// gid.
+fn sudo_owner() -> Option<(libc::uid_t, libc::gid_t)> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let id = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok());
+    let (Some(uid), Some(gid)) = (id("SUDO_UID"), id("SUDO_GID")) else {
+        return None;
+    };
+    (uid != 0).then_some((uid, gid))
+}
+
+/// Creates (truncates) an output file for the invoking user: a regular file is handed to
+/// `owner` (uid, gid), so files written under sudo belong to whoever ran sudo.
+fn create_owned(path: &Path, owner: Option<(u32, u32)>) -> io::Result<std::fs::File> {
+    let file = std::fs::File::create(path)?;
+    if let Some((uid, gid)) = owner
+        && file.metadata()?.is_file()
+    {
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+    }
+    Ok(file)
 }
 
 fn group_list(user: &OsStr, gid: libc::gid_t) -> io::Result<Vec<libc::gid_t>> {

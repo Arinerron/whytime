@@ -25,18 +25,32 @@
 //! [`MAX_DEPTH`]: the block then keeps its own class.
 //!
 //! The walk produces [`Span`]s that partition the window in time order; report lines sum
-//! them by class and subject.
+//! them by class and subject. A subject naming a process is its `comm`, unless processes
+//! with different arguments share that `comm` on the path: then each is named by the
+//! shortest suffix of its arguments that tells them apart (`sort -R`, `sort -n`; see
+//! [`tell_apart`]). Runqueue lines say who held the CPU meanwhile ([`Line::held_by`]).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use serde::Serialize;
 
 use crate::classify::{Class, Subject};
-use crate::timeline::{Block, ProcId, Seg, SegKind, ThreadId, Trace};
+use crate::timeline::{Block, HolderId, ProcId, Seg, SegKind, ThreadId, Trace};
 
 /// Deepest follow; deeper blocks keep their own class.
 const MAX_DEPTH: u32 = 64;
 
 /// A wait retried after less than `1 / RETRY_CPU_DIVISOR` of it on-CPU continues it.
 const RETRY_CPU_DIVISOR: u64 = 8;
+
+/// Most argument variants of one `comm` named apart; more (a build's many compiler runs)
+/// stay one line.
+const MAX_VARIANTS: usize = 4;
+
+/// Longest argument suffix in a variant's name, in characters.
+const MAX_SUFFIX_CHARS: usize = 40;
 
 /// One report line before rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +63,21 @@ pub struct Line {
     pub ns: u64,
     /// Distinct sockets behind a `net` line.
     pub connections: Option<usize>,
+    /// `runqueue` lines: who held the CPU meanwhile, largest first. Time without a recorded
+    /// holder is in none of them.
+    pub held_by: Vec<Held>,
+}
+
+/// A task that held a CPU the critical path waited for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Held {
+    /// The process's `comm` for a traced holder; else the holding thread's, `idle` for an
+    /// idle CPU.
+    pub comm: String,
+    /// Thread-group id; 0 for an idle CPU.
+    pub tgid: u32,
+    /// Nanoseconds of the line.
+    pub ns: u64,
 }
 
 /// One stretch of the critical path: `[start, end)` of the window, explained by `thread`.
@@ -68,6 +97,8 @@ pub struct Span {
     pub thread: ThreadId,
     /// Follows from the wrapped command's main line to `thread` (0: the main line itself).
     pub depth: u32,
+    /// `runqueue` spans: the task the kernel saw holding the CPU, when recorded.
+    pub holder: Option<HolderId>,
 }
 
 /// The attributed window.
@@ -98,7 +129,7 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
         by_tgid: HashMap::new(),
         by_tid: HashMap::new(),
         parents: vec![None; trace.procs.len()],
-        spans: Vec::new(),
+        pieces: Vec::new(),
         sockets: HashMap::new(),
         stack: Vec::new(),
         retries: HashMap::new(),
@@ -113,22 +144,72 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
         walker.by_tid.entry(thread.tid).or_default().push(id);
     }
     walker.walk_proc(root, start, end, 0);
-    let Walker { spans, sockets, .. } = walker;
+    let pieces = std::mem::take(&mut walker.pieces);
 
-    let mut totals: HashMap<(Class, &str), u64> = HashMap::new();
+    let names = names(trace, &pieces);
+    let mut spans: Vec<Span> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let subject = match piece.subject {
+            Named::Text(text) => text,
+            Named::Image(p, i) => names[&(p, i)].clone(),
+        };
+        // Images named alike join again (one process's consecutive programs, say).
+        if let Some(last) = spans.last_mut()
+            && (last.class, last.proc, last.thread, last.depth, last.holder)
+                == (piece.class, piece.at.proc, piece.at.thread, piece.at.depth, piece.holder)
+            && last.subject == subject
+        {
+            last.end = piece.end;
+            continue;
+        }
+        spans.push(Span {
+            start: piece.start,
+            end: piece.end,
+            class: piece.class,
+            subject,
+            proc: piece.at.proc,
+            thread: piece.at.thread,
+            depth: piece.at.depth,
+            holder: piece.holder,
+        });
+    }
+
+    let mut totals: HashMap<(Class, &str), (u64, HashMap<(u32, Arc<str>), u64>)> =
+        HashMap::new();
     for span in &spans {
-        *totals.entry((span.class, &span.subject)).or_default() += span.end - span.start;
+        let len = span.end - span.start;
+        let (ns, holders) = totals.entry((span.class, &span.subject)).or_default();
+        *ns += len;
+        if let Some(holder) = span.holder {
+            *holders.entry(walker.holder_name(holder, span.start)).or_default() += len;
+        }
     }
     let mut lines: Vec<Line> = totals
         .into_iter()
-        .map(|((class, subject), ns)| Line {
-            class,
-            subject: subject.to_owned(),
-            ns,
-            connections: sockets
-                .get(subject)
-                .map(HashSet::len)
-                .filter(|_| class == Class::Net),
+        .map(|((class, subject), (ns, holders))| {
+            let mut held_by: Vec<Held> = holders
+                .into_iter()
+                .map(|((tgid, comm), ns)| Held {
+                    comm: comm.to_string(),
+                    tgid,
+                    ns,
+                })
+                .collect();
+            held_by.sort_by(|a, b| {
+                b.ns.cmp(&a.ns)
+                    .then_with(|| (&a.comm, a.tgid).cmp(&(&b.comm, b.tgid)))
+            });
+            Line {
+                class,
+                subject: subject.to_owned(),
+                ns,
+                connections: walker
+                    .sockets
+                    .get(subject)
+                    .map(HashSet::len)
+                    .filter(|_| class == Class::Net),
+                held_by,
+            }
         })
         .collect();
     lines.sort_by(|a, b| {
@@ -138,12 +219,158 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
     Attribution { lines, spans }
 }
 
+/// Names for the process images that name spans: each one's `comm`, unless processes with
+/// different arguments share it ([`tell_apart`]).
+fn names(trace: &Trace, pieces: &[Piece]) -> HashMap<(ProcId, usize), String> {
+    let images: HashSet<(ProcId, usize)> = pieces
+        .iter()
+        .filter_map(|piece| match piece.subject {
+            Named::Image(p, i) => Some((p, i)),
+            Named::Text(_) => None,
+        })
+        .collect();
+    let mut by_comm: HashMap<&str, Vec<(ProcId, usize)>> = HashMap::new();
+    for &(p, i) in &images {
+        by_comm
+            .entry(&trace.procs[p].images[i].comm)
+            .or_default()
+            .push((p, i));
+    }
+    let mut names = HashMap::with_capacity(images.len());
+    for (comm, group) in by_comm {
+        let told = tell_apart(trace, comm, &group);
+        names.extend(group.into_iter().zip(told));
+    }
+    names
+}
+
+/// What tells an image's process apart from others with the same `comm`.
+#[derive(PartialEq, Eq, Hash)]
+enum Key<'a> {
+    /// Its arguments after `argv[0]`.
+    Args(Vec<Cow<'a, str>>),
+    /// Its argument bytes, cut short in kernel: equal ones may differ beyond the cut (or be
+    /// a fork that has not exec'd yet, which inherited its parent's).
+    Cut(&'a [u8]),
+    /// Unknown arguments: the pid alone.
+    Pid(u32),
+}
+
+/// Names for `group`, images that all have `comm`. Images of one process, or whose argument
+/// lists (after `argv[0]`) are all equal, are just `comm`; so are more than
+/// [`MAX_VARIANTS`] variants. Otherwise each is `comm` plus the shortest suffix of its
+/// arguments that tells the variants apart (one length for all, at most
+/// [`MAX_SUFFIX_CHARS`] shown), or `comm[pid]` (the lowest pid of its variant) when its
+/// arguments are unknown or were cut short in kernel, or its suffix would read like another
+/// variant's.
+fn tell_apart(trace: &Trace, comm: &str, group: &[(ProcId, usize)]) -> Vec<String> {
+    let plain = || vec![comm.to_owned(); group.len()];
+    if group.iter().all(|&(p, _)| p == group[0].0) {
+        return plain();
+    }
+    let keys: Vec<Key<'_>> = group
+        .iter()
+        .map(|&(p, i)| {
+            let image = &trace.procs[p].images[i];
+            if image.argv.is_empty() {
+                Key::Pid(trace.procs[p].key.pid)
+            } else if image.argv_truncated {
+                Key::Cut(&image.argv)
+            } else {
+                Key::Args(image.args().map(String::from_utf8_lossy).collect())
+            }
+        })
+        .collect();
+    let mut lowest: HashMap<&Key<'_>, u32> = HashMap::new();
+    for (key, &(p, _)) in keys.iter().zip(group) {
+        let pid = trace.procs[p].key.pid;
+        lowest.entry(key).and_modify(|low| *low = pid.min(*low)).or_insert(pid);
+    }
+    if lowest.len() < 2 || lowest.len() > MAX_VARIANTS {
+        return plain();
+    }
+    let lists: Vec<&[Cow<'_, str>]> = lowest
+        .keys()
+        .filter_map(|key| match key {
+            Key::Args(args) => Some(args.as_slice()),
+            Key::Cut(_) | Key::Pid(_) => None,
+        })
+        .collect();
+    let longest = lists.iter().map(|args| args.len()).max().unwrap_or(0);
+    let suffix = |args: &[Cow<'_, str>], k: usize| args.len().saturating_sub(k);
+    let k = (1..=longest)
+        .find(|&k| {
+            let mut seen = HashSet::new();
+            lists.iter().all(|args| seen.insert(&args[suffix(args, k)..]))
+        })
+        .unwrap_or(longest);
+    let by_pid = |key: &Key<'_>| format!("{comm}[{}]", lowest[key]);
+    let mut names: Vec<String> = keys
+        .iter()
+        .map(|key| match key {
+            Key::Args(args) => variant(comm, &args[suffix(args, k)..], suffix(args, k) > 0),
+            Key::Cut(_) | Key::Pid(_) => by_pid(key),
+        })
+        .collect();
+    // Suffixes cut to the same characters: those variants fall back to the pid.
+    let mut owner: HashMap<&str, &Key<'_>> = HashMap::new();
+    let mut clashes = HashSet::new();
+    for (name, key) in names.iter().zip(&keys) {
+        if *owner.entry(name).or_insert(key) != key {
+            clashes.insert(name.clone());
+        }
+    }
+    for (name, key) in names.iter_mut().zip(&keys) {
+        if clashes.contains(name) {
+            *name = by_pid(key);
+        }
+    }
+    names
+}
+
+/// `comm` and the argument suffix `shown`; `elided` when arguments before it are left out.
+fn variant(comm: &str, shown: &[Cow<'_, str>], elided: bool) -> String {
+    if shown.is_empty() {
+        return comm.to_owned();
+    }
+    let tail = shown.join(" ");
+    let chars = tail.chars().count();
+    if chars > MAX_SUFFIX_CHARS {
+        let kept: String = tail.chars().skip(chars - MAX_SUFFIX_CHARS).collect();
+        format!("{comm} …{kept}")
+    } else if elided {
+        format!("{comm} … {tail}")
+    } else {
+        format!("{comm} {tail}")
+    }
+}
+
 /// The thread a span's time comes from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct At {
     proc: ProcId,
     thread: ThreadId,
     depth: u32,
+}
+
+/// A span's subject as the walk forms it.
+#[derive(Clone, PartialEq, Eq)]
+enum Named {
+    /// Final text.
+    Text(String),
+    /// The `comm` of image `.1` of process `.0`, named once every image on the path is known
+    /// ([`names`]).
+    Image(ProcId, usize),
+}
+
+/// A [`Span`] whose subject is not final yet.
+struct Piece {
+    start: u64,
+    end: u64,
+    class: Class,
+    subject: Named,
+    at: At,
+    holder: Option<HolderId>,
 }
 
 /// What explains a block.
@@ -165,7 +392,7 @@ struct Walker<'a> {
     by_tid: HashMap<u32, Vec<ThreadId>>,
     /// Parent of each process, when it was traced.
     parents: Vec<Option<ProcId>>,
-    spans: Vec<Span>,
+    pieces: Vec<Piece>,
     /// Distinct socket inodes per `net` subject.
     sockets: HashMap<String, HashSet<u64>>,
     /// Threads being walked, outermost first. Each is blocked over the interval walked inside
@@ -176,36 +403,57 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    /// Appends `[start, end)`, merged into the previous span when every field matches.
-    fn emit(&mut self, at: At, start: u64, end: u64, class: Class, subject: String) {
+    /// Appends `[start, end)`, merged into the previous piece when every field matches.
+    fn emit(&mut self, at: At, start: u64, end: u64, class: Class, subject: Named) {
+        self.emit_held(at, start, end, (class, subject), None);
+    }
+
+    /// [`emit`](Self::emit) with the CPU holder of a `runqueue` stretch.
+    fn emit_held(
+        &mut self,
+        at: At,
+        start: u64,
+        end: u64,
+        (class, subject): (Class, Named),
+        holder: Option<HolderId>,
+    ) {
         if start >= end {
             return;
         }
-        debug_assert!(self.spans.last().is_none_or(|last| last.end == start));
-        if let Some(last) = self.spans.last_mut()
-            && (last.class, last.proc, last.thread, last.depth)
-                == (class, at.proc, at.thread, at.depth)
+        debug_assert!(self.pieces.last().is_none_or(|last| last.end == start));
+        if let Some(last) = self.pieces.last_mut()
+            && (last.class, last.at, last.holder) == (class, at, holder)
             && last.subject == subject
         {
             last.end = end;
             return;
         }
-        self.spans.push(Span {
+        self.pieces.push(Piece {
             start,
             end,
             class,
             subject,
-            proc: at.proc,
-            thread: at.thread,
-            depth: at.depth,
+            at,
+            holder,
         });
     }
 
     /// Time no record accounts for (lost records, or past the last sweep).
     fn untraced(&mut self, at: At, from: u64, to: u64) {
         if from < to {
-            self.emit(at, from, to, Class::Other, "untraced".to_owned());
+            self.emit(at, from, to, Class::Other, Named::Text("untraced".to_owned()));
         }
+    }
+
+    /// The holder `id` as `(tgid, comm)` at `ts`: a traced process by its own `comm`.
+    fn holder_name(&self, id: HolderId, ts: u64) -> (u32, Arc<str>) {
+        let holder = self.trace.holder(id);
+        let procs = &self.trace.procs;
+        let comm = self
+            .process_at(holder.tgid, ts)
+            .filter(|&p| procs[p].death.is_none_or(|death| death >= ts))
+            .map_or(&holder.comm, |p| procs[p].comm_at(ts));
+        (holder.tgid, Arc::clone(comm))
     }
 
     /// Walks `[a, b)` of process `p` (which has a thread) along its main line, `depth`
@@ -292,14 +540,14 @@ impl Walker<'_> {
     fn segment(&mut self, at: At, index: usize, s0: u64, s1: u64) {
         let trace = self.trace;
         let seg = &trace.threads[at.thread].segs[index];
-        let comm = || trace.procs[at.proc].comm_at(s0).to_string();
+        let image = Named::Image(at.proc, trace.procs[at.proc].image_at(s0));
         let len = s1 - s0;
         match &seg.kind {
-            SegKind::Mixed { run, rq, .. } => {
+            &SegKind::Mixed { run, rq, holder } => {
                 let cpu = if run + rq == 0 {
                     len
                 } else {
-                    u64::try_from(u128::from(len) * u128::from(*run) / u128::from(run + rq))
+                    u64::try_from(u128::from(len) * u128::from(run) / u128::from(run + rq))
                         .unwrap_or(len)
                 };
                 let class = if at.proc == self.root {
@@ -307,15 +555,17 @@ impl Walker<'_> {
                 } else {
                     Class::Child
                 };
-                let comm = comm();
                 if cpu < len {
-                    self.emit(at, s0, s0 + cpu, class, comm.clone());
-                    self.emit(at, s0 + cpu, s1, Class::Runqueue, comm);
+                    self.emit(at, s0, s0 + cpu, class, image.clone());
+                    // Preempted: blame the longest preemption's holder for all of it.
+                    self.emit_held(at, s0 + cpu, s1, (Class::Runqueue, image), holder);
                 } else {
-                    self.emit(at, s0, s1, class, comm);
+                    self.emit(at, s0, s1, class, image);
                 }
             }
-            SegKind::Runq => self.emit(at, s0, s1, Class::Runqueue, comm()),
+            &SegKind::Runq(holder) => {
+                self.emit_held(at, s0, s1, (Class::Runqueue, image), holder);
+            }
             SegKind::Blocked(block) => self.blocked(at, index, block, s0, s1),
         }
     }
@@ -325,14 +575,15 @@ impl Walker<'_> {
     fn blocked(&mut self, at: At, index: usize, block: &Block, s0: u64, s1: u64) {
         let trace = self.trace;
         let seg = &trace.threads[at.thread].segs[index];
-        let comm = |p: ProcId| trace.procs[p].comm().to_string();
+        let latest = |p: ProcId| Named::Image(p, trace.procs[p].images.len() - 1);
         let explained = match block.what.class {
             Class::Child => {
                 let Some(child) = self.child_for(at.proc, seg, block.waker_tgid) else {
-                    self.emit(at, s0, s1, Class::Child, "unknown child".to_owned());
+                    let unknown = Named::Text("unknown child".to_owned());
+                    self.emit(at, s0, s1, Class::Child, unknown);
                     return;
                 };
-                Some((Target::Proc(child), (Class::Child, comm(child))))
+                Some((Target::Proc(child), (Class::Child, latest(child))))
             }
             class @ (Class::Futex | Class::Ipc | Class::Poll) => {
                 let waker = match self.thread_at(block.waker_tid, block.waker_tgid, seg.end) {
@@ -344,16 +595,16 @@ impl Walker<'_> {
             _ if spawns(&block.what.subject) => self
                 .process_at(block.waker_tgid, seg.end)
                 .filter(|&child| self.parents[child] == Some(at.proc))
-                .map(|child| (Target::Proc(child), (Class::Child, comm(child)))),
+                .map(|child| (Target::Proc(child), (Class::Child, latest(child)))),
             _ => None,
         };
         match explained {
             Some((target, waiting)) => self.follow(at, target, s0, s1, waiting),
             None => {
                 let (class, subject) = self.own_line(at, block, s0);
-                if let Some(socket) = block.what.socket {
+                if let (Some(socket), Named::Text(text)) = (block.what.socket, &subject) {
                     self.sockets
-                        .entry(subject.clone())
+                        .entry(text.clone())
                         .or_default()
                         .insert(socket);
                 }
@@ -365,7 +616,7 @@ impl Walker<'_> {
     /// Explains `[s0, s1)` of a block at `at` by walking `target` over it. Time outside the
     /// target's life goes to `waiting` (class and subject), and so does all of it when the
     /// target is already being walked or the walk is [`MAX_DEPTH`] deep.
-    fn follow(&mut self, at: At, target: Target, s0: u64, s1: u64, waiting: (Class, String)) {
+    fn follow(&mut self, at: At, target: Target, s0: u64, s1: u64, waiting: (Class, Named)) {
         let trace = self.trace;
         let (birth, death, busy) = match target {
             Target::Thread(t) => {
@@ -397,11 +648,11 @@ impl Walker<'_> {
         self.emit(at, hi, s1, class, subject);
     }
 
-    /// A block's own class and subject: the classified subject, or the blocked process's comm.
-    fn own_line(&self, at: At, block: &Block, ts: u64) -> (Class, String) {
+    /// A block's own class and subject: the classified subject, or the blocked process.
+    fn own_line(&self, at: At, block: &Block, ts: u64) -> (Class, Named) {
         let subject = match &block.what.subject {
-            Subject::Process => self.trace.procs[at.proc].comm_at(ts).to_string(),
-            other => other.to_string(),
+            Subject::Process => Named::Image(at.proc, self.trace.procs[at.proc].image_at(ts)),
+            other => Named::Text(other.to_string()),
         };
         (block.what.class, subject)
     }
@@ -489,7 +740,7 @@ impl Walker<'_> {
                         break;
                     }
                 }
-                SegKind::Runq => {}
+                SegKind::Runq(_) => {}
                 SegKind::Blocked(block) if block.what.class == class => {
                     waker = self.thread_at(block.waker_tid, block.waker_tgid, seg.end);
                     if waker.is_some() {
@@ -519,17 +770,29 @@ fn spawns(subject: &Subject) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use libc::{SYS_nanosleep, SYS_wait4};
     use procctx::ProcKey;
 
     use super::*;
     use crate::classify::Blocked;
     use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
-    use crate::timeline::{Proc, Thread};
+    use crate::timeline::{Image, Proc, Thread};
 
-    /// Adds process `pid` alive over `life`, `[birth, death)`.
+    /// A program `comm` with arguments `argv` (space-separated; none when empty), exec'd at
+    /// `from`.
+    fn image(from: u64, comm: &str, argv: &str) -> Image {
+        let words = argv.split(' ').filter(|arg| !arg.is_empty());
+        let argv: Vec<u8> = words.flat_map(|arg| arg.bytes().chain([0])).collect();
+        Image {
+            from,
+            comm: Arc::from(comm),
+            argv: Arc::from(argv),
+            argv_truncated: false,
+            exec: true,
+        }
+    }
+
+    /// Adds process `pid` running `comm` (argv `[comm]`) alive over `life`, `[birth, death)`.
     fn proc(
         t: &mut Trace,
         pid: u32,
@@ -542,7 +805,7 @@ mod tests {
             key: ProcKey { pid, start: 0 },
             birth: life.0,
             death: Some(life.1),
-            comms: vec![(life.0, Arc::from(comm))],
+            images: vec![image(life.0, comm, comm)],
             threads: Vec::new(),
             children: Vec::new(),
             cpu_ns: 0,
@@ -571,12 +834,13 @@ mod tests {
         let kind = SegKind::Mixed {
             run: end - start,
             rq: 0,
+            holder: None,
         };
         Seg { start, end, kind }
     }
 
     fn runq(start: u64, end: u64) -> Seg {
-        let kind = SegKind::Runq;
+        let kind = SegKind::Runq(None);
         Seg { start, end, kind }
     }
 
@@ -591,6 +855,7 @@ mod tests {
             waker_tid: waker.0,
             waker_tgid: waker.1,
             waker_comm: None,
+            syscall: None,
         };
         let kind = SegKind::Blocked(Box::new(block));
         Seg { start, end, kind }
@@ -682,7 +947,7 @@ mod tests {
         let spawn = block(5, 60, Class::Other, Subject::Syscall("clone3"), (20, 20));
         thread(&mut t, py, 10, vec![run(0, 5), spawn, run(60, 100)]);
         let child = proc(&mut t, 20, "py", (4, 90), Some(py));
-        t.procs[child].comms.push((60, Arc::from("true")));
+        t.procs[child].images.push(image(60, "true", "true"));
         thread(&mut t, child, 20, vec![run(4, 60), run(60, 90)]);
 
         let a = attribute(&t, py, 0, 100);
@@ -848,5 +1113,116 @@ mod tests {
         assert_eq!(ns(&a, Class::Child, "bash"), 2_000);
         // git's own CPU, then the wait after it exited, until make ran again.
         assert_eq!(ns(&a, Class::Child, "git"), 4_700 + 1_000);
+    }
+
+    /// A child wait of the root's main thread over `[start, end)`, ended by process `pid`.
+    fn wait(start: u64, end: u64, pid: u32) -> Seg {
+        block(start, end, Class::Child, Subject::Process, (pid, pid))
+    }
+
+    #[test]
+    fn processes_sharing_a_comm_are_told_apart_by_their_arguments() {
+        // sh runs `sort -R`, `sort -n` and `sort -R` again, one after another; tail, alone
+        // with its comm, keeps it.
+        let mut t = trace(1);
+        let sh = proc(&mut t, 10, "sh", (0, 100), None);
+        let waits = vec![wait(0, 30, 20), wait(30, 60, 30), wait(60, 90, 40), wait(90, 100, 50)];
+        thread(&mut t, sh, 10, waits);
+        for (pid, argv, life) in [
+            (20, "sort -R", (0, 30)),
+            (30, "sort -n", (30, 60)),
+            (40, "sort -R", (60, 90)),
+            (50, "tail -1", (90, 100)),
+        ] {
+            let comm = &argv[..4];
+            let p = proc(&mut t, pid, comm, life, Some(sh));
+            t.procs[p].images[0] = image(life.0, comm, argv);
+            thread(&mut t, p, pid, vec![run(life.0, life.1)]);
+        }
+
+        let a = attribute(&t, sh, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [
+                (Class::Child, "sort -R", 60),
+                (Class::Child, "sort -n", 30),
+                (Class::Child, "tail", 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn told_apart_names_use_one_shortest_suffix_or_the_pid() {
+        let mut t = trace(1);
+        let mut make = |pid: u32, argv: &str| {
+            let p = proc(&mut t, pid, "make", (0, 1), None);
+            t.procs[p].images[0] = image(0, "make", argv);
+            (p, 0)
+        };
+        // The last argument is common: two are needed, the one before them elided.
+        let sub = [make(1, "make -C lib all"), make(2, "make -C app all")];
+        let unknown = make(3, "");
+        let long = make(4, &format!("make {}", "x".repeat(50)));
+        let fleet: Vec<_> = (5..10).map(|pid| make(pid, &format!("make t{pid}"))).collect();
+        let same = [make(10, "make -j4"), make(11, "make -j4")];
+        // Arguments cut short in kernel: a fork inherits the same bytes as its parent's.
+        let cut = [make(13, "make -f a"), make(12, "make -f a"), make(14, "make -f b")];
+        for &(p, i) in &cut {
+            t.procs[p].images[i].argv_truncated = true;
+        }
+
+        assert_eq!(tell_apart(&t, "make", &sub), ["make … lib all", "make … app all"]);
+        // Unknown arguments: the pid; a suffix past MAX_SUFFIX_CHARS keeps its end.
+        assert_eq!(
+            tell_apart(&t, "make", &[sub[0], unknown, long]),
+            [
+                "make … all".to_owned(),
+                "make[3]".to_owned(),
+                format!("make …{}", "x".repeat(MAX_SUFFIX_CHARS)),
+            ]
+        );
+        // More variants than MAX_VARIANTS, or none: the comm alone.
+        assert!(tell_apart(&t, "make", &fleet).iter().all(|name| name == "make"));
+        assert_eq!(tell_apart(&t, "make", &same), ["make", "make"]);
+        assert_eq!(tell_apart(&t, "make", &cut[..2]), ["make", "make"]);
+        assert_eq!(tell_apart(&t, "make", &cut), ["make[12]", "make[12]", "make[14]"]);
+        // Two programs of one process are never split.
+        let p = sub[0].0;
+        t.procs[p].images.push(image(5, "make", "make install"));
+        assert_eq!(tell_apart(&t, "make", &[(p, 0), (p, 1)]), ["make", "make"]);
+    }
+
+    #[test]
+    fn runqueue_lines_name_who_held_the_cpu() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 200, 200));
+        feed(&mut t, &exec(1_100, 200, 200, "worker", seg(1_100, 0, 0)));
+        let comm = |name: &str| {
+            let mut raw = [0; 16];
+            raw[..name.len()].copy_from_slice(name.as_bytes());
+            raw
+        };
+        // Preempted 100 of 400 ns by an untraced chrome, then after a sleep 100 ns behind a
+        // thread of the traced worker, whose own thread name the kernel reported.
+        let mut ran = seg(1_000, 300, 100);
+        (ran.preempt_max_ns, ran.preempt_tgid, ran.preempt_comm) = (100, 999, comm("chrome"));
+        let mut slept = episode(100, 100, ran, sys(SYS_nanosleep), [1_400, 2_000, 2_100]);
+        (slept.run_holder_tgid, slept.run_holder_comm) = (200, comm("wthread"));
+        feed(&mut t, &slept);
+        feed(&mut t, &exit(3_000, 100, 100, seg(2_100, 900, 0), 0, true));
+
+        let a = attribute(&t, 0, 1_000, 3_000);
+        let runqueue = a.lines.iter().find(|l| l.class == Class::Runqueue).unwrap();
+        assert_eq!(runqueue.ns, 200);
+        let held: Vec<_> = runqueue
+            .held_by
+            .iter()
+            .map(|held| (held.comm.as_str(), held.tgid, held.ns))
+            .collect();
+        assert_eq!(held, [("chrome", 999, 100), ("worker", 200, 100)]);
+        let others = a.lines.iter().filter(|l| l.class != Class::Runqueue);
+        assert!(others.into_iter().all(|l| l.held_by.is_empty()));
     }
 }

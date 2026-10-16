@@ -351,7 +351,7 @@ impl Session {
         };
         drop(maps);
         crate::save(recorder.as_ref(), args, &tasks, &end);
-        crate::report(&trace, end.end, crate::meta(&header, &end), args.json);
+        crate::report(&trace, end.end, crate::meta(&header, &end), &args.output);
         0
     }
 

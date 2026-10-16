@@ -97,6 +97,13 @@ fn test_e2e() -> anyhow::Result<()> {
     let server_arg = server.to_string();
     let trace_file = work.join("replay.wt");
     let attach_trace = work.join("attach.wt");
+    let perfetto_file = work.join("replay.perfetto.json");
+    let attach_perfetto = work.join("attach.perfetto.json");
+    // An untraced CPU hog with its own comm: wt-burn under another name.
+    let hog = work.join("wt-hog");
+    let _ = std::fs::remove_file(&hog);
+    std::os::unix::fs::symlink(&bins["wt-burn"], &hog)
+        .with_context(|| format!("linking {}", hog.display()))?;
     // A fresh directory per run; wt-flock creates it and removes it (renamed) on success.
     let lock_dir = work.join(format!("flock-{}", std::process::id()));
     let mut lock_moved = lock_dir.clone().into_os_string();
@@ -226,13 +233,15 @@ fn test_e2e() -> anyhow::Result<()> {
             "record-replay",
             {
                 let mut cmd = Command::new("sudo");
-                cmd.arg("-n").arg(whytime).args(["--json", "--record"]);
-                cmd.arg(&trace_file).args(["--", &bin("wt-child"), "300"]);
+                cmd.arg("-n").arg(whytime).args(["--json", "--timeline", "--perfetto"]);
+                cmd.arg(&perfetto_file).arg("--record").arg(&trace_file);
+                cmd.args(["--", &bin("wt-child"), "300"]);
                 cmd
             },
             Box::new({
-                let (whytime, trace, work) = (whytime.clone(), trace_file.clone(), work.clone());
-                move |out: &Output| check_replay(out, &whytime, &trace, &work)
+                let (whytime, work) = (whytime.clone(), work.clone());
+                let files = (trace_file.clone(), perfetto_file.clone());
+                move |out: &Output| check_replay(out, &whytime, (&files.0, &files.1), &work)
             }),
         ),
         (
@@ -292,13 +301,58 @@ fn test_e2e() -> anyhow::Result<()> {
                     &bin("wt-fsync"),
                     &fsync_dir,
                 ],
-                &["--duration", "1s", "--record", &attach_trace.display().to_string()],
+                &[
+                    "--duration",
+                    "1s",
+                    "--timeline",
+                    "--perfetto",
+                    &attach_perfetto.display().to_string(),
+                    "--record",
+                    &attach_trace.display().to_string(),
+                ],
                 None,
             ),
             Box::new({
-                let (whytime, trace, work) = (whytime.clone(), attach_trace.clone(), work.clone());
-                move |out: &Output| check_attach_record(out, &whytime, &trace, &work)
+                let (whytime, work) = (whytime.clone(), work.clone());
+                let files = (attach_trace.clone(), attach_perfetto.clone());
+                move |out: &Output| {
+                    check_attach_record(out, &whytime, (&files.0, &files.1), &work)
+                }
             }),
+        ),
+        (
+            "parallelism",
+            sudo(&[&bin("wt-threads"), "4", "600"]),
+            Box::new(check_parallelism),
+        ),
+        (
+            // Two runs of one program with different arguments, one after the other.
+            "same-comm",
+            sudo(&["sh", "-c", "\"$0\" 400; \"$0\" 250; exit 0", &bin("wt-burn")]),
+            Box::new(check_same_comm),
+        ),
+        (
+            // The hog and the traced burner share one CPU; the burner naps every 5 ms, so
+            // its time is many scheduling stretches, each with its own CPU holder.
+            "held-by",
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args([
+                    "-c",
+                    "cpu=$(taskset -cp $$ | sed 's/.*[-,: ]//')\n\
+                     taskset -c \"$cpu\" \"$1\" 5000 & h=$!\n\
+                     sleep 0.3\n\
+                     sudo -n \"$2\" --json -- taskset -c \"$cpu\" \"$3\" 1500 5; s=$?\n\
+                     kill \"$h\"; wait \"$h\"\n\
+                     exit \"$s\"",
+                    "sh",
+                ])
+                .arg(&hog)
+                .arg(whytime)
+                .arg(bin("wt-burn"));
+                cmd
+            },
+            Box::new(check_held_by),
         ),
     ];
 
@@ -661,24 +715,37 @@ fn check_setcap(out: &Output) -> anyhow::Result<String> {
     ))
 }
 
-/// The `--record` run reported normally; `whytime report FILE --json`, unprivileged, prints the
-/// identical report; the file belongs to the invoking user; a cut-short copy exits 2.
+/// The `--record --timeline --perfetto P` run reported normally, with a valid timeline and
+/// Perfetto file; `whytime report FILE --json --timeline --perfetto P2`, unprivileged, prints
+/// the identical report and writes the identical file; the files written under sudo belong to
+/// the invoking user; a cut-short copy exits 2.
 fn check_replay(
     out: &Output,
     whytime: &Path,
-    trace: &Path,
+    (trace, perfetto): (&Path, &Path),
     work: &Path,
 ) -> anyhow::Result<String> {
     use std::os::unix::fs::MetadataExt as _;
 
     exited(out, 0)?;
     let live = report(out)?;
-    let replay = run(Command::new(whytime).arg("report").arg(trace).arg("--json"))?;
+    let slices = check_timeline(&live)?;
+    let tracks = check_perfetto(perfetto, &live)?;
+    let replayed_perfetto = perfetto.with_extension("replay.json");
+    let replay = run(Command::new(whytime)
+        .arg("report")
+        .arg(trace)
+        .args(["--json", "--timeline", "--perfetto"])
+        .arg(&replayed_perfetto))?;
     exited(&replay, 0)?;
     let replayed = report(&replay)?;
     ensure!(
         replayed == live,
         "the replayed report differs from the live one:\nlive: {live}\nreplayed: {replayed}"
+    );
+    ensure!(
+        std::fs::read(perfetto)? == std::fs::read(&replayed_perfetto)?,
+        "the replayed Perfetto file differs from the live one"
     );
     let human = run(Command::new(whytime).arg("report").arg(trace))?;
     exited(&human, 0)?;
@@ -686,11 +753,14 @@ fn check_replay(
         String::from_utf8_lossy(&human.stderr).starts_with("wall "),
         "the human replay does not start with the wall time"
     );
-    let owner = std::fs::metadata(trace)?.uid();
-    ensure!(
-        owner == std::fs::metadata(work)?.uid(),
-        "the trace file belongs to uid {owner}, not the invoking user"
-    );
+    for file in [trace, perfetto] {
+        let owner = std::fs::metadata(file)?.uid();
+        ensure!(
+            owner == std::fs::metadata(work)?.uid(),
+            "{} belongs to uid {owner}, not the invoking user",
+            file.display()
+        );
+    }
 
     let bytes = std::fs::read(trace).with_context(|| format!("reading {}", trace.display()))?;
     let cut = trace.with_extension("cut.wt");
@@ -703,9 +773,151 @@ fn check_replay(
         "a cut-short trace is not reported as truncated: {message}"
     );
     Ok(format!(
-        "{} bytes, {} events: the replayed report is identical; a cut-short file exits 2",
+        "{} bytes, {} events, {slices} timeline slices, {tracks} Perfetto tracks: the replayed \
+         report and Perfetto file are identical; a cut-short file exits 2",
         bytes.len(),
         live["quality"]["events"]
+    ))
+}
+
+/// `--timeline`: slices tiling `[0, wall_ns)`, each with lines adding up to its length.
+/// Returns the number of slices.
+fn check_timeline(report: &Value) -> anyhow::Result<usize> {
+    let slices = report["timeline"].as_array().context("no timeline")?;
+    ensure!(!slices.is_empty(), "an empty timeline");
+    let mut cursor = 0;
+    for slice in slices {
+        let (Some(start), Some(end)) = (slice["start_ns"].as_u64(), slice["end_ns"].as_u64())
+        else {
+            bail!("a timeline slice without start_ns/end_ns: {slice}");
+        };
+        ensure!(
+            start == cursor && end > start,
+            "timeline slice {start}..{end} does not continue at {cursor}"
+        );
+        let lines = slice["lines"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let sum: u64 = lines.iter().filter_map(|line| line["ns"].as_u64()).sum();
+        ensure!(
+            sum == end - start,
+            "timeline slice {start}..{end}: lines sum to {sum} ns"
+        );
+        cursor = end;
+    }
+    let wall = report["wall_ns"].as_u64().unwrap_or(0);
+    ensure!(cursor == wall, "the timeline ends at {cursor}, not wall_ns {wall}");
+    Ok(slices.len())
+}
+
+/// The `--perfetto` file: Chrome Trace Event JSON with a `critical path` track whose slices
+/// add up to the window (whole microseconds), and no two slices of a track overlapping.
+/// Returns the number of tracks with slices.
+fn check_perfetto(path: &Path, report: &Value) -> anyhow::Result<usize> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let json: Value = serde_json::from_slice(&bytes).context("parsing the Perfetto file")?;
+    let events = json["traceEvents"].as_array().context("no traceEvents")?;
+    let critical = events
+        .iter()
+        .find(|e| {
+            e["ph"] == "M" && e["name"] == "process_name" && e["args"]["name"] == "critical path"
+        })
+        .and_then(|e| e["pid"].as_u64())
+        .context("no critical path track")?;
+    let mut tracks: HashMap<(u64, u64), Vec<(u64, u64)>> = HashMap::new();
+    for event in events.iter().filter(|e| e["ph"] == "X") {
+        let field = |key: &str| event[key].as_u64().with_context(|| format!("{key} in {event}"));
+        let track = (field("pid")?, field("tid")?);
+        tracks.entry(track).or_default().push((field("ts")?, field("dur")?));
+    }
+    for ((pid, tid), slices) in &mut tracks {
+        slices.sort_unstable();
+        for pair in slices.windows(2) {
+            ensure!(
+                pair[0].0 + pair[0].1 <= pair[1].0,
+                "track {pid}/{tid}: slices {pair:?} overlap"
+            );
+        }
+    }
+    let path_us: u64 = tracks
+        .get(&(critical, critical))
+        .map(|slices| slices.iter().map(|&(_, dur)| dur).sum())
+        .unwrap_or(0);
+    let wall_us = report["wall_ns"].as_u64().unwrap_or(0) / 1_000;
+    ensure!(
+        path_us == wall_us,
+        "the critical path track covers {path_us} µs of the {wall_us} µs window"
+    );
+    Ok(tracks.len())
+}
+
+/// Four threads spin side by side: about four CPUs busy over the window.
+fn check_parallelism(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let parallelism = &report["parallelism"];
+    let factor = parallelism["factor"].as_f64().unwrap_or(0.0);
+    ensure!(factor >= 3.0, "parallelism factor {factor:.2} < 3");
+    ensure!(
+        parallelism["processes"] == 1,
+        "parallelism.processes = {}",
+        parallelism["processes"]
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let cpu = parallelism["cpu_ns"].as_u64().unwrap_or(0) as f64 / 1e9;
+    Ok(format!(
+        "wall {:.3}s, cpu {cpu:.3}s, {factor:.2}× parallel",
+        wall_secs(&report)
+    ))
+}
+
+/// `wt-burn 400` and `wt-burn 250` share a comm: each gets lines of its own, named by its
+/// arguments.
+fn check_same_comm(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let named = |subject: &str| {
+        lines(&report)
+            .into_iter()
+            .filter(|l| l["subject"] == subject)
+            .map(share)
+            .sum::<f64>()
+    };
+    let (long, short) = (named("wt-burn 400"), named("wt-burn 250"));
+    ensure!(long >= 0.45, "wt-burn 400 lines {long:.3} < 0.45");
+    ensure!(short >= 0.25, "wt-burn 250 lines {short:.3} < 0.25");
+    ensure!(named("wt-burn") == 0.0, "a line still names plain wt-burn");
+    Ok(format!(
+        "wt-burn 400 {:.1}%, wt-burn 250 {:.1}%",
+        long * 100.0,
+        short * 100.0
+    ))
+}
+
+/// The burner waited for its CPU behind the untraced hog: runqueue lines whose largest CPU
+/// holder is `wt-hog`.
+fn check_held_by(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let runqueue = class_share(&report, "runqueue", |_| true);
+    ensure!(runqueue >= 0.2, "runqueue share {runqueue:.3} < 0.2");
+    let mut held: HashMap<String, u64> = HashMap::new();
+    for line in lines(&report).into_iter().filter(|l| l["class"] == "runqueue") {
+        for holder in line["held_by"].as_array().into_iter().flatten() {
+            let comm = holder["comm"].as_str().unwrap_or_default().to_owned();
+            *held.entry(comm).or_default() += holder["ns"].as_u64().unwrap_or(0);
+        }
+    }
+    let total: u64 = held.values().sum();
+    let hog = held.get("wt-hog").copied().unwrap_or(0);
+    ensure!(
+        held.values().all(|&ns| ns <= hog) && hog > 0,
+        "wt-hog is not the main CPU holder: {held:?}"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let hog_share = hog as f64 / total.max(1) as f64;
+    Ok(format!(
+        "runqueue {:.1}%, {:.1}% of it held by wt-hog",
+        runqueue * 100.0,
+        hog_share * 100.0
     ))
 }
 
@@ -846,14 +1058,14 @@ fn check_attach_nopid(out: &Output) -> anyhow::Result<String> {
 fn check_attach_record(
     out: &Output,
     whytime: &Path,
-    trace: &Path,
+    files: (&Path, &Path),
     work: &Path,
 ) -> anyhow::Result<String> {
     let live = attached(out, "duration")?;
     ensure!(target_alive(out), "the target did not survive whytime");
     let events = live["quality"]["events"].as_u64().unwrap_or(0);
     ensure!(events > 0, "no records in the window: nothing to replay but the seeds");
-    check_replay(out, whytime, trace, work).map(|summary| format!("attached: {summary}"))
+    check_replay(out, whytime, files, work).map(|summary| format!("attached: {summary}"))
 }
 
 fn check_flock(out: &Output, dir: &str) -> anyhow::Result<String> {

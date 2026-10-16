@@ -34,9 +34,9 @@ pub struct Cli {
 /// Wrap and attach mode.
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Print the report as JSON (schema whytime.report/1).
-    #[arg(long)]
-    pub json: bool,
+    /// How to print the report, and what else to write.
+    #[command(flatten)]
+    pub output: OutputArgs,
 
     /// Stop observing after D (e.g. 500ms, 30s, 2m) and report; COMMAND (or PID) keeps
     /// running, and whytime still exits with COMMAND's code.
@@ -83,15 +83,34 @@ pub enum Sub {
         /// The trace file.
         #[arg(value_name = "FILE")]
         file: PathBuf,
-        /// Print the report as JSON (schema whytime.report/1).
-        #[arg(long)]
-        json: bool,
+        /// How to print the report, and what else to write.
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Print a shell completion script to stdout.
     Completions {
         /// The shell to generate for.
         shell: Shell,
     },
+}
+
+/// Report options shared by wrap mode, attach mode and `report` (replay).
+#[derive(Clone, Debug, Default, Args)]
+pub struct OutputArgs {
+    /// Print the report as JSON (schema whytime.report/1).
+    #[arg(long)]
+    pub json: bool,
+
+    /// Also write the window as a Chrome Trace Event JSON file to FILE (open it in
+    /// ui.perfetto.dev or chrome://tracing): every traced thread's on-CPU, runqueue and
+    /// blocked stretches, and the critical path.
+    #[arg(long, value_name = "FILE")]
+    pub perfetto: Option<PathBuf>,
+
+    /// Add a timeline to the report: the window in equal slices, each with its largest
+    /// lines.
+    #[arg(long)]
+    pub timeline: bool,
 }
 
 /// Parses `500ms`, `30s`, `1.5s`, `2m`, `1h`; a bare number is seconds.
@@ -135,7 +154,7 @@ mod tests {
     fn command_words_after_the_command_belong_to_it() {
         let cli = Cli::try_parse_from(["whytime", "--json", "ls", "--json", "-l"]).unwrap();
         assert!(cli.sub.is_none());
-        assert!(cli.run.json);
+        assert!(cli.run.output.json);
         assert_eq!(cli.run.command, ["ls", "--json", "-l"]);
 
         let cli = Cli::try_parse_from(["whytime", "--", "doctor"]).unwrap();
@@ -161,15 +180,37 @@ mod tests {
         let cli = Cli::try_parse_from(["whytime", "report", "t.wt", "--json"]).unwrap();
         assert!(matches!(
             cli.sub,
-            Some(Sub::Report { ref file, json: true }) if file.as_os_str() == "t.wt"
+            Some(Sub::Report { ref file, ref output }) if file.as_os_str() == "t.wt" && output.json
         ));
+    }
+
+    #[test]
+    fn report_options_parse_alike_in_every_mode_and_never_after_the_command() {
+        let extras = ["--perfetto", "t.json", "--timeline"];
+        let check = |output: &OutputArgs| {
+            assert_eq!(output.perfetto, Some(PathBuf::from("t.json")));
+            assert!(output.timeline);
+        };
+        let wrap = Cli::try_parse_from(["whytime"].into_iter().chain(extras).chain(["ls"]));
+        check(&wrap.unwrap().run.output);
+        let attach = Cli::try_parse_from(["whytime", "-p", "42"].into_iter().chain(extras));
+        check(&attach.unwrap().run.output);
+        let replay = Cli::try_parse_from(["whytime", "report", "t.wt"].into_iter().chain(extras));
+        let Some(Sub::Report { output, .. }) = replay.unwrap().sub else {
+            panic!("not the report subcommand");
+        };
+        check(&output);
+
+        let cli = Cli::try_parse_from(["whytime", "ls", "--timeline"]).unwrap();
+        assert!(!cli.run.output.timeline);
+        assert_eq!(cli.run.command, ["ls", "--timeline"]);
     }
 
     #[test]
     fn pid_replaces_the_command_and_excludes_it() {
         let cli = Cli::try_parse_from(["whytime", "-p", "42", "--json"]).unwrap();
         assert_eq!(cli.run.pid, Some(42));
-        assert!(cli.run.json);
+        assert!(cli.run.output.json);
         assert!(cli.run.command.is_empty());
         let cli = Cli::try_parse_from(["whytime", "-p", "42", "--record", "t.wt"]).unwrap();
         assert_eq!(cli.run.record, Some(PathBuf::from("t.wt")));
