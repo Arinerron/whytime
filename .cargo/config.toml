@@ -1,5 +1,6 @@
 [alias]
 # `cargo xtask test-e2e`: builds the release binaries and runs the sudo end-to-end suite;
+# `cargo xtask record-fixtures`: records the replay fixtures `cargo test` checks (sudo);
 # `cargo xtask man [DIR]`: writes the man pages.
 xtask = "run --quiet --package xtask --"
 

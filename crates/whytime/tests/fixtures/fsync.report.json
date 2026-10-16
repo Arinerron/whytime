@@ -1,0 +1,324 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-fsync",
+    "/var/tmp/whytime-fixtures/work",
+    "50"
+  ],
+  "wall_ns": 165776545,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 7112100,
+    "processes": 1,
+    "factor": 0.042901726537973146
+  },
+  "lines": [
+    {
+      "class": "fsync",
+      "share": 0.9423023142387242,
+      "ns": 156211622,
+      "subject": "/var/tmp/whytime-fixtures/work"
+    },
+    {
+      "class": "cpu",
+      "share": 0.042901726537973146,
+      "ns": 7112100,
+      "subject": "wt-fsync"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.014795959223302669,
+      "ns": 2452823,
+      "subject": "wt-fsync",
+      "held_by": [
+        {
+          "comm": "kworker/u89:28",
+          "tgid": 2502058,
+          "ns": 1380427
+        },
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 822939
+        },
+        {
+          "comm": "jbd2/nvme1n1p2-",
+          "tgid": 388,
+          "ns": 70802
+        },
+        {
+          "comm": "HeapHelper",
+          "tgid": 20888,
+          "ns": 48812
+        },
+        {
+          "comm": "migration/3",
+          "tgid": 32,
+          "ns": 30840
+        },
+        {
+          "comm": "HeapHelper",
+          "tgid": 1160007,
+          "ns": 26119
+        },
+        {
+          "comm": "migration/12",
+          "tgid": 56,
+          "ns": 25762
+        },
+        {
+          "comm": "kworker/u89:5",
+          "tgid": 2644005,
+          "ns": 18492
+        },
+        {
+          "comm": "kworker/u90:11",
+          "tgid": 2688764,
+          "ns": 17191
+        },
+        {
+          "comm": "migration/10",
+          "tgid": 50,
+          "ns": 11439
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 16577654,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15646976
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 671564
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 259114
+        }
+      ]
+    },
+    {
+      "start_ns": 16577654,
+      "end_ns": 33155309,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 14807449
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 1245741
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 524465
+        }
+      ]
+    },
+    {
+      "start_ns": 33155309,
+      "end_ns": 49732963,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15430525
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 931740
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 215389
+        }
+      ]
+    },
+    {
+      "start_ns": 49732963,
+      "end_ns": 66310618,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15777043
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 694589
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 106023
+        }
+      ]
+    },
+    {
+      "start_ns": 66310618,
+      "end_ns": 82888272,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15767374
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 710187
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 100093
+        }
+      ]
+    },
+    {
+      "start_ns": 82888272,
+      "end_ns": 99465927,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15576132
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 880690
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 120833
+        }
+      ]
+    },
+    {
+      "start_ns": 99465927,
+      "end_ns": 116043581,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15709722
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 734296
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 133636
+        }
+      ]
+    },
+    {
+      "start_ns": 116043581,
+      "end_ns": 132621236,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15906436
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 570241
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 100978
+        }
+      ]
+    },
+    {
+      "start_ns": 132621236,
+      "end_ns": 149198890,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 16014158
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 477137
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 86359
+        }
+      ]
+    },
+    {
+      "start_ns": 149198890,
+      "end_ns": 165776545,
+      "lines": [
+        {
+          "class": "fsync",
+          "subject": "/var/tmp/whytime-fixtures/work",
+          "ns": 15575807
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-fsync",
+          "ns": 917191
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-fsync",
+          "ns": 84657
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2850527,
+      "ppid": 2850405,
+      "comm": "wt-fsync",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-fsync",
+        "/var/tmp/whytime-fixtures/work",
+        "50"
+      ],
+      "cpu_ns": 7112100,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 102,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": []
+}

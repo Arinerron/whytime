@@ -1,0 +1,192 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-sleep",
+    "1000"
+  ],
+  "wall_ns": 1000183146,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 169885,
+    "processes": 1,
+    "factor": 0.0001698538919391069
+  },
+  "lines": [
+    {
+      "class": "sleep",
+      "share": 0.9998166285837414,
+      "ns": 999999741,
+      "subject": "wt-sleep"
+    },
+    {
+      "class": "cpu",
+      "share": 0.0001698538919391069,
+      "ns": 169885,
+      "subject": "wt-sleep"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.000013517524319490983,
+      "ns": 13520,
+      "subject": "wt-sleep",
+      "held_by": [
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 13520
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 100018314,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 99909417
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-sleep",
+          "ns": 108897
+        }
+      ]
+    },
+    {
+      "start_ns": 100018314,
+      "end_ns": 200036629,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018315
+        }
+      ]
+    },
+    {
+      "start_ns": 200036629,
+      "end_ns": 300054943,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018314
+        }
+      ]
+    },
+    {
+      "start_ns": 300054943,
+      "end_ns": 400073258,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018315
+        }
+      ]
+    },
+    {
+      "start_ns": 400073258,
+      "end_ns": 500091573,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018315
+        }
+      ]
+    },
+    {
+      "start_ns": 500091573,
+      "end_ns": 600109887,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018314
+        }
+      ]
+    },
+    {
+      "start_ns": 600109887,
+      "end_ns": 700128202,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018315
+        }
+      ]
+    },
+    {
+      "start_ns": 700128202,
+      "end_ns": 800146516,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018314
+        }
+      ]
+    },
+    {
+      "start_ns": 800146516,
+      "end_ns": 900164831,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 100018315
+        }
+      ]
+    },
+    {
+      "start_ns": 900164831,
+      "end_ns": 1000183146,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-sleep",
+          "ns": 99943807
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-sleep",
+          "ns": 60988
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-sleep",
+          "ns": 13520
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2849802,
+      "ppid": 2849795,
+      "comm": "wt-sleep",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-sleep",
+        "1000"
+      ],
+      "cpu_ns": 169885,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 3,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": []
+}

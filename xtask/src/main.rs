@@ -4,6 +4,12 @@
 //! `sudo -n` with `--json` and asserts on the report. Every report must have shares summing to
 //! 1 ± 0.001 and no lost records.
 //!
+//! `cargo xtask record-fixtures` builds the same binaries, records small traces of
+//! representative workloads under `sudo -n` in a neutral directory ([`FIXTURE_ROOT`]), checks
+//! each live report like the e2e suite and its replay against it, and replaces the replay
+//! fixtures in [`FIXTURE_DIR`] (the traces and their expected `whytime report` outputs, which
+//! `cargo test` compares byte for byte).
+//!
 //! `cargo xtask man [DIR]` writes `whytime.1` and one page per subcommand to DIR (default
 //! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
 
@@ -23,7 +29,24 @@ use anyhow::{Context as _, bail, ensure};
 use clap::CommandFactory as _;
 use serde_json::Value;
 
-const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask man [DIR]";
+const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask record-fixtures | cargo xtask man [DIR]";
+/// What each command does, after [`USAGE`] for `--help`.
+const HELP: &str = concat!(
+    "  test-e2e         build release whytime and the testbins, run the sudo end-to-end suite\n",
+    "  record-fixtures  build them, record the replay fixtures (sudo) into\n",
+    "                   crates/whytime/tests/fixtures with their expected `whytime report`\n",
+    "                   outputs, which `cargo test` compares byte for byte\n",
+    "  man [DIR]        write the man pages to DIR (default $CARGO_TARGET_DIR/man)",
+);
+/// Where `record-fixtures` runs its workloads: nothing under it names this machine's user
+/// (unlike `$HOME` or the cargo target directory, which recorded paths would show), and it is
+/// on the root filesystem, not tmpfs, so fsync waits.
+const FIXTURE_ROOT: &str = "/var/tmp/whytime-fixtures";
+/// The replay fixtures, relative to the workspace root.
+const FIXTURE_DIR: &str = "crates/whytime/tests/fixtures";
+/// `PATH` of the recorded runs (their whole environment is this and a `HOME` under
+/// [`FIXTURE_ROOT`]).
+const FIXTURE_PATH: &str = "PATH=/usr/local/bin:/usr/bin:/bin";
 /// Delay of the scenario-6 server between accept and reply.
 const SERVER_DELAY: Duration = Duration::from_millis(300);
 /// Seconds the attach scenarios let their target run before whytime attaches.
@@ -65,7 +88,12 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("test-e2e") => test_e2e(),
+        Some("record-fixtures") => record_fixtures(),
         Some("man") => man(args.next().map(PathBuf::from)),
+        Some("help" | "--help" | "-h") => {
+            println!("{USAGE}\n{HELP}");
+            Ok(())
+        }
         _ => bail!("{USAGE}"),
     }
 }
@@ -90,11 +118,7 @@ fn man(dir: Option<PathBuf>) -> anyhow::Result<()> {
 
 fn test_e2e() -> anyhow::Result<()> {
     let bins = build()?;
-    let ok = Command::new("sudo")
-        .args(["-n", "true"])
-        .status()
-        .context("running sudo")?;
-    ensure!(ok.success(), "the e2e suite needs passwordless `sudo -n`");
+    need_sudo("the e2e suite")?;
 
     // WHYTIME_E2E_DIR lets parallel checkouts run the suite without sharing files.
     let work = match std::env::var_os("WHYTIME_E2E_DIR") {
@@ -103,13 +127,7 @@ fn test_e2e() -> anyhow::Result<()> {
             .join(".cache/whytime-e2e"),
     };
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let fs_type = run(Command::new("stat").args(["-f", "-c", "%T"]).arg(&work))?;
-    let fs_type = String::from_utf8_lossy(&fs_type.stdout).trim().to_owned();
-    ensure!(
-        fs_type != "tmpfs",
-        "{} is on tmpfs; fsync would not wait",
-        work.display()
-    );
+    not_tmpfs(&work)?;
 
     let server = slow_server()?;
     let whytime = &bins["whytime"];
@@ -545,6 +563,316 @@ fn test_e2e() -> anyhow::Result<()> {
 }
 
 type Check = Box<dyn Fn(&Output) -> anyhow::Result<String>>;
+
+/// Fails unless `sudo -n` works: `what` needs it.
+fn need_sudo(what: &str) -> anyhow::Result<()> {
+    let ok = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .context("running sudo")?;
+    ensure!(ok.success(), "{what} needs passwordless `sudo -n`");
+    Ok(())
+}
+
+/// Fails if `dir` is on tmpfs, where fsync does not wait.
+fn not_tmpfs(dir: &Path) -> anyhow::Result<()> {
+    let fs_type = run(Command::new("stat").args(["-f", "-c", "%T"]).arg(dir))?;
+    let fs_type = String::from_utf8_lossy(&fs_type.stdout).trim().to_owned();
+    ensure!(
+        fs_type != "tmpfs",
+        "{} is on tmpfs; fsync would not wait",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// A replay fixture: a recorded run, and the outputs its replay is compared on.
+struct Fixture {
+    /// File stem in [`FIXTURE_DIR`].
+    name: &'static str,
+    /// The recording run: whytime with `--json --timeline --record LIVE/NAME.wt`, plus
+    /// `--folded LIVE/NAME.folded` / `--perfetto LIVE/NAME.perfetto.json` if wanted below.
+    command: Command,
+    /// Recorded with stack capture; the replay writes `--folded` too.
+    folded: bool,
+    /// The replay writes `--perfetto` too.
+    perfetto: bool,
+    /// The e2e check of the live run: the trace shows what the fixture is for.
+    check: Check,
+}
+
+/// `cargo xtask record-fixtures`: records every [`Fixture`] in [`FIXTURE_ROOT`], checks the
+/// live reports and the replays, makes sure no file names this machine or user, then
+/// replaces the contents of [`FIXTURE_DIR`].
+fn record_fixtures() -> anyhow::Result<()> {
+    let bins = build()?;
+    need_sudo("recording fixtures")?;
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("workspace root")?;
+    let root = Path::new(FIXTURE_ROOT);
+    // The recorded runs are root's, and so are their files: a previous run's need sudo.
+    remove_fixture_root()?;
+    let (bin_dir, home, work, live) = (
+        root.join("bin"),
+        root.join("home"),
+        root.join("work"),
+        root.join("live"),
+    );
+    for dir in [&bin_dir, &home, &work, &live] {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    not_tmpfs(root)?;
+    // Copies under the root: the recorded argv, exec and mapped file paths name them there.
+    let mut neutral = HashMap::new();
+    for (name, path) in &bins {
+        if name == "whytime" || name.starts_with("wt-") {
+            let copy = bin_dir.join(name);
+            std::fs::copy(path, &copy).with_context(|| format!("copying to {}", copy.display()))?;
+            neutral.insert(name.clone(), copy);
+        }
+    }
+    let whytime = &neutral["whytime"];
+    let home_env = format!("HOME={}", home.display());
+    // `sudo -n` runs this as root with nothing of the invoking user's: no SUDO_* variables
+    // (whytime would run COMMAND as that user and record their passwd home directory; root's
+    // is recorded instead), an environment of FIXTURE_PATH and a HOME under the root only.
+    let wrapper = bin_dir.join("whytime-fixture");
+    let script = format!(
+        "#!/bin/sh\nexec env -i {FIXTURE_PATH} {home_env} {} \"$@\"\n",
+        whytime.display()
+    );
+    std::fs::write(&wrapper, script).with_context(|| format!("writing {}", wrapper.display()))?;
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+
+    let server = slow_server()?;
+    let mut dns = dns_server(&neutral["wt-dns"], root)?;
+    let bin = |name: &str| neutral[name].display().to_string();
+    let in_live = |file: &str| live.join(file).display().to_string();
+    let record = |name: &str, extra: &[&str], args: &[&str]| {
+        let trace = in_live(&format!("{name}.wt"));
+        let mut flags = vec!["--timeline", "--record", &trace];
+        flags.extend(extra);
+        traced_with(&wrapper, &flags, args)
+    };
+    let plain = |name: &'static str, args: &[&str], check: Check| Fixture {
+        name,
+        command: record(name, &[], args),
+        folded: false,
+        perfetto: false,
+        check,
+    };
+    let work_arg = work.display().to_string();
+    let lock_dir = work.join("flock").display().to_string();
+    let port = server.port().to_string();
+    let server_arg = server.to_string();
+    let flame_folded = live.join("flame.folded");
+    let fixtures = vec![
+        plain("sleep", &[&bin("wt-sleep"), "1000"], Box::new(check_sleep)),
+        plain("cpu-burn", &[&bin("wt-burn"), "1000"], Box::new(check_burn)),
+        Fixture {
+            name: "child",
+            command: record(
+                "child",
+                &["--perfetto", &in_live("child.perfetto.json")],
+                &[&bin("wt-child"), "1000"],
+            ),
+            folded: false,
+            perfetto: true,
+            check: Box::new(check_child),
+        },
+        plain("lock-holder", &[&bin("wt-futex"), "500"], Box::new(check_lock_holder)),
+        plain("threads-cpu", &[&bin("wt-threads"), "4", "600"], Box::new(check_threads_cpu)),
+        plain("fsync", &[&bin("wt-fsync"), &work_arg, "50"], Box::new(check_fsync)),
+        plain("flock-path", &[&bin("wt-flock"), &lock_dir, "600"], {
+            let subject = lock_dir.clone();
+            Box::new(move |out: &Output| check_flock(out, &subject))
+        }),
+        plain(
+            "poll-ready",
+            &[&bin("wt-poll"), &server_arg, "4"],
+            Box::new(move |out: &Output| check_poll(out, server)),
+        ),
+        plain(
+            "dns-udp",
+            &[&bin("wt-dns"), "udp", DNS_SERVER, DNS_NAME, &port, "3"],
+            Box::new(move |out: &Output| check_host(out, DNS_NAME, server)),
+        ),
+        Fixture {
+            name: "attach-spawn",
+            // The target runs with the recorded runs' environment too.
+            command: attach_cmd(
+                &wrapper,
+                &["env", "-i", FIXTURE_PATH, &home_env, &bin("wt-attach"), "1500", "800"],
+                &["--timeline", "--record", &in_live("attach-spawn.wt")],
+                None,
+            ),
+            folded: false,
+            perfetto: false,
+            check: Box::new(check_attach_spawn),
+        },
+        Fixture {
+            name: "flame",
+            command: record(
+                "flame",
+                &["--folded", &in_live("flame.folded")],
+                &[&bin("wt-flame"), "600", "400"],
+            ),
+            folded: true,
+            perfetto: false,
+            check: Box::new(move |out: &Output| {
+                exited(out, 0)?;
+                let report = report(out)?;
+                #[allow(clippy::cast_precision_loss)]
+                let wall_us = report["wall_ns"].as_u64().unwrap_or(0) as f64 / 1e3;
+                through_functions(&report, &folded(&flame_folded)?, wall_us)
+            }),
+        },
+    ];
+
+    let recorded = (|| {
+        let mut files = Vec::new();
+        for mut fixture in fixtures {
+            let out = run(fixture.command.current_dir(&work).stdin(Stdio::null()))?;
+            let summary = (fixture.check)(&out).with_context(|| {
+                format!(
+                    "fixture {}: the live run\n---- stderr ----\n{}",
+                    fixture.name,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })?;
+            let replayed = replay_fixture(whytime, &live, &fixture, &out)
+                .with_context(|| format!("fixture {}", fixture.name))?;
+            let bytes: usize = replayed.iter().map(|(_, data)| data.len()).sum();
+            println!("recorded {}: {summary}; {bytes} bytes", fixture.name);
+            std::io::stdout().flush()?;
+            files.extend(replayed);
+        }
+        anyhow::Ok(files)
+    })();
+    // Closing its stdin ends the DNS server; kill it should it linger.
+    drop(dns.stdin.take());
+    let _ = dns.kill();
+    let _ = dns.wait();
+    let files = recorded?;
+    check_private(&files)?;
+
+    let dest = workspace.join(FIXTURE_DIR);
+    std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
+    for entry in std::fs::read_dir(&dest)? {
+        let path = entry?.path();
+        if path.is_file() && !path.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b".")) {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    for (name, data) in &files {
+        let path = dest.join(name);
+        std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))?;
+    }
+    remove_fixture_root()?;
+    let total: usize = files.iter().map(|(_, data)| data.len()).sum();
+    println!("{} files, {total} bytes in {}", files.len(), dest.display());
+    Ok(())
+}
+
+/// `sudo -n rm -rf` [`FIXTURE_ROOT`].
+fn remove_fixture_root() -> anyhow::Result<()> {
+    let removed = run(Command::new("sudo").args(["-n", "rm", "-rf", FIXTURE_ROOT]))?;
+    ensure!(removed.status.success(), "removing {FIXTURE_ROOT} failed");
+    Ok(())
+}
+
+/// Replays the trace `live/NAME.wt` as the fixture test does (`whytime report TRACE --json
+/// --timeline`, with `--folded`/`--perfetto` if the fixture has them), checks that it
+/// reproduces the live run `out` and its files, and returns the fixture's files (name,
+/// contents): the trace, `NAME.report.json` (the replay's stderr) and the replayed
+/// `NAME.folded` / `NAME.perfetto.json`.
+fn replay_fixture(
+    whytime: &Path,
+    live: &Path,
+    fixture: &Fixture,
+    out: &Output,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let name = fixture.name;
+    let trace = live.join(format!("{name}.wt"));
+    let mut extensions = Vec::new();
+    let mut cmd = Command::new(whytime);
+    cmd.arg("report").arg(&trace).args(["--json", "--timeline"]);
+    for (wanted, flag, extension) in [
+        (fixture.folded, "--folded", "folded"),
+        (fixture.perfetto, "--perfetto", "perfetto.json"),
+    ] {
+        if wanted {
+            cmd.arg(flag).arg(live.join(format!("{name}.replay.{extension}")));
+            extensions.push(extension);
+        }
+    }
+    let replay = run(cmd.stdin(Stdio::null()))?;
+    exited(&replay, 0)?;
+    ensure!(
+        report(&replay)? == report(out)?,
+        "the replayed report differs from the live one"
+    );
+    let read = |path: PathBuf| std::fs::read(&path).with_context(|| format!("reading {}", path.display()));
+    let mut files = vec![
+        (format!("{name}.wt"), read(trace.clone())?),
+        (format!("{name}.report.json"), replay.stderr),
+    ];
+    for extension in extensions {
+        let replayed = read(live.join(format!("{name}.replay.{extension}")))?;
+        ensure!(
+            replayed == read(live.join(format!("{name}.{extension}")))?,
+            "the replayed {extension} file differs from the live one"
+        );
+        files.push((format!("{name}.{extension}"), replayed));
+    }
+    Ok(files)
+}
+
+/// Fails if a fixture file names this machine or its user: the user name or the host name
+/// as a word, or the home directory, in a run of 4 or more printable ASCII bytes (what
+/// `strings` shows; the other bytes of a trace are binary numbers).
+fn check_private(files: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
+    let mut words: Vec<String> = ["USER", "LOGNAME", "SUDO_USER"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .collect();
+    words.extend(std::fs::read_to_string("/proc/sys/kernel/hostname").ok());
+    let mut paths: Vec<String> = std::env::var("HOME").ok().into_iter().collect();
+    for value in words.iter_mut().chain(&mut paths) {
+        *value = value.trim().to_owned();
+    }
+    words.retain(|word| !word.is_empty());
+    paths.retain(|path| path.len() > 1);
+    for (name, data) in files {
+        let printable = data.split(|b| !(0x20..=0x7e).contains(b)).filter(|run| run.len() >= 4);
+        for text in printable {
+            let shown = || String::from_utf8_lossy(text).into_owned();
+            for word in &words {
+                ensure!(
+                    !has_word(text, word.as_bytes()),
+                    "{name} names {word:?}: {}",
+                    shown()
+                );
+            }
+            for path in &paths {
+                let found = text.windows(path.len()).any(|w| w == path.as_bytes());
+                ensure!(!found, "{name} names {path}: {}", shown());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `text` has `word` with no ASCII letter or digit right before or after it.
+fn has_word(text: &[u8], word: &[u8]) -> bool {
+    let alnum = |at: Option<&u8>| at.is_some_and(u8::is_ascii_alphanumeric);
+    (0..=text.len().saturating_sub(word.len())).any(|at| {
+        text[at..].starts_with(word)
+            && !alnum(at.checked_sub(1).and_then(|before| text.get(before)))
+            && !alnum(text.get(at + word.len()))
+    })
+}
 
 /// Builds the release `whytime` and the testbins; returns executable name → path. The
 /// testbins get frame pointers and keep their symbols (profile `e2e`), so flamegraph checks

@@ -1,0 +1,3 @@
+# Byte-for-byte expectations: never convert line endings; traces are binary.
+* -text
+*.wt binary

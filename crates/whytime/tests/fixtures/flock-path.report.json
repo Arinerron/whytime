@@ -1,0 +1,293 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-flock",
+    "/var/tmp/whytime-fixtures/work/flock",
+    "600"
+  ],
+  "wall_ns": 601912481,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 2594720,
+    "processes": 3,
+    "factor": 0.004310792817735241
+  },
+  "lines": [
+    {
+      "class": "lock",
+      "share": 0.9943709158607728,
+      "ns": 598524265,
+      "subject": "/var/tmp/whytime-fixtures/work/flock"
+    },
+    {
+      "class": "cpu",
+      "share": 0.002244809740039267,
+      "ns": 1351179,
+      "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600"
+    },
+    {
+      "class": "sleep",
+      "share": 0.0016638598328051616,
+      "ns": 1001498,
+      "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600"
+    },
+    {
+      "class": "child",
+      "share": 0.0007423238661834627,
+      "ns": 446814,
+      "subject": "wt-flock …tmp/whytime-fixtures/work/flock/lock 600"
+    },
+    {
+      "class": "child",
+      "share": 0.00046894192911743263,
+      "ns": 282262,
+      "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600"
+    },
+    {
+      "class": "child",
+      "share": 0.0003371005028221038,
+      "ns": 202905,
+      "subject": "wt-flock …var/tmp/whytime-fixtures/work/flock/lock"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.0001508176069869533,
+      "ns": 90779,
+      "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+      "held_by": [
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 90779
+        }
+      ]
+    },
+    {
+      "class": "runqueue",
+      "share": 0.00002123066127283046,
+      "ns": 12779,
+      "subject": "wt-flock …var/tmp/whytime-fixtures/work/flock/lock",
+      "held_by": [
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 12779
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 60191248,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 57581788
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+          "ns": 1006246
+        },
+        {
+          "class": "sleep",
+          "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+          "ns": 1001498
+        },
+        {
+          "class": "child",
+          "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+          "ns": 282262
+        },
+        {
+          "class": "child",
+          "subject": "wt-flock …tmp/whytime-fixtures/work/flock/lock 600",
+          "ns": 246723
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+          "ns": 72731
+        }
+      ]
+    },
+    {
+      "start_ns": 60191248,
+      "end_ns": 120382496,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 120382496,
+      "end_ns": 180573744,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 180573744,
+      "end_ns": 240764992,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 240764992,
+      "end_ns": 300956240,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 300956240,
+      "end_ns": 361147488,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 361147488,
+      "end_ns": 421338736,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 421338736,
+      "end_ns": 481529984,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 481529984,
+      "end_ns": 541721232,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 60191248
+        }
+      ]
+    },
+    {
+      "start_ns": 541721232,
+      "end_ns": 601912481,
+      "lines": [
+        {
+          "class": "lock",
+          "subject": "/var/tmp/whytime-fixtures/work/flock",
+          "ns": 59412493
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+          "ns": 344933
+        },
+        {
+          "class": "child",
+          "subject": "wt-flock …var/tmp/whytime-fixtures/work/flock/lock",
+          "ns": 202905
+        },
+        {
+          "class": "child",
+          "subject": "wt-flock …tmp/whytime-fixtures/work/flock/lock 600",
+          "ns": 200091
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-flock /var/tmp/whytime-fixtures/work/flock 600",
+          "ns": 18048
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-flock …var/tmp/whytime-fixtures/work/flock/lock",
+          "ns": 12779
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2850695,
+      "ppid": 2850659,
+      "comm": "wt-flock",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-flock",
+        "/var/tmp/whytime-fixtures/work/flock",
+        "600"
+      ],
+      "cpu_ns": 1351179,
+      "exit_code": 0,
+      "critical": true
+    },
+    {
+      "pid": 2850696,
+      "ppid": 2850695,
+      "comm": "wt-flock",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-flock",
+        "hold",
+        "/var/tmp/whytime-fixtures/work/flock/lock",
+        "600"
+      ],
+      "cpu_ns": 675116,
+      "exit_code": 0,
+      "critical": true
+    },
+    {
+      "pid": 2850697,
+      "ppid": 2850695,
+      "comm": "wt-flock",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-flock",
+        "wait",
+        "/var/tmp/whytime-fixtures/work/flock/lock"
+      ],
+      "cpu_ns": 568425,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 17,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": []
+}

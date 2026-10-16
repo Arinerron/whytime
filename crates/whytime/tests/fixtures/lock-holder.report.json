@@ -1,0 +1,197 @@
+{
+  "schema": "whytime.report/1",
+  "command": [
+    "/var/tmp/whytime-fixtures/bin/wt-futex",
+    "500"
+  ],
+  "wall_ns": 500568157,
+  "ended_by": "exit",
+  "exit_code": 0,
+  "parallelism": {
+    "cpu_ns": 596101,
+    "processes": 1,
+    "factor": 0.0011908488218118915
+  },
+  "lines": [
+    {
+      "class": "sleep",
+      "share": 0.9988329121782311,
+      "ns": 499983950,
+      "subject": "wt-futex"
+    },
+    {
+      "class": "cpu",
+      "share": 0.0010487522880925084,
+      "ns": 524972,
+      "subject": "wt-futex"
+    },
+    {
+      "class": "runqueue",
+      "share": 0.00011833553367638605,
+      "ns": 59235,
+      "subject": "wt-futex",
+      "held_by": [
+        {
+          "comm": "idle",
+          "tgid": 0,
+          "ns": 59235
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "start_ns": 0,
+      "end_ns": 50056815,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 49670119
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-futex",
+          "ns": 359609
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-futex",
+          "ns": 27087
+        }
+      ]
+    },
+    {
+      "start_ns": 50056815,
+      "end_ns": 100113631,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056816
+        }
+      ]
+    },
+    {
+      "start_ns": 100113631,
+      "end_ns": 150170447,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056816
+        }
+      ]
+    },
+    {
+      "start_ns": 150170447,
+      "end_ns": 200227262,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056815
+        }
+      ]
+    },
+    {
+      "start_ns": 200227262,
+      "end_ns": 250284078,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056816
+        }
+      ]
+    },
+    {
+      "start_ns": 250284078,
+      "end_ns": 300340894,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056816
+        }
+      ]
+    },
+    {
+      "start_ns": 300340894,
+      "end_ns": 350397709,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056815
+        }
+      ]
+    },
+    {
+      "start_ns": 350397709,
+      "end_ns": 400454525,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056816
+        }
+      ]
+    },
+    {
+      "start_ns": 400454525,
+      "end_ns": 450511341,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 50056816
+        }
+      ]
+    },
+    {
+      "start_ns": 450511341,
+      "end_ns": 500568157,
+      "lines": [
+        {
+          "class": "sleep",
+          "subject": "wt-futex",
+          "ns": 49859305
+        },
+        {
+          "class": "cpu",
+          "subject": "wt-futex",
+          "ns": 165363
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-futex",
+          "ns": 32148
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "pid": 2850229,
+      "ppid": 2850200,
+      "comm": "wt-futex",
+      "argv": [
+        "/var/tmp/whytime-fixtures/bin/wt-futex",
+        "500"
+      ],
+      "cpu_ns": 596101,
+      "exit_code": 0,
+      "critical": true
+    }
+  ],
+  "quality": {
+    "events": 8,
+    "dropped": 0,
+    "syscalls": true,
+    "readiness": true,
+    "faults": true,
+    "dns": true
+  },
+  "notes": []
+}
