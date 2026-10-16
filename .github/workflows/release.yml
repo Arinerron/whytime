@@ -18,17 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: whytime
-      - uses: ./whytime/.github/actions/setup
+          submodules: recursive
+      - uses: ./.github/actions/setup
 
       - name: Build static binaries
-        working-directory: whytime
         run: |
           cargo build --release -p whytime --target x86_64-unknown-linux-musl
           cargo build --release -p whytime --target aarch64-unknown-linux-musl
 
       - name: Package
-        working-directory: whytime
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -55,6 +53,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            whytime/dist/*.tar.gz
-            whytime/dist/*.tar.gz.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           generate_release_notes: true

@@ -6,8 +6,8 @@ fsync, network peers, locks, ...). COMMAND's output passes through; whytime exit
 COMMAND's code. `whytime -p PID` does the same for a running process and its descendants,
 from the attach until PID exits, `--duration` elapses or Ctrl-C.
 
-**Name.** The repo directory is `why`, but the crate and binary are `whytime`: the `why`
-crate name is taken on crates.io. Use `whytime` everywhere in code, docs and output.
+**Name.** The crate and binary are `whytime` (https://github.com/Arinerron/whytime): the
+`why` crate name is taken on crates.io. Use `whytime` everywhere in code, docs and output.
 
 **Status: MVP.** Wrap mode and attach mode (`-p PID`), plus trace files for both:
 `--record FILE` saves a run and `whytime report FILE` replays it offline into the identical
@@ -15,7 +15,10 @@ report. Flamegraphs and hostname/DNS correlation for network subjects are later 
 
 ## Commands
 
-All cargo invocations need these, because `/tmp` has a tight quota:
+The shared tracekit crates are a git submodule: clone with `--recursive`, or run
+`git submodule update --init` once (else cargo fails with "failed to read
+`…/tracekit/crates/wire/Cargo.toml`"). All cargo invocations need these, because `/tmp` has
+a tight quota:
 
 ```sh
 mkdir -p ~/.cache/whytime-tmp ~/.cache/whytime-target
@@ -50,8 +53,8 @@ verifier only lets GPL-compatible programs call GPL-only helpers (`bpf_probe_rea
 
 CI (`.github/workflows/ci.yml`): x86_64 build + unit tests, aarch64 check/build/qemu smoke,
 and `cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: `v*` tags publish static
-x86_64/aarch64 tarballs with completions and man pages. Both check out
-`Arinerron/tracekit` next to the repo via `.github/actions/setup` (its `tracekit-*` inputs).
+x86_64/aarch64 tarballs with completions and man pages. Both check out with
+`submodules: recursive`; `.github/actions/setup` installs clang and the toolchain.
 
 `crates/whytime/src/cli.rs` is also compiled into xtask (`#[path]`, for `cargo xtask man`):
 keep it self-contained (std, clap, clap_complete only; no `crate::` items).
@@ -62,7 +65,8 @@ tracekit block (`clippy::all` + `pedantic`) in the root `Cargo.toml`.
 ## Layout
 
 ```
-Cargo.toml                 workspace, shared deps, lint block, release profile (lto, strip, abort)
+Cargo.toml                 workspace (excludes tracekit/), shared deps, lint block, release
+                           profile (lto, strip, abort)
 crates/whytime-abi/        wire! records + wire_consts! shared with C; feature std → header(),
                            feature user → aya::Pod impls
 crates/whytime-bpf/        build.rs + bpf/ ; exports OBJECT (the .o) and ABI_HASH
@@ -93,12 +97,18 @@ crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child,
                            wt-attach, wt-threads, wt-vfork, wt-flock, wt-syscalls, wt-poll,
                            wt-fault, wt-fifo
 xtask/                     cargo xtask test-e2e | man [DIR]
-.github/                   workflows ci.yml, release.yml; actions/setup (tracekit checkout, clang, rustup)
+.github/                   workflows ci.yml, release.yml; actions/setup (clang, rustup)
+tracekit/                  git submodule, Arinerron/tracekit pinned at a release tag (v0.1.0)
 LICENSE                    MIT
 ```
 
-Shared foundation (path deps, **do not modify**; report gaps to the orchestrator):
-`../tracekit/crates/{wire,procctx,bpfdoctor}`.
+Shared foundation: the `tracekit` submodule (https://github.com/Arinerron/tracekit), path
+deps `tracekit/crates/{wire,procctx,bpfdoctor}`, pinned at a release tag. **Do not modify**
+it here; report gaps to the orchestrator. It is a workspace of its own, hence
+`exclude = ["tracekit"]` in the root `Cargo.toml` (without it cargo cannot inherit the
+crates' `workspace.package` fields). Bump it to a new release with
+`git -C tracekit fetch --tags && git -C tracekit checkout vX.Y.Z && git add tracekit`, then
+build and commit the new gitlink.
 
 ## How the BPF object is built
 

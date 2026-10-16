@@ -75,18 +75,20 @@ own processes.
 One static binary (Rust, musl; the BPF side is C CO-RE compiled by clang — no nightly) for
 x86_64 and aarch64. Release tarballs on
 [GitHub releases](https://github.com/Arinerron/whytime/releases) contain the binary,
-completions and man pages. To build from source, check out
-[tracekit](https://github.com/Arinerron/tracekit) next to the repository (it is a `../tracekit`
-path dependency):
+completions and man pages. To build from source, clone with submodules (the shared
+[tracekit](https://github.com/Arinerron/tracekit) crates are pinned as the `tracekit`
+submodule):
 
 ```sh
-git clone https://github.com/Arinerron/whytime
-git clone https://github.com/Arinerron/tracekit
+git clone --recursive https://github.com/Arinerron/whytime
 cd whytime
 cargo build --release -p whytime
 sudo install target/x86_64-unknown-linux-musl/release/whytime /usr/local/bin/
 sudo setcap cap_bpf,cap_perfmon+ep /usr/local/bin/whytime   # or run it with sudo
 ```
+
+Already cloned without `--recursive` (cargo fails with "failed to read
+`…/tracekit/crates/wire/Cargo.toml`")? Run `git submodule update --init`.
 
 For arm64: `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (links with
 the toolchain's bundled `rust-lld`; no cross compiler needed) →
