@@ -3,6 +3,14 @@
 //! `cargo xtask test-e2e` builds the release binaries, then runs each scenario under
 //! `sudo -n` with `--json` and asserts on the report. Every report must have shares summing to
 //! 1 ± 0.001 and no lost records.
+//!
+//! `cargo xtask man [DIR]` writes `whytime.1` and one page per subcommand to DIR (default
+//! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
+
+/// The binary's CLI, compiled in from its source so the man pages cannot drift from it.
+#[path = "../../crates/whytime/src/cli.rs"]
+#[allow(dead_code)]
+mod cli;
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -12,17 +20,38 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail, ensure};
+use clap::CommandFactory as _;
 use serde_json::Value;
 
-const USAGE: &str = "usage: cargo xtask test-e2e";
+const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask man [DIR]";
 /// Delay of the scenario-6 server between accept and reply.
 const SERVER_DELAY: Duration = Duration::from_millis(300);
 
 fn main() -> anyhow::Result<()> {
-    match std::env::args().nth(1).as_deref() {
+    let mut args = std::env::args_os().skip(1);
+    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("test-e2e") => test_e2e(),
+        Some("man") => man(args.next().map(PathBuf::from)),
         _ => bail!("{USAGE}"),
     }
+}
+
+/// Renders the man pages into `dir`.
+fn man(dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let dir = match dir {
+        Some(dir) => dir,
+        None => std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(
+                || Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"),
+                PathBuf::from,
+            )
+            .join("man"),
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    clap_mangen::generate_to(cli::Cli::command(), &dir)
+        .with_context(|| format!("writing man pages to {}", dir.display()))?;
+    println!("{}", dir.display());
+    Ok(())
 }
 
 fn test_e2e() -> anyhow::Result<()> {

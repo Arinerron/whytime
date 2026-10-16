@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR GPL-2.0)
+// SPDX-License-Identifier: MIT
 /*
  * whytime kernel side: per-thread off-CPU episodes for one process tree.
  *
@@ -24,6 +24,8 @@
 #define AF_INET6 10
 #define TASK_RUNNING 0
 
+/* MIT code may be distributed under the GPL, and the verifier grants GPL-only helpers
+ * (bpf_probe_read_kernel, ...) only to programs declaring a GPL-compatible license. */
 char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
 struct {

@@ -26,14 +26,31 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | Release binary | `cargo build --release -p whytime` → `$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime` (static) |
 | Unit tests | `cargo test --workspace` |
 | End-to-end suite | `cargo xtask test-e2e` (needs passwordless `sudo -n`) |
+| aarch64 | `cargo check --target aarch64-unknown-linux-musl --workspace`; `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (static, linked by `rust-lld`; smoke with `qemu-aarch64 …/whytime --version`) |
+| Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` (stdout) |
+| Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`) |
 | Run | `sudo $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime -- sleep 1` |
 | Doctor | `whytime doctor [--json]` (exit 0 ready, 3 cannot run) |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (prints the verifier log on load failures) |
 
-Toolchain: `rust-toolchain.toml` pins **stable** with the `x86_64-unknown-linux-musl`
-target, and `.cargo/config.toml` makes musl the default build target, so every binary
-(including tests and xtask) is static. No nightly, no `bpf-linker`: the BPF side is C,
-compiled by clang (22 here; any clang with BPF CO-RE works, override with `CLANG=`).
+Toolchain: `rust-toolchain.toml` pins **stable** with the `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` targets, and `.cargo/config.toml` makes x86_64 musl the default
+build target, so every binary (including tests and xtask) is static; aarch64 links with
+`rust-lld` against Rust's self-contained musl (no cross gcc). No nightly, no `bpf-linker`: the
+BPF side is C, compiled by clang (22 here; any clang with BPF CO-RE works, override with
+`CLANG=`).
+
+License: MIT (`LICENSE`). The BPF object's `SEC("license")` string stays `Dual MIT/GPL`: the
+verifier only lets GPL-compatible programs call GPL-only helpers (`bpf_probe_read_kernel`,
+`bpf_get_current_task_btf`, ...). Vendored libbpf headers are `LGPL-2.1 OR BSD-2-Clause`.
+
+CI (`.github/workflows/ci.yml`): x86_64 build + unit tests, aarch64 check/build/qemu smoke,
+and `cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: `v*` tags publish static
+x86_64/aarch64 tarballs with completions and man pages. Both check out
+`Arinerron/tracekit` next to the repo via `.github/actions/setup` (its `tracekit-*` inputs).
+
+`crates/whytime/src/cli.rs` is also compiled into xtask (`#[path]`, for `cargo xtask man`):
+keep it self-contained (std, clap, clap_complete only; no `crate::` items).
 
 Do not run `cargo fmt`/`cargo clippy` as part of feature work unless asked; lints are the
 tracekit block (`clippy::all` + `pedantic`) in the root `Cargo.toml`.
@@ -46,7 +63,7 @@ crates/whytime-abi/        wire! records + wire_consts! shared with C; feature s
                            feature user → aya::Pod impls
 crates/whytime-bpf/        build.rs + bpf/ ; exports OBJECT (the .o) and ABI_HASH
   bpf/whytime.bpf.c        the BPF programs (C CO-RE)
-  bpf/vmlinux_min.h        hand-curated preserve_access_index subset of vmlinux.h
+  bpf/vmlinux_min.h        hand-curated preserve_access_index subset of vmlinux.h (pt_regs per arch)
   bpf/include/bpf/         vendored libbpf v1.8.0 headers
 crates/whytime/            the binary
   src/main.rs              wrap flow, event loop (epoll: ring, pidfd, signalfd), sudo handling
@@ -61,7 +78,9 @@ crates/whytime/            the binary
   src/doctor.rs            bpfdoctor Tool, probe.sched / probe.syscalls checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
 crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp
-xtask/                     cargo xtask test-e2e
+xtask/                     cargo xtask test-e2e | man [DIR]
+.github/                   workflows ci.yml, release.yml; actions/setup (tracekit checkout, clang, rustup)
+LICENSE                    MIT
 ```
 
 Shared foundation (path deps, **do not modify**; report gaps to the orchestrator):
@@ -74,8 +93,11 @@ Shared foundation (path deps, **do not modify**; report gaps to the orchestrator
 1. renders `whytime_abi::header()` to `$OUT_DIR/whytime_wire.h` (structs, `_Static_assert`s on
    every size/offset, `#define`s for the `wire_consts!`, `WHYTIME_WIRE_H_ABI_HASH`) and
    writes the hash to `$OUT_DIR/abi_hash.rs`;
-2. runs `clang -target bpfel -O2 -g -mcpu=v3 -Wall -Werror -D__TARGET_ARCH_x86 -I bpf
-   -I bpf/include -I $OUT_DIR -c bpf/whytime.bpf.c -o $OUT_DIR/whytime.bpf.o`;
+2. runs `clang -target bpfel -O2 -g -mcpu=v3 -Wall -Werror -D__TARGET_ARCH_{x86,arm64} -I bpf
+   -I bpf/include -I $OUT_DIR -c bpf/whytime.bpf.c -o $OUT_DIR/whytime.bpf.o` (arch from
+   `CARGO_CFG_TARGET_ARCH`; other arches panic, as `vmlinux_min.h` declares `pt_regs` for
+   x86 (`di`, `si`, `dx`) and arm64 (`pt_regs.orig_x0` via libbpf's `pt_regs___arm64`, then
+   `user_pt_regs.regs[]`) only);
 3. `src/lib.rs` embeds it with `aya::include_bytes_aligned!`.
 
 To change a record: edit `crates/whytime-abi/src/lib.rs` only; the C side picks the new
@@ -212,9 +234,37 @@ Honesty limits (state them when presenting results):
 
 Human (stderr): `wall`, then lines ≥ 1% (max 8), `other` collecting the rest and every
 `other`-class line, then `critical path: N processes · M events lost` and notes.
-JSON (`--json`, stderr): `{schema: "whytime.report/1", command, wall_ns, ended_by,
-exit_code, lines: [{class, share, ns, subject, connections?}], processes: [{pid, ppid, comm,
-argv, cpu_ns, exit_code, critical}], quality: {events, dropped, syscalls}, notes}`.
+JSON (`--json`, stderr), schema `whytime.report/1`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `"whytime.report/1"` |
+| `command` | string[] | COMMAND and its arguments |
+| `wall_ns` | u64 | window length: COMMAND's exec to its exit (or the `--duration` deadline) |
+| `ended_by` | `"exit"` \| `"duration"` | why the window ended |
+| `exit_code` | i32 \| null | COMMAND's code (128 + signal if killed); null if still running |
+| `lines[]` | object[] | the breakdown, largest first; `share`s sum to 1 |
+| `lines[].class` | string | `cpu`, `child`, `runqueue`, `sleep`, `fsync`, `file`, `net`, `ipc`, `futex`, `poll`, `signal`, `tty`, `other` (see `classify::Class`) |
+| `lines[].share` | f64 | fraction of `wall_ns` |
+| `lines[].ns` | u64 | nanoseconds |
+| `lines[].subject` | string | what within the class: comm, directory, `ip:port`, syscall |
+| `lines[].connections` | usize, optional | distinct sockets (`net` lines only) |
+| `processes[]` | object[] | every process of the tree, in order of appearance |
+| `processes[].pid` / `.ppid` | u32 / u32 \| null | ids |
+| `processes[].comm` / `.argv` | string / string[] | last comm; argv capped at 256 B in kernel |
+| `processes[].cpu_ns` | u64 | on-CPU time over all its threads |
+| `processes[].exit_code` | i32 \| null | null while running |
+| `processes[].critical` | bool | the attribution walked through it |
+| `quality.events` | u64 | ring buffer records received |
+| `quality.dropped` | u64 | records or tracked tasks lost in kernel |
+| `quality.syscalls` | bool | syscall tracepoints attached (blocks classified by resource) |
+| `notes` | string[] | caveats for this report |
+
+**Versioning policy.** `whytime.report/1` changes only additively: new optional fields, new
+`class` values, new notes. Removing or renaming a field, changing its type, or changing its
+meaning bumps the schema to `whytime.report/2` (`Report::SCHEMA`). Consumers must ignore
+unknown fields and treat an unknown `class` as `other`. Every new field or class goes into
+this table.
 
 Exit codes: COMMAND's (128 + signal if killed); 125 whytime failed before/at start (with
 doctor diagnostics); 126 not executable; 127 not found; `doctor`: 0 ready / 3 cannot run.
@@ -293,3 +343,8 @@ Targets, to be measured (not yet benchmarked):
   `"schema": "whytime.report/1"` prefix, so test workloads must not write JSON to stderr.
 - Tracking membership is inserted in kernel at fork; user space inserts only COMMAND's pid,
   before releasing it. Never add user-space insertion at fork (it races the child).
+- Running the e2e suite in virtme-ng (as CI does): `vng --run v6.12.40 --disable-microvm
+  --user "$USER" --disk e2e.img --exec "export PATH='$PATH'; ..."`. The microvm machine
+  hung at ACPI init with that Ubuntu mainline kernel; the guest's default PATH finds a system
+  cargo without the musl target; the guest root is read-only virtiofs, so put
+  `WHYTIME_E2E_DIR` on a mounted ext4 image (`/dev/vda`). vng returns the guest's exit code.

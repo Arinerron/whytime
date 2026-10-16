@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bpfdoctor::{Doctor, RealEnv, ids_for_errno};
-use clap::Parser as _;
+use clap::{CommandFactory as _, Parser as _};
 use procctx::{Config, ProcFs, ProcTable, StartClock};
 
 use crate::classify::Classifier;
@@ -48,6 +48,18 @@ fn main() -> ExitCode {
             eprintln!("whytime: {err}");
             EXIT_SETUP
         }),
+        Some(Sub::Completions { shell }) => {
+            // Buffered: clap_complete panics on write errors (e.g. a closed pipe).
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "whytime", &mut script);
+            match io::stdout().write_all(&script) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("whytime: writing completions: {err}");
+                    1
+                }
+            }
+        }
         None => wrap(&cli.run),
     };
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))

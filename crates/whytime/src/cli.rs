@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use clap_complete::Shell;
 
 /// Explain where a command's wall-clock time went.
 ///
@@ -58,6 +59,11 @@ pub enum Sub {
         #[arg(long)]
         json: bool,
     },
+    /// Print a shell completion script to stdout.
+    Completions {
+        /// The shell to generate for.
+        shell: Shell,
+    },
 }
 
 /// Parses `500ms`, `30s`, `1.5s`, `2m`, `1h`; a bare number is seconds.
@@ -110,5 +116,9 @@ mod tests {
 
         let cli = Cli::try_parse_from(["whytime", "doctor", "--json"]).unwrap();
         assert!(matches!(cli.sub, Some(Sub::Doctor { json: true })));
+
+        let cli = Cli::try_parse_from(["whytime", "completions", "zsh"]).unwrap();
+        assert!(matches!(cli.sub, Some(Sub::Completions { shell: Shell::Zsh })));
+        assert!(Cli::try_parse_from(["whytime", "completions", "tcsh"]).is_err());
     }
 }

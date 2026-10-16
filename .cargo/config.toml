@@ -1,7 +1,13 @@
 [alias]
-# `cargo xtask test-e2e`: builds the release binaries and runs the sudo end-to-end suite.
+# `cargo xtask test-e2e`: builds the release binaries and runs the sudo end-to-end suite;
+# `cargo xtask man [DIR]`: writes the man pages.
 xtask = "run --quiet --package xtask --"
 
 [build]
 # whytime ships as one static binary; tests and xtask build for the same target.
 target = "x86_64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+# Cross-link with the toolchain's bundled lld against Rust's self-contained musl crt/libc: a
+# static aarch64 binary with no cross gcc (`cargo build --target aarch64-unknown-linux-musl`).
+linker = "rust-lld"

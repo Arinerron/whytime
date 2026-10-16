@@ -21,31 +21,21 @@ fn main() {
     )
     .expect("write abi_hash.rs");
 
-    // libbpf's bpf_tracing.h keys pt_regs access off __TARGET_ARCH_<arch>.
+    // libbpf's bpf_tracing.h keys pt_regs access off __TARGET_ARCH_<arch>; vmlinux_min.h
+    // declares the pt_regs layout for these two only (both little-endian: bpfel).
     let arch = match env::var("CARGO_CFG_TARGET_ARCH")
         .expect("target arch")
         .as_str()
     {
         "x86_64" => "x86",
         "aarch64" => "arm64",
-        "riscv64" => "riscv",
-        "s390x" => "s390",
-        "loongarch64" => "loongarch",
-        "powerpc64" => "powerpc",
-        other => panic!("no __TARGET_ARCH mapping for {other}"),
-    };
-    let target = match env::var("CARGO_CFG_TARGET_ENDIAN")
-        .expect("target endian")
-        .as_str()
-    {
-        "big" => "bpfeb",
-        _ => "bpfel",
+        other => panic!("unsupported target arch {other}: whytime builds for x86_64 and aarch64"),
     };
     let clang = env::var_os("CLANG").unwrap_or_else(|| "clang".into());
     let object = out_dir.join("whytime.bpf.o");
     let status = Command::new(&clang)
         .args([
-            "-target", target, "-O2", "-g", "-mcpu=v3", "-Wall", "-Werror",
+            "-target", "bpfel", "-O2", "-g", "-mcpu=v3", "-Wall", "-Werror",
         ])
         .arg(format!("-D__TARGET_ARCH_{arch}"))
         .args(["-I", "bpf", "-I", "bpf/include", "-I"])
