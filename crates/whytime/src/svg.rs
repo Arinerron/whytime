@@ -216,26 +216,37 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// Displays a string with XML special characters escaped.
+/// Displays a string with XML special characters escaped, and the characters XML 1.0 does
+/// not allow (C0 controls but tab, newline and carriage return; U+FFFE, U+FFFF) replaced with
+/// U+FFFD: a title from a command line with an ESC in it must not break the document.
 #[derive(Debug)]
 struct Esc<'a>(&'a str);
 
 impl fmt::Display for Esc<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut rest = self.0;
-        while let Some(i) = rest.find(['&', '<', '>', '"', '\'']) {
+        while let Some((i, c)) = rest
+            .char_indices()
+            .find(|&(_, c)| matches!(c, '&' | '<' | '>' | '"' | '\'') || !xml_char(c))
+        {
             f.write_str(&rest[..i])?;
-            f.write_str(match rest.as_bytes()[i] {
-                b'&' => "&amp;",
-                b'<' => "&lt;",
-                b'>' => "&gt;",
-                b'"' => "&quot;",
-                _ => "&#39;",
+            f.write_str(match c {
+                '&' => "&amp;",
+                '<' => "&lt;",
+                '>' => "&gt;",
+                '"' => "&quot;",
+                '\'' => "&#39;",
+                _ => "\u{fffd}",
             })?;
-            rest = &rest[i + 1..];
+            rest = &rest[i + c.len_utf8()..];
         }
         f.write_str(rest)
     }
+}
+
+/// Whether XML 1.0 allows `c` in a document (a `char` is never a surrogate).
+fn xml_char(c: char) -> bool {
+    !matches!(c, '\0'..='\x08' | '\x0b' | '\x0c' | '\x0e'..='\x1f' | '\u{fffe}' | '\u{ffff}')
 }
 
 /// Zoom, search and hover details; mirrors [`label`] for re-truncation.
@@ -421,6 +432,25 @@ mod tests {
         assert!(doc.contains("a&lt;b &amp; &#39;c&#39;"));
         assert!(doc.contains("&quot;q&quot;"));
         assert_eq!(doc.matches("<g").count(), doc.matches("</g>").count());
+        assert_well_formed(&doc);
+    }
+
+    /// Characters XML does not allow (a command line's ESC, a stray \x01) become U+FFFD, so
+    /// the document still parses; tab and newline stay.
+    #[test]
+    fn characters_xml_forbids_are_replaced() {
+        let s = stacks(&[("main;f\x02g", 10), ("main;other", 10)]);
+        let c = no_colors();
+        let title = "whytime: sh -c x\x1b[31my \x01\t\u{ffff}";
+        let chart = Chart { title, subtitle: "s\u{fffe}\n", stacks: &s, root_colors: &c };
+        let mut buf = Vec::new();
+        write(&mut buf, &chart).unwrap();
+        let doc = String::from_utf8(buf).unwrap();
+        let forbidden = |c: char| !xml_char(c);
+        assert!(!doc.contains(forbidden), "{doc:?}");
+        assert!(doc.contains("whytime: sh -c x\u{fffd}[31my \u{fffd}\t\u{fffd}"));
+        assert!(doc.contains(">s\u{fffd}\n</text>"));
+        assert!(doc.contains("<title>f\u{fffd}g ("));
         assert_well_formed(&doc);
     }
 
