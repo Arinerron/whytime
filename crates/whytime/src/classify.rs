@@ -33,9 +33,8 @@ use whytime_abi::{
 use crate::dns::Hosts;
 use crate::sys::{Kind, SyscallTable};
 
-/// Where wall time went. Serialized in lower case (`"fsync"`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// Where wall time went. Serialized as [`Class::name`] (`"fsync"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Class {
     /// The wrapped command's own process was on a CPU.
     Cpu,
@@ -70,6 +69,36 @@ pub enum Class {
     Fault,
     /// Anything else, including time whytime could not observe.
     Other,
+}
+
+impl Class {
+    /// Lower-case name, as in the JSON report (`"runqueue"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Child => "child",
+            Self::Runqueue => "runqueue",
+            Self::Sleep => "sleep",
+            Self::Fsync => "fsync",
+            Self::File => "file",
+            Self::Aio => "aio",
+            Self::Net => "net",
+            Self::Ipc => "ipc",
+            Self::Futex => "futex",
+            Self::Lock => "lock",
+            Self::Poll => "poll",
+            Self::Signal => "signal",
+            Self::Tty => "tty",
+            Self::Fault => "fault",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl Serialize for Class {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
 }
 
 /// The resource a block waited on, beyond its class.
@@ -271,6 +300,11 @@ impl Classifier {
     /// Learns host names from resolver traffic; later blocks on their addresses use them.
     pub fn resolved(&mut self, record: &DnsRecord) {
         self.hosts.ingest(record);
+    }
+
+    /// Kernel name of syscall `nr`, if whytime knows it.
+    pub fn syscall_name(&self, nr: i32) -> Option<&'static str> {
+        self.syscalls.get(nr).map(|syscall| syscall.name)
     }
 
     /// Classifies a block of process `tgid` in `sys` (with the kernel's `detail` on it),

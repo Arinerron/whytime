@@ -213,13 +213,7 @@ impl Recorder {
     /// Creates (truncates) `path` and writes the preamble. A regular file is handed to
     /// `owner` (uid, gid), so a trace recorded under sudo belongs to the invoking user.
     pub fn create(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
-        let file = File::create(path)?;
-        if let Some((uid, gid)) = owner
-            && file.metadata()?.is_file()
-        {
-            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
-        }
-        let mut out = BufWriter::new(file);
+        let mut out = BufWriter::new(crate::create_owned(path, owner)?);
         out.write_all(&MAGIC)?;
         out.write_all(&VERSION.to_le_bytes())?;
         out.write_all(&0_u32.to_le_bytes())?;
@@ -787,6 +781,7 @@ mod tests {
     use whytime_abi::{DNS_UDP, ST_RUNNING};
 
     use super::*;
+    use crate::cli::OutputArgs;
     use crate::testkit::{dns, episode, exec, seg, sys, task};
 
     const DEV: u32 = (8 << 20) | 1;
@@ -907,17 +902,26 @@ mod tests {
 
         let mut json = Vec::new();
         let meta = crate::meta(&header, &end);
-        crate::write_report(&mut json, &trace, end.end, meta, true).expect("rendering");
+        crate::write_report(&mut json, &trace, end.end, meta, &output()).expect("rendering");
         let bytes = std::fs::read(&path).expect("reading the trace file back");
         std::fs::remove_file(&path).expect("removing the trace file");
         (String::from_utf8(json).expect("UTF-8 JSON"), bytes)
+    }
+
+    /// `--json --timeline`.
+    fn output() -> OutputArgs {
+        OutputArgs {
+            json: true,
+            timeline: true,
+            ..OutputArgs::default()
+        }
     }
 
     fn replayed_json(bytes: &[u8]) -> String {
         let replay = replay(bytes).expect("replaying");
         let meta = crate::meta(&replay.header, &replay.end);
         let mut json = Vec::new();
-        crate::write_report(&mut json, &replay.trace, replay.end.end, meta, true)
+        crate::write_report(&mut json, &replay.trace, replay.end.end, meta, &output())
             .expect("rendering");
         String::from_utf8(json).expect("UTF-8 JSON")
     }
