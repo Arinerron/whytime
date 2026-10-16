@@ -402,6 +402,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracekit-wire"
+version = "0.1.0"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -427,9 +431,9 @@ dependencies = [
  "procctx",
  "serde",
  "serde_json",
+ "tracekit-wire",
  "whytime-abi",
  "whytime-bpf",
- "wire",
 ]
 
 [[package]]
@@ -437,7 +441,7 @@ name = "whytime-abi"
 version = "0.1.0"
 dependencies = [
  "aya",
- "wire",
+ "tracekit-wire",
 ]
 
 [[package]]
@@ -469,10 +473,6 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
-
-[[package]]
-name = "wire"
-version = "0.1.0"
 
 [[package]]
 name = "xtask"

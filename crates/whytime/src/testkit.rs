@@ -30,6 +30,10 @@ impl FdTarget for NoFiles {
     fn fd_target(&self, _tgid: u32, _fd: i32, _dev: u32, _ino: u64) -> Option<PathBuf> {
         None
     }
+
+    fn mapped_file(&self, _tgid: u32, _dev: u32, _ino: u64) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// An empty trace of the wrapped command `root_pid`, home `/home/u`, no `/proc` access.

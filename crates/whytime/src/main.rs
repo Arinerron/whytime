@@ -14,6 +14,7 @@ mod classify;
 mod cli;
 mod doctor;
 mod logger;
+mod percpu;
 mod record;
 mod report;
 mod snapshot;
@@ -40,7 +41,7 @@ use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget, ProcFd};
 use crate::cli::{Cli, RunArgs, Sub};
-use crate::record::{End, Header, Logged, Recorder};
+use crate::record::{End, Header, Logged, Probes, Recorder};
 use crate::report::{EndedBy, Meta, Report};
 use crate::spawn::{Child, Credentials, StartError};
 use crate::sys::SyscallTable;
@@ -123,13 +124,31 @@ fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
     EXIT_SETUP
 }
 
-/// Loads and attaches the programs; the flag says whether the syscall pair is attached.
-fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, bool)> {
+/// Loads and attaches the programs; says which optional program sets are attached, warning
+/// about the others.
+fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, Probes)> {
     let loaded = Tracer::load(syscalls)?;
     if let Err(err) = &loaded.syscalls {
         log::warn!("syscall tracepoints unavailable ({err:#}); blocked time will not be classified");
     }
-    Ok((loaded.tracer, loaded.syscalls.is_ok()))
+    if let Err(err) = &loaded.readiness {
+        log::warn!(
+            "poll/epoll readiness probes unavailable ({err:#}); poll waits will not be \
+             attributed to the ready descriptor"
+        );
+    }
+    if let Err(err) = &loaded.faults {
+        log::warn!(
+            "page-fault probes unavailable ({err:#}); blocks in page faults will not be \
+             reported as fault"
+        );
+    }
+    let probes = Probes {
+        syscalls: loaded.syscalls.is_ok(),
+        readiness: loaded.readiness.is_ok(),
+        faults: loaded.faults.is_ok(),
+    };
+    Ok((loaded.tracer, probes))
 }
 
 /// Kernel `USER_HZ`, the unit of `/proc` start times.
@@ -179,7 +198,7 @@ impl Session {
             restore_user_env(home.as_deref());
         }
         let syscalls = SyscallTable::new();
-        let (mut tracer, syscalls_attached) = load(&syscalls)?;
+        let (mut tracer, probes) = load(&syscalls)?;
         let ticks_per_sec = ticks_per_sec()?;
         let recorder = recorder(args, creds.as_ref())?;
 
@@ -205,7 +224,7 @@ impl Session {
             command: args.command.clone(),
             root_pid: child.pid(),
             home: home.clone(),
-            syscalls: syscalls_attached,
+            probes,
             ticks_per_sec,
             attached: None,
         };
@@ -261,6 +280,7 @@ impl Session {
             ended_by,
             exit_code,
             dropped: maps.dropped(),
+
         };
         drop(maps);
         save(recorder.as_ref(), args, &tasks, &end);
@@ -359,7 +379,9 @@ fn meta(header: &Header, end: &End) -> Meta {
         ended_by: end.ended_by,
         exit_code: end.exit_code,
         dropped: end.dropped,
-        syscalls: header.syscalls,
+        syscalls: header.probes.syscalls,
+        readiness: header.probes.readiness,
+        faults: header.probes.faults,
         attached: header.attached,
     }
 }

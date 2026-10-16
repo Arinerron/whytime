@@ -19,7 +19,7 @@ license = "MIT"
 whytime-abi = { path = "crates/whytime-abi" }
 whytime-bpf = { path = "crates/whytime-bpf" }
 
-wire = { path = "../tracekit/crates/wire" }
+wire = { path = "../tracekit/crates/wire", package = "tracekit-wire" }
 procctx = { path = "../tracekit/crates/procctx" }
 bpfdoctor = { path = "../tracekit/crates/bpfdoctor" }
 

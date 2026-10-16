@@ -107,6 +107,17 @@ fn test_e2e() -> anyhow::Result<()> {
     let lock_arg = lock_dir.display().to_string();
     let overhead_whytime = whytime.clone();
     let syscalls = bin("wt-syscalls");
+    // wt-fault touch drops the file's cached pages itself; it only needs a synced file.
+    let fault_file = work.join("fault.bin").display().to_string();
+    let wrote = run(Command::new(bin("wt-fault")).args(["write", &fault_file, "128"]))?;
+    ensure!(wrote.status.success(), "wt-fault write {fault_file} failed");
+    let fault_dir = home_relative(&work.canonicalize()?);
+    let fifo = work.join("waker.fifo");
+    let _ = std::fs::remove_file(&fifo);
+    let made = run(Command::new("mkfifo").arg(&fifo))?;
+    ensure!(made.status.success(), "mkfifo {} failed", fifo.display());
+    let watched = work.join("waker.watched");
+    std::fs::write(&watched, b"").with_context(|| format!("creating {}", watched.display()))?;
     let scenarios: Vec<(&str, Command, Check)> = vec![
         (
             "sleep",
@@ -181,6 +192,35 @@ fn test_e2e() -> anyhow::Result<()> {
             "overhead",
             sudo(&[&syscalls, OVERHEAD_READS]),
             Box::new(move |out: &Output| check_overhead(out, &overhead_whytime, &syscalls)),
+        ),
+        (
+            "poll-ready",
+            sudo(&[&bin("wt-poll"), &server_arg, "4"]),
+            Box::new(move |out: &Output| check_poll(out, server)),
+        ),
+        (
+            "fault",
+            sudo(&[&bin("wt-fault"), "touch", &fault_file]),
+            Box::new(move |out: &Output| check_fault(out, &fault_dir)),
+        ),
+        (
+            "waker",
+            {
+                // sh starts the writer next to whytime, outside the traced tree, then
+                // becomes sudo.
+                let mut cmd = Command::new("sh");
+                cmd.args([
+                    "-c",
+                    r#""$1" write "$2" "$3" 8 100 & exec sudo -n "$4" --json -- "$1" read "$2" "$3" 8"#,
+                    "sh",
+                ])
+                .arg(bin("wt-fifo"))
+                .arg(&fifo)
+                .arg(&watched)
+                .arg(whytime);
+                cmd
+            },
+            Box::new(check_waker),
         ),
         (
             "record-replay",
@@ -327,6 +367,9 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         "wt-vfork",
         "wt-syscalls",
         "wt-flock",
+        "wt-poll",
+        "wt-fault",
+        "wt-fifo",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -889,4 +932,49 @@ fn children_cpu() -> Duration {
         )
     };
     time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// poll/epoll waits ended by the slow server are `net` on its address (readiness probes).
+fn check_poll(out: &Output, server: SocketAddr) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let peer = server.to_string();
+    // Without the readiness probes these waits would be class poll.
+    let net = class_share(&report, "net", |s| s == peer);
+    ensure!(net >= 0.6, "net share for {peer} {net:.3} < 0.6");
+    Ok(format!(
+        "wall {:.3}s, epoll_wait/poll ended by {peer}: net {:.1}%",
+        wall_secs(&report),
+        net * 100.0
+    ))
+}
+
+/// Page faults on a file whose pages were dropped are `fault` on its directory.
+fn check_fault(out: &Output, dir: &str) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let fault = class_share(&report, "fault", |s| s == dir);
+    ensure!(fault >= 0.5, "fault share on {dir} {fault:.3} < 0.5");
+    Ok(format!(
+        "wall {:.3}s, page faults on {dir} {:.1}%",
+        wall_secs(&report),
+        fault * 100.0
+    ))
+}
+
+/// inotify polls and FIFO reads ended by a writer outside the tree name it.
+fn check_waker(out: &Output) -> anyhow::Result<String> {
+    const WOKEN: &str = "woken by wt-fifo-writer";
+    exited(out, 0)?;
+    let report = report(out)?;
+    let poll = class_share(&report, "poll", |s| s == WOKEN);
+    ensure!(poll >= 0.35, "poll share {WOKEN:?} {poll:.3} < 0.35");
+    let ipc = class_share(&report, "ipc", |s| s == WOKEN);
+    ensure!(ipc >= 0.35, "ipc share {WOKEN:?} {ipc:.3} < 0.35");
+    Ok(format!(
+        "wall {:.3}s, {WOKEN}: poll {:.1}%, fifo read {:.1}%",
+        wall_secs(&report),
+        poll * 100.0,
+        ipc * 100.0
+    ))
 }

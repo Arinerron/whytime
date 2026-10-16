@@ -1,17 +1,17 @@
 //! `whytime doctor` and the start-up diagnostics: the shared bpfdoctor checks plus whytime's
-//! own `probe.sched` and `probe.syscalls`, which load and attach the real programs.
+//! own probes (`probe.sched`, `probe.syscalls`, `probe.readiness`, `probe.faults`), which load
+//! and attach the real programs.
 
-use std::cell::OnceCell;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 use bpfdoctor::{
     Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name,
 };
 
 use crate::sys::SyscallTable;
-use crate::tracer::{self, SCHED, SYSCALLS, Tracer};
+use crate::tracer::{self, FAULTS, READINESS, SCHED, SYSCALLS, Tracer};
 
 /// whytime as bpfdoctor sees it.
 pub fn tool() -> Tool {
@@ -25,17 +25,22 @@ pub fn tool() -> Tool {
         )],
         // sched_switch passes prev_state since 5.18.
         min_kernel: (5, 18),
-        // 4 MiB ring buffer, 32768 task states, 16384 tracked pids, programs.
-        memlock_bytes: 16 << 20,
+        // 4 MiB ring buffer, 32768 task states (304 B), 16384 tracked pids, programs.
+        memlock_bytes: 24 << 20,
     }
 }
 
 /// The full doctor: shared checks, then whytime's probes.
 pub fn full() -> Doctor {
     let mut doctor = Doctor::with_shared();
-    let probe = Rc::new(Probe::default());
-    doctor.add(Box::new(SchedCheck(Rc::clone(&probe))));
-    doctor.add(Box::new(SyscallsCheck(probe)));
+    let probe = Arc::new(Probe::default());
+    doctor.add(Box::new(SchedCheck(Arc::clone(&probe))));
+    for index in 0..OPTIONAL.len() {
+        doctor.add(Box::new(OptionalCheck {
+            probe: Arc::clone(&probe),
+            index,
+        }));
+    }
     doctor
 }
 
@@ -64,15 +69,17 @@ fn color(fd: libc::c_int) -> bool {
     std::env::var_os("NO_COLOR").is_none() && unsafe { libc::isatty(fd) } == 1
 }
 
-/// Outcome of loading the real object once, shared by both probe checks.
+/// Outcome of loading the real object once, shared by every probe check.
 #[derive(Default)]
 struct Probe {
-    outcome: OnceCell<Outcome>,
+    outcome: OnceLock<Outcome>,
 }
 
 struct Outcome {
     sched: Result<String, anyhow::Error>,
-    syscalls: Option<Result<String, anyhow::Error>>,
+    /// The optional program sets, in [`OPTIONAL`] order; `None` when the scheduler probe
+    /// failed and nothing else was tried.
+    optional: Option<[Result<String, anyhow::Error>; 3]>,
 }
 
 impl Probe {
@@ -81,32 +88,34 @@ impl Probe {
             .get_or_init(|| match Tracer::load(&SyscallTable::new()) {
                 Ok(loaded) => {
                     let sizes = loaded.tracer.program_sizes();
-                    let insns = |names: &[(&str, &str)]| -> u32 {
-                        sizes
+                    let attached = |what: &str, set: &[(&str, &str)]| {
+                        let insns: u32 = sizes
                             .iter()
-                            .filter(|(name, _)| names.iter().any(|(prog, _)| prog == name))
+                            .filter(|(name, _)| set.iter().any(|(prog, _)| prog == name))
                             .map(|(_, n)| n)
-                            .sum()
+                            .sum();
+                        format!("{what} loaded and attached ({insns} verified insns)")
                     };
-                    let sched = format!(
-                        "{} tp_btf programs loaded and attached ({} verified insns)",
-                        SCHED.len(),
-                        insns(&SCHED)
-                    );
-                    let syscalls = loaded.syscalls.map(|()| {
-                        format!(
-                            "tp_btf/sys_enter and sys_exit loaded and attached ({} verified insns)",
-                            insns(&SYSCALLS)
-                        )
-                    });
+                    let sched = attached(&format!("{} tp_btf programs", SCHED.len()), &SCHED);
+                    let optional = [
+                        loaded
+                            .syscalls
+                            .map(|()| attached("tp_btf/sys_enter and sys_exit", &SYSCALLS)),
+                        loaded.readiness.map(|()| {
+                            attached("fentry/pollwake and ep_poll_callback", &READINESS)
+                        }),
+                        loaded
+                            .faults
+                            .map(|()| attached("fentry and fexit/handle_mm_fault", &FAULTS)),
+                    ];
                     Outcome {
                         sched: Ok(sched),
-                        syscalls: Some(syscalls),
+                        optional: Some(optional),
                     }
                 }
                 Err(err) => Outcome {
                     sched: Err(err),
-                    syscalls: None,
+                    optional: None,
                 },
             })
     }
@@ -139,14 +148,33 @@ fn fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
             "upgrade to Linux >= 5.18 built with CONFIG_DEBUG_INFO_BTF=y",
             "BTF tracepoints and sched_switch's prev_state argument",
         )],
-        _ => vec![Fix::new(
-            format!("WHYTIME_LOG=debug {} doctor", tool.exe.display()),
-            "prints the verifier log",
-        )],
+        _ => vec![debug_fix(tool)],
     }
 }
 
-struct SchedCheck(Rc<Probe>);
+/// Fixes for a failed fentry/fexit set on `functions`.
+fn fentry_fixes(err: &anyhow::Error, tool: &Tool, functions: &str) -> Vec<Fix> {
+    match tracer::errno(err) {
+        Some(libc::EPERM | libc::EACCES) => fixes(err, tool),
+        _ => vec![
+            Fix::new(
+                "Linux with BPF trampolines (x86-64 >= 5.5, arm64 >= 6.0) and \
+                 CONFIG_DEBUG_INFO_BTF=y",
+                format!("fentry/fexit on {functions}, which must be in the kernel's BTF"),
+            ),
+            debug_fix(tool),
+        ],
+    }
+}
+
+fn debug_fix(tool: &Tool) -> Fix {
+    Fix::new(
+        format!("WHYTIME_LOG=debug {} doctor", tool.exe.display()),
+        "prints the verifier log",
+    )
+}
+
+struct SchedCheck(Arc<Probe>);
 
 impl Check for SchedCheck {
     fn id(&self) -> &'static str {
@@ -175,38 +203,81 @@ impl Check for SchedCheck {
     }
 }
 
-struct SyscallsCheck(Rc<Probe>);
+/// An optional program set: whytime runs without it, with less detail.
+struct OptionalSpec {
+    id: &'static str,
+    title: &'static str,
+    impact: &'static str,
+    explain: &'static str,
+    /// Kernel functions an fentry/fexit set hooks; `None` for tracepoints.
+    functions: Option<&'static str>,
+}
 
-impl Check for SyscallsCheck {
+/// Optional program sets, in the order of [`Outcome::optional`].
+static OPTIONAL: [OptionalSpec; 3] = [
+    OptionalSpec {
+        id: "probe.syscalls",
+        title: "Syscall tracepoints",
+        impact: "blocked time is reported as \"other\" instead of by resource (fsync, network \
+                 peer, futex, ...)",
+        explain: "the syscall in flight when a thread blocks says what it waited for; \
+                  tp_btf/sys_enter and sys_exit record it",
+        functions: None,
+    },
+    OptionalSpec {
+        id: "probe.readiness",
+        title: "Poll/epoll readiness probes",
+        impact: "poll/select/epoll waits are reported as \"poll\" instead of the descriptor \
+                 that became ready (network peer, pipe, terminal)",
+        explain: "fentry on pollwake and ep_poll_callback records which file woke a thread \
+                  blocked in poll, select or epoll_wait",
+        functions: Some("pollwake and ep_poll_callback"),
+    },
+    OptionalSpec {
+        id: "probe.faults",
+        title: "Page-fault probes",
+        impact: "time blocked in page faults (mapped-file reads, swap-in) is reported as \
+                 \"other\" or as the syscall it interrupted instead of \"fault\"",
+        explain: "fentry/fexit on handle_mm_fault mark threads inside a page fault, so a block \
+                  there is attributed to the mapped file",
+        functions: Some("handle_mm_fault"),
+    },
+];
+
+struct OptionalCheck {
+    probe: Arc<Probe>,
+    /// Index into [`OPTIONAL`] and [`Outcome::optional`].
+    index: usize,
+}
+
+impl Check for OptionalCheck {
     fn id(&self) -> &'static str {
-        "probe.syscalls"
+        OPTIONAL[self.index].id
     }
 
     fn run(&self, _env: &dyn Env, tool: &Tool) -> Diagnostic {
-        const TITLE: &str = "Syscall tracepoints";
-        match &self.0.get().syscalls {
+        let spec = &OPTIONAL[self.index];
+        match self.probe.get().optional.as_ref().map(|sets| &sets[self.index]) {
             None => Diagnostic::new(
-                self.id(),
-                TITLE,
+                spec.id,
+                spec.title,
                 false,
                 Status::Skip,
                 "not probed: the scheduler probe failed",
             ),
             Some(Ok(observed)) => {
-                Diagnostic::new(self.id(), TITLE, false, Status::Pass, observed.as_str())
+                Diagnostic::new(spec.id, spec.title, false, Status::Pass, observed.as_str())
             }
             Some(Err(err)) => {
                 let mut diag =
-                    Diagnostic::new(self.id(), TITLE, false, Status::Warn, describe(err))
-                        .with_impact(
-                            "blocked time is reported as \"other\" instead of by resource \
-                         (fsync, network peer, futex, ...)",
-                        )
-                        .with_explain(
-                            "the syscall in flight when a thread blocks says what it waited for; \
-                         tp_btf/sys_enter and sys_exit record it",
-                        );
-                for fix in fixes(err, tool) {
+                    Diagnostic::new(spec.id, spec.title, false, Status::Warn, describe(err))
+                        .with_impact(spec.impact)
+                        .with_explain(spec.explain);
+                let fixes = match spec.functions {
+                    Some(functions) => fentry_fixes(err, tool, functions),
+                    None => fixes(err, tool),
+                };
+                for fix in fixes {
                     diag = diag.with_fix(fix);
                 }
                 diag

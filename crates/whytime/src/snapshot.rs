@@ -84,6 +84,10 @@ pub fn task_state(tgid: u32, now: u64, activity: &Activity) -> TaskState {
             start: now,
             run_ns: 0,
             rq_ns: 0,
+            preempt_max_ns: 0,
+            preempt_tgid: 0,
+            _pad: 0,
+            preempt_comm: [0; 16],
         },
         last_ts: now,
         block_ts,
@@ -96,6 +100,15 @@ pub fn task_state(tgid: u32, now: u64, activity: &Activity) -> TaskState {
         waker_tgid: 0,
         _pad: 0,
         detail,
+        ready: no_syscall(),
+        fault: no_syscall(),
+        fault_file: 0,
+        in_fault: 0,
+        has_ready: 0,
+        pend_tgid: 0,
+        _pad2: 0,
+        pend_comm: [0; 16],
+        waker_comm: [0; 16],
     }
 }
 

@@ -590,6 +590,7 @@ mod tests {
             },
             waker_tid: waker.0,
             waker_tgid: waker.1,
+            waker_comm: None,
         };
         let kind = SegKind::Blocked(Box::new(block));
         Seg { start, end, kind }

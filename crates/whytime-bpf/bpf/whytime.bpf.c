@@ -12,6 +12,9 @@
  * (type, identity, socket peer, path) so user space can say what each block waited for. The
  * description is lazy because most syscalls never block, and it is the expensive part.
  *
+ * Optional fentry programs refine that: pollwake/ep_poll_callback record which file ended a
+ * poll/select/epoll wait, and handle_mm_fault entry/exit mark blocks inside page faults.
+ *
  * Untracked tasks cost one hash lookup per handler (two in sched_switch).
  */
 #include "vmlinux_min.h"
@@ -30,6 +33,10 @@
 #define TASK_RUNNING 0
 /* Dentries plus mount crossings visited by one path walk. */
 #define PATH_DEPTH 32
+#define PF_EXITING 0x00000004
+/* epoll_event.events bits that are not readiness events (EPOLLEXCLUSIVE, EPOLLWAKEUP,
+ * EPOLLONESHOT, EPOLLET): an item with none of the others is disabled. */
+#define EP_PRIVATE_BITS 0xf0000000u
 
 /* MIT code may be distributed under the GPL, and the verifier grants GPL-only helpers
  * (bpf_probe_read_kernel, ...) only to programs declaring a GPL-compatible license. */
@@ -84,6 +91,14 @@ struct {
 	__type(key, u32);
 	__type(value, struct path_scratch);
 } path_buf SEC(".maps");
+/* One zeroed task_state, the template of new `tasks` entries: task_state is too large for
+ * the 512-byte BPF stack. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct task_state);
+} task_zero SEC(".maps");
 
 static __always_inline void stat_inc(u32 slot)
 {
@@ -116,9 +131,8 @@ static __always_inline void close_segment(struct task_state *t, struct cpu_segme
 {
 	if (out)
 		*out = t->seg;
+	__builtin_memset(&t->seg, 0, sizeof(t->seg));
 	t->seg.start = now;
-	t->seg.run_ns = 0;
-	t->seg.rq_ns = 0;
 }
 
 static __always_inline void clear_sys(struct sys_info *s)
@@ -295,7 +309,67 @@ static __always_inline void describe_blocked(struct task_state *t)
 		describe_sockaddr(&t->sys, (const void *)t->detail.args[1], t->detail.args[2]);
 }
 
+/* Creates (or resets) the `tasks` entry of `tid`, with a segment open from `now`. */
+static __always_inline struct task_state *new_task(u32 tid, u32 tgid, u32 state, u64 now)
+{
+	u32 zero = 0;
+	struct task_state *t, *tmpl = bpf_map_lookup_elem(&task_zero, &zero);
+
+	if (!tmpl)
+		return 0;
+	if (bpf_map_update_elem(&tasks, &tid, tmpl, BPF_ANY)) {
+		stat_inc(STAT_TASKS_FULL);
+		return 0;
+	}
+	t = bpf_map_lookup_elem(&tasks, &tid);
+	if (!t)
+		return 0;
+	t->seg.start = now;
+	t->last_ts = now;
+	t->state = state;
+	t->tgid = tgid;
+	clear_sys(&t->sys);
+	clear_sys(&t->ready);
+	clear_sys(&t->fault);
+	return t;
+}
+
 /* ---- scheduler ---------------------------------------------------------------------- */
+
+/* Called as the thread blocks: what the episode needs that is only known now. */
+static __always_inline void note_block(struct task_state *p)
+{
+	p->wake_ts = 0;
+	p->waker_tid = 0;
+	p->waker_tgid = 0;
+	__builtin_memset(p->waker_comm, 0, sizeof(p->waker_comm));
+	p->has_ready = 0;
+	if (p->in_fault) {
+		/* The vma's file is held while the fault waits on its pages; the reads are probe
+		 * reads in any case. */
+		clear_sys(&p->fault);
+		if (p->fault_file)
+			describe_file(&p->fault, (struct file *)p->fault_file);
+	}
+}
+
+/* A preempted (or new) thread gets the CPU back after `waited` ns: keep the longest such
+ * wait of the segment and who held the CPU meanwhile. */
+static __always_inline void note_preemption(struct task_state *n, struct task_struct *prev,
+					    u64 waited)
+{
+	if (waited <= n->seg.preempt_max_ns)
+		return;
+	n->seg.preempt_max_ns = waited;
+	if (n->pend_comm[0]) {
+		n->seg.preempt_tgid = n->pend_tgid;
+		__builtin_memcpy(n->seg.preempt_comm, n->pend_comm, sizeof(n->pend_comm));
+	} else {
+		/* Never preempted: a new task waiting for its first run. */
+		n->seg.preempt_tgid = prev->tgid;
+		__builtin_memcpy(n->seg.preempt_comm, prev->comm, sizeof(n->pend_comm));
+	}
+}
 
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_struct *next,
@@ -326,19 +400,21 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 			p->state = ST_BLOCKED;
 			p->block_ts = now;
 			p->block_state = prev_state;
-			p->wake_ts = 0;
-			p->waker_tid = 0;
-			p->waker_tgid = 0;
+			note_block(p);
 			if (p->sys.nr != NR_NONE && !(p->detail.flags & SYSD_DESCRIBED))
 				describe_blocked(p);
 		} else {
 			p->state = ST_RUNNABLE;
+			/* `next` holds the CPU while this thread waits for it. */
+			p->pend_tgid = next->tgid;
+			__builtin_memcpy(p->pend_comm, next->comm, sizeof(p->pend_comm));
 		}
 	}
 
 	if (n) {
 		if (n->state == ST_RUNNABLE) {
 			n->seg.rq_ns += now - n->last_ts;
+			note_preemption(n, prev, now - n->last_ts);
 		} else if (n->state == ST_BLOCKED || n->state == ST_WOKEN) {
 			struct episode_record *e = reserve(sizeof(*e));
 
@@ -353,6 +429,13 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 				e->block_state = n->block_state;
 				e->_pad = 0;
 				e->detail = n->detail;
+				/* in_fault cannot change while blocked: it says where it blocked. */
+				e->flags = (n->in_fault ? EPF_FAULT : 0) | (n->has_ready ? EPF_READY : 0);
+				e->run_holder_tgid = prev->tgid;
+				__builtin_memcpy(e->run_holder_comm, prev->comm, sizeof(e->run_holder_comm));
+				__builtin_memcpy(e->waker_comm, n->waker_comm, sizeof(e->waker_comm));
+				e->ready = n->ready;
+				e->fault = n->fault;
 				bpf_ringbuf_submit(e, 0);
 			}
 			close_segment(n, 0, now);
@@ -363,20 +446,67 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 	return 0;
 }
 
+/*
+ * Distance in bytes from a CPU's `runqueues` to its `__preempt_count` (x86-64) in the per-CPU
+ * area; 0 when unknown. Every CPU's copy of the per-CPU variables has the same layout, so user
+ * space computes it from the offsets in the kernel BTF's `.data..percpu` section.
+ */
+const volatile s64 preempt_count_from_rq = 0;
+
+/* preempt_count bits: NMI, hardirq nesting, and "serving a softirq". */
+#define NMI_MASK 0x00f00000
+#define HARDIRQ_MASK 0x000f0000
+#define SOFTIRQ_OFFSET 0x00000100
+
+/*
+ * True when the wakeup runs in hardirq, softirq or NMI context, where `current` is just the
+ * interrupted task (or the CPU's ksoftirqd). preempt_count says so. arm64 and riscv keep it
+ * in thread_info. x86-64 keeps it in the per-CPU `__preempt_count`, which BPF could address
+ * as a __ksym, but aya cannot load those; instead this CPU's run queue (`current`'s CFS run
+ * queue's `rq`, confirmed by rq->curr == current) plus the distance user space found in BTF.
+ * When neither works (no BTF offsets, no CONFIG_FAIR_GROUP_SCHED) the answer is false and
+ * the waker is `current`, as before.
+ */
+static __always_inline bool in_interrupt_context(struct task_struct *cur)
+{
+	int count = 0;
+
+	if (bpf_core_field_exists(cur->thread_info.preempt_count)) {
+		count = BPF_CORE_READ(cur, thread_info.preempt_count);
+	} else if (preempt_count_from_rq && bpf_core_field_exists(cur->se.cfs_rq)) {
+		struct rq *rq = BPF_CORE_READ(cur, se.cfs_rq, rq);
+
+		if (!rq || BPF_CORE_READ(rq, curr) != cur)
+			return false;
+		if (bpf_probe_read_kernel(&count, sizeof(count), (void *)rq + preempt_count_from_rq))
+			return false;
+	}
+	return count & (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET);
+}
+
 SEC("tp_btf/sched_waking")
 int BPF_PROG(on_waking, struct task_struct *p)
 {
-	u32 tid = p->pid;
+	u32 tid = p->pid, waker_tgid;
 	struct task_state *t = bpf_map_lookup_elem(&tasks, &tid);
-	u64 cur;
+	struct task_struct *cur;
 
 	if (!t || t->state != ST_BLOCKED)
 		return 0;
-	cur = bpf_get_current_pid_tgid();
 	t->wake_ts = bpf_ktime_get_ns();
-	t->waker_tid = (u32)cur;
-	t->waker_tgid = cur >> 32;
 	t->state = ST_WOKEN;
+	/* The waker stays 0/0 (cleared at block) when raised from interrupt context. */
+	cur = bpf_get_current_task_btf();
+	if (in_interrupt_context(cur))
+		return 0;
+	waker_tgid = cur->tgid;
+	t->waker_tid = cur->pid;
+	t->waker_tgid = waker_tgid;
+	/* A tracked process leaves `tracked` before its exit wakes its parent: exiting wakers
+	 * are not named. */
+	if (waker_tgid && !(cur->flags & PF_EXITING) &&
+	    !bpf_map_lookup_elem(&tracked, &waker_tgid))
+		__builtin_memcpy(t->waker_comm, cur->comm, sizeof(t->waker_comm));
 	return 0;
 }
 
@@ -386,7 +516,6 @@ SEC("tp_btf/sched_process_fork")
 int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 {
 	u32 ptgid = parent->tgid, ctid = child->pid, ctgid = child->tgid, one = 1;
-	struct task_state s = {};
 	struct fork_record *e;
 	u64 now;
 
@@ -397,13 +526,7 @@ int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 
 	now = bpf_ktime_get_ns();
 	/* A new task is runnable until it first gets a CPU. */
-	s.seg.start = now;
-	s.last_ts = now;
-	s.state = ST_RUNNABLE;
-	s.tgid = ctgid;
-	clear_sys(&s.sys);
-	if (bpf_map_update_elem(&tasks, &ctid, &s, BPF_ANY))
-		stat_inc(STAT_TASKS_FULL);
+	new_task(ctid, ctgid, ST_RUNNABLE, now);
 
 	e = reserve(sizeof(*e));
 	if (!e)
@@ -435,27 +558,16 @@ int BPF_PROG(on_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm 
 		struct task_state *prev = bpf_map_lookup_elem(&tasks, &old);
 
 		if (prev) {
-			struct task_state moved = *prev;
-
+			if (bpf_map_update_elem(&tasks, &tid, prev, BPF_ANY))
+				stat_inc(STAT_TASKS_FULL);
+			else
+				t = bpf_map_lookup_elem(&tasks, &tid);
 			bpf_map_delete_elem(&tasks, &old);
-			bpf_map_update_elem(&tasks, &tid, &moved, BPF_ANY);
-			t = bpf_map_lookup_elem(&tasks, &tid);
 		}
 	}
 	if (!t) {
 		/* The wrapped command's first exec: its timeline starts here, on-CPU. */
-		struct task_state s = {};
-
-		s.seg.start = now;
-		s.last_ts = now;
-		s.state = ST_RUNNING;
-		s.tgid = tgid;
-		clear_sys(&s.sys);
-		if (bpf_map_update_elem(&tasks, &tid, &s, BPF_ANY)) {
-			stat_inc(STAT_TASKS_FULL);
-			return 0;
-		}
-		t = bpf_map_lookup_elem(&tasks, &tid);
+		t = new_task(tid, tgid, ST_RUNNING, now);
 		if (!t)
 			return 0;
 	} else if (t->state == ST_RUNNING) {
@@ -521,6 +633,7 @@ int BPF_PROG(on_exit, struct task_struct *p)
 
 /* ---- syscalls ----------------------------------------------------------------------- */
 
+
 SEC("tp_btf/sys_enter")
 int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id)
 {
@@ -546,5 +659,107 @@ int BPF_PROG(on_sys_exit, struct pt_regs *regs, long ret)
 
 	if (t)
 		t->sys.nr = NR_NONE;
+	return 0;
+}
+
+/* ---- readiness: which file ended a poll/select/epoll wait --------------------------- */
+
+/* The state of `task` if it is tracked, blocked, and has no readiness source yet. */
+static __always_inline struct task_state *blocked_poller(struct task_struct *task)
+{
+	u32 tid = BPF_CORE_READ(task, pid);
+	struct task_state *t;
+
+	if (!tid)
+		return 0;
+	t = bpf_map_lookup_elem(&tasks, &tid);
+	if (!t || t->state != ST_BLOCKED || t->has_ready)
+		return 0;
+	return t;
+}
+
+/* `f` (descriptor `fd`, -1 if unknown) is about to wake the blocked thread `t`. The wakeup
+ * follows synchronously; the first source claims the slot. */
+static __always_inline void note_ready(struct task_state *t, struct file *f, int fd)
+{
+	if (__sync_val_compare_and_swap(&t->has_ready, 0, 1))
+		return;
+	clear_sys(&t->ready);
+	t->ready.fd = fd;
+	describe_file(&t->ready, f);
+}
+
+/* poll/select: one wait entry per polled file; `wait->private` is the poller's
+ * poll_wqueues. */
+SEC("fentry/pollwake")
+int BPF_PROG(on_pollwake, struct wait_queue_entry *wait, unsigned int mode, int sync, void *key)
+{
+	struct poll_table_entry *entry = container_of(wait, struct poll_table_entry, wait);
+	struct poll_wqueues *pwq = BPF_CORE_READ(wait, private);
+	__poll_t events = (__poll_t)(unsigned long)key;
+	struct task_state *t = blocked_poller(BPF_CORE_READ(pwq, polling_task));
+
+	if (!t)
+		return 0;
+	/* pollwake ignores events the poller did not ask for. */
+	if (events && !(events & BPF_CORE_READ(entry, key)))
+		return 0;
+	note_ready(t, BPF_CORE_READ(entry, filp), -1);
+	return 0;
+}
+
+/* epoll: `wait` hangs off a watched file; the callback queues the item on its eventpoll and
+ * wakes the first thread in epoll_wait on it (ep->wq waiters are exclusive). */
+SEC("fentry/ep_poll_callback")
+int BPF_PROG(on_ep_poll_callback, struct wait_queue_entry *wait, unsigned int mode, int sync,
+	     void *key)
+{
+	struct eppoll_entry *pwq = container_of(wait, struct eppoll_entry, wait);
+	struct epitem *epi = BPF_CORE_READ(pwq, base);
+	struct eventpoll *ep = BPF_CORE_READ(epi, ep);
+	struct list_head *first = BPF_CORE_READ(ep, wq.head.next);
+	__poll_t events = (__poll_t)(unsigned long)key, want;
+	struct wait_queue_entry *waiter;
+	struct task_state *t;
+
+	if (!first || first == &ep->wq.head)
+		return 0;
+	waiter = container_of(first, struct wait_queue_entry, entry);
+	t = blocked_poller(BPF_CORE_READ(waiter, private));
+	if (!t)
+		return 0;
+	/* Same filters as ep_poll_callback: disabled items and unwanted events wake nobody. */
+	want = BPF_CORE_READ(epi, event.events);
+	if (!(want & ~EP_PRIVATE_BITS) || (events && !(events & want)))
+		return 0;
+	note_ready(t, BPF_CORE_READ(epi, ffd.file), BPF_CORE_READ(epi, ffd.fd));
+	return 0;
+}
+
+/* ---- page faults -------------------------------------------------------------------- */
+
+/* Marks the thread as in a fault until fexit; a block meanwhile is described as the fault's
+ * (note_block). handle_mm_fault also serves faults taken inside syscalls (copy_to_user). */
+SEC("fentry/handle_mm_fault")
+int BPF_PROG(on_fault_enter, struct vm_area_struct *vma)
+{
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	struct task_state *t = bpf_map_lookup_elem(&tasks, &tid);
+
+	if (!t)
+		return 0;
+	t->fault_file = (u64)BPF_CORE_READ(vma, vm_file);
+	t->in_fault = 1;
+	return 0;
+}
+
+SEC("fexit/handle_mm_fault")
+int BPF_PROG(on_fault_exit)
+{
+	u32 tid = (u32)bpf_get_current_pid_tgid();
+	struct task_state *t = bpf_map_lookup_elem(&tasks, &tid);
+
+	if (t)
+		t->in_fault = 0;
 	return 0;
 }

@@ -16,12 +16,15 @@ whytime runs a command, traces it and every process it starts with eBPF, and spl
 wall-clock time along the command's critical path: on-CPU, waiting on a child that was
 computing, timer sleeps, fsync (per directory), file I/O, file locks (`flock`/`fcntl`),
 async I/O completions (io_uring, AIO), network peers (`ip:port`), pipes and other IPC,
-futexes, polling, waiting for a CPU. Shares always add up to 100% of the wall time. When the
-command waits on another of its threads or processes (joining workers, a contended lock, a
-pipe, a child), the time is explained by what that task was doing: a main thread joining
-CPU-bound workers is on-CPU, a lock held across a sleep is the sleep. File subjects are
-captured in the kernel when the process blocks, so they name the directory even for
-processes that are gone by the time whytime reports.
+futexes, polling, page faults (per mapped file's directory), waiting for a CPU. Shares always
+add up to 100% of the wall time. When the command waits on another of its threads or
+processes (joining workers, a contended lock, a pipe, a child), the time is explained by what
+that task was doing: a main thread joining CPU-bound workers is on-CPU, a lock held across a
+sleep is the sleep. A poll/select/epoll wait is reported as the descriptor that became ready
+(so `curl` shows its server, not "poll"), and a pipe or poll wait ended by a process outside
+the tree names it (`woken by dbus-daemon`). File subjects are captured in the kernel when the
+process blocks, so they name the directory even for processes that are gone by the time
+whytime reports.
 
 ```
 $ whytime -- ./build.sh            # report on stderr; the command's output passes through

@@ -36,6 +36,7 @@ typedef _Bool bool;
 typedef int pid_t;
 typedef unsigned short umode_t;
 typedef __u32 dev_t;
+typedef unsigned int __poll_t;
 
 /* UAPI values (stable ABI); vmlinux.h would supply these. */
 enum bpf_map_type {
@@ -159,16 +160,90 @@ struct mm_struct {
 	unsigned long arg_end;
 };
 
+struct vm_area_struct {
+	struct file *vm_file;
+};
+
+/* Scheduler run queues. cfs_rq->rq exists with CONFIG_FAIR_GROUP_SCHED. */
+struct rq {
+	struct task_struct *curr;
+};
+
+struct cfs_rq {
+	struct rq *rq;
+};
+
+struct sched_entity {
+	struct cfs_rq *cfs_rq;
+};
+
+/* preempt_count is here on arm64 and riscv; x86-64 keeps it per-CPU. */
+struct thread_info {
+	int preempt_count;
+};
+
+struct list_head {
+	struct list_head *next;
+};
+
+struct wait_queue_head {
+	struct list_head head;
+};
+
+struct wait_queue_entry {
+	void *private;
+	struct list_head entry;
+};
+
+/* poll/select: one per (file, waitqueue); `wait.private` is the poll_wqueues. */
+struct poll_table_entry {
+	struct file *filp;
+	__poll_t key;
+	struct wait_queue_entry wait;
+};
+
+struct poll_wqueues {
+	struct task_struct *polling_task;
+};
+
+/* epoll: `epoll_key` on 7.x, `epoll_filefd` before; CO-RE matches the member by name. */
+struct epoll_filefd {
+	struct file *file;
+	int fd;
+};
+
+struct epoll_event {
+	__poll_t events;
+};
+
+struct eventpoll {
+	struct wait_queue_head wq;
+};
+
+struct epitem {
+	struct epoll_filefd ffd;
+	struct eventpoll *ep;
+	struct epoll_event event;
+};
+
+struct eppoll_entry {
+	struct epitem *base;
+	struct wait_queue_entry wait;
+};
+
 struct signal_struct {
 	atomic_t live;
 };
 
 struct task_struct {
+	struct thread_info thread_info;
 	pid_t pid;
 	pid_t tgid;
+	unsigned int flags;
 	int exit_code;
 	char comm[16];
 	u64 start_boottime;
+	struct sched_entity se;
 	struct task_struct *real_parent;
 	struct task_struct *group_leader;
 	struct files_struct *files;

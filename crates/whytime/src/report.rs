@@ -8,9 +8,9 @@ use crate::attribute::{Attribution, Line};
 use crate::classify::Class;
 use crate::timeline::Trace;
 
-/// Lines below this share are folded into "other" in the human rendering.
+/// Lines below this share are folded into the final "other" line of the human rendering.
 const MIN_SHOWN_SHARE: f64 = 0.01;
-/// At most this many lines are shown before "other".
+/// At most this many lines are shown before the folded "other" line.
 const MAX_SHOWN_LINES: usize = 8;
 
 /// Why the observation window ended.
@@ -96,6 +96,11 @@ pub struct Quality {
     pub dropped: u64,
     /// Whether syscall tracepoints were attached (blocks are classified by resource).
     pub syscalls: bool,
+    /// Whether the poll/epoll readiness probes were attached (poll waits are classified by
+    /// the descriptor that became ready).
+    pub readiness: bool,
+    /// Whether the page-fault probes were attached (blocks in page faults are `fault`).
+    pub faults: bool,
 }
 
 /// Inputs of [`Report::new`] besides the trace.
@@ -113,6 +118,10 @@ pub struct Meta {
     pub dropped: u64,
     /// Syscall tracepoints attached.
     pub syscalls: bool,
+    /// Readiness probes attached.
+    pub readiness: bool,
+    /// Page-fault probes attached.
+    pub faults: bool,
     /// Attach mode: the target and how it was seeded.
     pub attached: Option<Attached>,
 }
@@ -209,6 +218,20 @@ impl Report {
                     .to_owned(),
             );
         }
+        if !meta.readiness {
+            notes.push(
+                "poll/epoll readiness probes unavailable: poll waits are not attributed to the \
+                 descriptor that became ready"
+                    .to_owned(),
+            );
+        }
+        if !meta.faults {
+            notes.push(
+                "page-fault probes unavailable: time blocked in page faults is not reported as \
+                 \"fault\""
+                    .to_owned(),
+            );
+        }
         match meta.ended_by {
             EndedBy::Duration => {
                 notes.push("--duration elapsed; the command was still running".to_owned());
@@ -238,6 +261,8 @@ impl Report {
                 events: trace.records,
                 dropped: meta.dropped,
                 syscalls: meta.syscalls,
+                readiness: meta.readiness,
+                faults: meta.faults,
             },
             notes,
         }
@@ -249,25 +274,24 @@ impl Report {
         writeln!(w)
     }
 
-    /// Writes the human breakdown.
+    /// Writes the human breakdown: lines of at least [`MIN_SHOWN_SHARE`] (at most
+    /// [`MAX_SHOWN_LINES`] of them, `other`-class lines included), then the rest folded into
+    /// one `other` line.
     pub fn render_human(&self, w: &mut dyn Write) -> io::Result<()> {
         writeln!(w, "wall {}", format_duration(self.wall_ns))?;
-        let mut other = 0;
+        let mut rest = 0;
         let mut shown = 0;
         for line in &self.lines {
-            if line.class == Class::Other
-                || line.share < MIN_SHOWN_SHARE
-                || shown == MAX_SHOWN_LINES
-            {
-                other += line.ns;
+            if line.share < MIN_SHOWN_SHARE || shown == MAX_SHOWN_LINES {
+                rest += line.ns;
                 continue;
             }
             shown += 1;
             writeln!(w, "{:>5}  {}", percent(line.share), label(line))?;
         }
-        if other > 0 {
+        if rest > 0 {
             #[allow(clippy::cast_precision_loss)]
-            let share = other as f64 / self.wall_ns.max(1) as f64;
+            let share = rest as f64 / self.wall_ns.max(1) as f64;
             writeln!(w, "{:>5}  other", percent(share))?;
         }
         let critical = self.processes.iter().filter(|p| p.critical).count();
@@ -332,6 +356,7 @@ fn label(line: &ReportLine) -> String {
         Class::Poll => format!("poll/epoll wait ({subject})"),
         Class::Signal => format!("waiting for a signal ({subject})"),
         Class::Tty => format!("terminal/device I/O ({subject})"),
+        Class::Fault => at("page faults"),
         Class::Other => format!("other ({subject})"),
     }
 }
@@ -369,5 +394,86 @@ mod tests {
         assert_eq!(format_duration(1_034_000_000), "1.03s");
         assert_eq!(format_duration(512_300_000), "512ms");
         assert_eq!(format_duration(830_000), "830µs");
+    }
+
+    /// A report of `lines` `(class, subject, ns)`, wall time their sum.
+    fn report(lines: &[(Class, &str, u64)]) -> Report {
+        let wall_ns = lines.iter().map(|&(.., ns)| ns).sum::<u64>();
+        #[allow(clippy::cast_precision_loss)]
+        let lines = lines
+            .iter()
+            .map(|&(class, subject, ns)| ReportLine {
+                class,
+                share: ns as f64 / wall_ns as f64,
+                ns,
+                subject: subject.to_owned(),
+                connections: None,
+            })
+            .collect();
+        Report {
+            schema: Report::SCHEMA,
+            command: vec!["cmd".to_owned()],
+            attached_pid: None,
+            wall_ns,
+            ended_by: EndedBy::Exit,
+            exit_code: Some(0),
+            lines,
+            processes: Vec::new(),
+            quality: Quality {
+                events: 0,
+                dropped: 0,
+                syscalls: true,
+                readiness: true,
+                faults: true,
+            },
+            notes: Vec::new(),
+        }
+    }
+
+    fn breakdown(report: &Report) -> Vec<String> {
+        let mut out = Vec::new();
+        report.render_human(&mut out).unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("critical path"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn large_other_lines_show_individually_and_only_small_lines_fold() {
+        let report = report(&[
+            (Class::Cpu, "make", 700),
+            (Class::Other, "outside syscalls (page faults, kernel locks)", 230),
+            (Class::Fault, "/usr/lib", 60),
+            (Class::Sleep, "make", 6),
+            (Class::Other, "untraced", 4),
+        ]);
+        assert_eq!(
+            breakdown(&report),
+            [
+                "  70%  on-CPU (make)",
+                "  23%  other (outside syscalls (page faults, kernel locks))",
+                "   6%  page faults on /usr/lib",
+                "   1%  other",
+            ]
+        );
+    }
+
+    #[test]
+    fn lines_beyond_the_shown_maximum_fold_into_other() {
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+        let lines: Vec<_> = names
+            .into_iter()
+            .zip(0..)
+            .map(|(name, i)| (Class::Other, name, 100 - i))
+            .collect();
+        let shown = breakdown(&report(&lines));
+        assert_eq!(shown.len(), MAX_SHOWN_LINES + 1);
+        assert_eq!(shown[MAX_SHOWN_LINES - 1], "  10%  other (h)");
+        // i and j: 92 + 91 of 955.
+        assert_eq!(shown[MAX_SHOWN_LINES], "  19%  other");
     }
 }

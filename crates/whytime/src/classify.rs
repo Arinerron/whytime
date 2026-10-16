@@ -4,9 +4,14 @@
 //! blocks, so they survive the process. When that walk could not reach the root, the path
 //! comes from `/proc/<pid>/fd/<fd>` while the record is processed, trusted only if the file it
 //! names has the device and inode the kernel reported; then from the walk's trailing
-//! components (`…/dir`); otherwise the subject is `dev M:m ino N`. The `/proc` lookup is the
-//! classifier's only outside input, behind [`FdTarget`] so trace files can record and replay
-//! it ([`crate::record`]).
+//! components (`…/dir`); otherwise the subject is `dev M:m ino N`. A page fault's file is
+//! found by device and inode in `/proc/<pid>/maps`. Those `/proc` lookups are the classifier's
+//! only outside input, behind [`FdTarget`] so trace files can record and replay them
+//! ([`crate::record`]).
+//!
+//! Besides the syscall, a block may carry what ended or caused it: the descriptor whose
+//! readiness ended a poll/select/epoll wait, the mapped file of a page fault, and the `comm`
+//! of a waker outside the traced tree (see [`BlockInfo`]).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -19,8 +24,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use whytime_abi::{
-    ANON_INODE_FS_MAGIC, NR_NONE, SYSD_DESCRIBED, SYSD_PATH_ROOTED, SYSD_PATH_TRUNCATED,
-    SysDetail, SysInfo,
+    ANON_INODE_FS_MAGIC, NR_NONE, PATH_BYTES, SYSD_DESCRIBED, SYSD_PATH_ROOTED,
+    SYSD_PATH_TRUNCATED, SysDetail, SysInfo,
 };
 
 use crate::sys::{Kind, SyscallTable};
@@ -57,6 +62,9 @@ pub enum Class {
     Signal,
     /// Terminal and other character-device I/O.
     Tty,
+    /// Blocked inside a page fault: reading a mapped file, swap-in, or the memory locks
+    /// around them. Takes precedence over the syscall the fault interrupted.
+    Fault,
     /// Anything else, including time whytime could not observe.
     Other,
 }
@@ -92,6 +100,10 @@ pub enum Subject {
     Stopped,
     /// Blocked since before attach, in a syscall `/proc` would not show.
     Unreadable,
+    /// A process-context task outside the traced tree ended the wait (its `comm`).
+    Waker(Arc<str>),
+    /// A page fault on memory no file backs.
+    AnonMemory,
 }
 
 impl fmt::Display for Subject {
@@ -108,6 +120,8 @@ impl fmt::Display for Subject {
             Self::NoSyscall => f.write_str("outside syscalls (page faults, kernel locks)"),
             Self::Stopped => f.write_str("stopped (signal or tracer)"),
             Self::Unreadable => f.write_str("blocked since attach, syscall unreadable"),
+            Self::Waker(comm) => write!(f, "woken by {comm}"),
+            Self::AnonMemory => f.write_str("anonymous memory (swap)"),
         }
     }
 }
@@ -139,12 +153,42 @@ const O_DSYNC: u32 = 0o10_000;
 /// [`SysInfo::nr`] of a thread found blocked at attach whose `/proc/<tid>/syscall` could not
 /// be read. Only attach mode writes it; the kernel side never does.
 pub const NR_UNREADABLE: i32 = -2;
+/// The detail of a file the kernel described without capturing its path (`ready`, `fault`):
+/// its [`SysInfo`] holds, any path comes from [`FdTarget`].
+const DESCRIBED_ONLY: SysDetail = SysDetail {
+    args: [0; 3],
+    magic: 0,
+    flags: SYSD_DESCRIBED,
+    path_len: 0,
+    _pad: 0,
+    path: [0; PATH_BYTES as usize],
+};
 
-/// What a descriptor's `/proc` link names: the classifier's only external lookup.
+/// What the kernel recorded about one block, besides the thread and its process.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockInfo<'a> {
+    /// The syscall in flight.
+    pub sys: &'a SysInfo,
+    /// Its arguments and block-time description.
+    pub detail: &'a SysDetail,
+    /// `prev_state` at the switch-out.
+    pub block_state: u32,
+    /// The file whose readiness ended a poll/select/epoll wait.
+    pub ready: Option<&'a SysInfo>,
+    /// The file mapped at the page fault the thread blocked in (`mode` 0: anonymous memory).
+    pub fault: Option<&'a SysInfo>,
+    /// `comm` of the waker when it is a process-context task outside the traced tree.
+    pub waker: Option<&'a Arc<str>>,
+}
+
+/// What `/proc` says about a process's files: the classifier's only external lookups.
 pub trait FdTarget: fmt::Debug {
     /// The target of `/proc/<tgid>/fd/<fd>`, if that link still names the file with inode
     /// `ino` on `dev` (kernel `dev_t`).
     fn fd_target(&self, tgid: u32, fd: i32, dev: u32, ino: u64) -> Option<PathBuf>;
+
+    /// The path `/proc/<tgid>/maps` shows for a mapping of inode `ino` on `dev`.
+    fn mapped_file(&self, tgid: u32, dev: u32, ino: u64) -> Option<PathBuf>;
 }
 
 /// [`FdTarget`] reading `/proc`.
@@ -163,6 +207,13 @@ impl FdTarget for ProcFd {
             return None;
         }
         std::fs::read_link(&link).ok()
+    }
+
+    fn mapped_file(&self, tgid: u32, dev: u32, ino: u64) -> Option<PathBuf> {
+        let maps = std::fs::read_to_string(format!("/proc/{tgid}/maps")).ok()?;
+        maps.lines()
+            .find_map(|line| mapped_path(line, dev, ino))
+            .map(PathBuf::from)
     }
 }
 
@@ -248,6 +299,48 @@ impl Classifier {
         }
     }
 
+    /// Classifies a block of process `tgid`. A page fault takes precedence over the syscall
+    /// it interrupted; a readiness wait takes the class of the descriptor that became ready
+    /// (sockets, FIFOs, character devices; anything else stays `poll`); `ipc` and `poll`
+    /// waits ended by a waker outside the traced tree are named after it.
+    pub fn classify_block(&mut self, tgid: u32, block: &BlockInfo<'_>) -> Blocked {
+        if let Some(fault) = block.fault {
+            return Blocked {
+                class: Class::Fault,
+                subject: self.fault_subject(tgid, fault),
+                socket: None,
+            };
+        }
+        let mut blocked = self.classify(tgid, block.sys, block.detail, block.block_state);
+        // Without the syscall programs (nr unknown) readiness alone says it was a poll.
+        if let Some(ready) = block.ready
+            && (blocked.class == Class::Poll || block.sys.nr == NR_NONE)
+        {
+            blocked = match ready.mode {
+                S_IFSOCK | S_IFIFO | S_IFCHR => {
+                    let name = self.syscalls.get(block.sys.nr).map_or("poll", |s| s.name);
+                    let fd = Descriptor {
+                        sys: ready,
+                        detail: &DESCRIBED_ONLY,
+                    };
+                    self.by_descriptor(tgid, fd, name, false)
+                }
+                _ => Blocked {
+                    class: Class::Poll,
+                    subject: Subject::Process,
+                    socket: None,
+                },
+            };
+        }
+        if matches!(blocked.class, Class::Ipc | Class::Poll)
+            && blocked.subject == Subject::Process
+            && let Some(waker) = block.waker
+        {
+            blocked.subject = Subject::Waker(Arc::clone(waker));
+        }
+        blocked
+    }
+
     fn by_descriptor(
         &mut self,
         tgid: u32,
@@ -327,16 +420,48 @@ impl Classifier {
         }
     }
 
+    /// The directory holding the file mapped at a page fault (from [`FdTarget::mapped_file`]
+    /// unless already known), or anonymous memory.
+    fn fault_subject(&mut self, tgid: u32, fault: &SysInfo) -> Subject {
+        if fault.mode == 0 {
+            return Subject::AnonMemory;
+        }
+        let key = (fault.dev, fault.ino);
+        let found = match self.paths.get(&key) {
+            Some(Known::Full(path) | Known::Tail(path)) => return Subject::Path(Arc::clone(path)),
+            Some(Known::Unresolved) => Known::Unresolved,
+            None => {
+                let target = self.files.mapped_file(tgid, fault.dev, fault.ino);
+                let found = target.and_then(|target| self.located(&target, fault.mode));
+                let found = found.map_or(Known::Unresolved, Known::Full);
+                self.paths.insert(key, found.clone());
+                found
+            }
+        };
+        match found {
+            Known::Full(path) | Known::Tail(path) => Subject::Path(path),
+            Known::Unresolved => Subject::Inode {
+                dev: fault.dev,
+                ino: fault.ino,
+            },
+        }
+    }
+
     /// What [`FdTarget`] says `sys.fd` of `tgid` names, if it is a location.
     fn resolve(&self, tgid: u32, sys: &SysInfo) -> Option<Arc<str>> {
         let target = self.files.fd_target(tgid, sys.fd, sys.dev, sys.ino)?;
+        self.located(&target, sys.mode)
+    }
+
+    /// How a `/proc` path is shown ([`Self::shown`], without a ` (deleted)` mark); `None` for
+    /// pseudo files (`anon_inode:[pidfd]`), which have no location.
+    fn located(&self, target: &Path, mode: u32) -> Option<Arc<str>> {
         let target = target.to_string_lossy();
-        // Pseudo files (`anon_inode:[pidfd]`) have no location.
         if !target.starts_with('/') {
             return None;
         }
         let path = Path::new(target.strip_suffix(" (deleted)").unwrap_or(&target));
-        Some(self.shown(path, sys.mode))
+        Some(self.shown(path, mode))
     }
 
     /// How a file's path is shown: its directory for regular files, `~`-abbreviated.
@@ -442,6 +567,18 @@ fn waits_for_lock(cmd: u64) -> bool {
         .any(|lock| u64::from(lock.cast_unsigned()) == cmd)
 }
 
+/// The path of a `/proc/<pid>/maps` line (`start-end perms offset MM:mm inode   path`) that
+/// maps kernel device `dev` (`major << 20 | minor`) and inode `ino`.
+fn mapped_path(line: &str, dev: u32, ino: u64) -> Option<&str> {
+    let mut fields = line.splitn(6, ' ');
+    let (major, minor) = fields.nth(3)?.split_once(':')?;
+    let same_file = fields.next()?.parse::<u64>().ok()? == ino
+        && u32::from_str_radix(major, 16).ok()? == dev >> 20
+        && u32::from_str_radix(minor, 16).ok()? == dev & 0xf_ffff;
+    let path = fields.next()?.trim_start();
+    (same_file && path.starts_with('/')).then_some(path)
+}
+
 /// `path` with a leading `home` replaced by `~`.
 fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
@@ -511,13 +648,20 @@ mod tests {
         s
     }
 
-    /// Descriptor targets by `(dev, ino)`; no `/proc` involved.
+    /// Descriptor links and mappings by `(dev, ino)`; no `/proc` involved.
     #[derive(Debug, Default)]
-    struct Files(HashMap<(u32, u64), PathBuf>);
+    struct Files {
+        links: HashMap<(u32, u64), PathBuf>,
+        maps: HashMap<(u32, u64), PathBuf>,
+    }
 
     impl FdTarget for Files {
         fn fd_target(&self, _tgid: u32, _fd: i32, dev: u32, ino: u64) -> Option<PathBuf> {
-            self.0.get(&(dev, ino)).cloned()
+            self.links.get(&(dev, ino)).cloned()
+        }
+
+        fn mapped_file(&self, _tgid: u32, dev: u32, ino: u64) -> Option<PathBuf> {
+            self.maps.get(&(dev, ino)).cloned()
         }
     }
 
@@ -539,10 +683,10 @@ mod tests {
         let dev = (8 << 20) | 1;
         let mut files = Files::default();
         files
-            .0
+            .links
             .insert((dev, 10), PathBuf::from("/home/u/proj/.git/index (deleted)"));
-        files.0.insert((dev, 11), PathBuf::from("/dev/sda1"));
-        files.0.insert((dev, 12), PathBuf::from("anon_inode:[pidfd]"));
+        files.links.insert((dev, 11), PathBuf::from("/dev/sda1"));
+        files.links.insert((dev, 12), PathBuf::from("anon_inode:[pidfd]"));
         let mut c = classifier_with(files);
         let none = detail(0, &[]);
         let mut s = sys(libc::SYS_fsync);
@@ -719,6 +863,160 @@ mod tests {
         assert_eq!(
             abbreviate_home(Path::new("/home/user2/x"), home),
             "/home/user2/x"
+        );
+    }
+
+    /// A block in `sys`, described without a path, with nothing else recorded.
+    fn block(sys: &SysInfo) -> BlockInfo<'_> {
+        BlockInfo {
+            sys,
+            detail: &DESCRIBED_ONLY,
+            block_state: 1,
+            ready: None,
+            fault: None,
+            waker: None,
+        }
+    }
+
+    /// A file the kernel described outside any syscall (a ready or faulting file).
+    fn described(mode: u32, dev: u32, ino: u64) -> SysInfo {
+        SysInfo {
+            nr: NR_NONE,
+            fd: -1,
+            mode,
+            dev,
+            ino,
+            ..sys(0)
+        }
+    }
+
+    #[test]
+    fn a_page_fault_outranks_the_syscall_it_interrupted() {
+        let mut c = classifier();
+        let mut read = sys(libc::SYS_read);
+        read.mode = S_IFIFO;
+        let mapped = described(S_IFREG, (259 << 20) | 2, 99);
+        let b = c.classify_block(
+            1,
+            &BlockInfo {
+                fault: Some(&mapped),
+                ..block(&read)
+            },
+        );
+        assert_eq!(b.class, Class::Fault);
+        assert_eq!(b.subject.to_string(), "dev 259:2 ino 99");
+        let anon = described(0, 0, 0);
+        let b = c.classify_block(
+            1,
+            &BlockInfo {
+                fault: Some(&anon),
+                ..block(&read)
+            },
+        );
+        assert_eq!(
+            (b.class, b.subject.to_string()),
+            (Class::Fault, "anonymous memory (swap)".to_owned())
+        );
+    }
+
+    #[test]
+    fn fault_subjects_are_the_mapped_files_directory() {
+        let dev = (0x103 << 20) | 2;
+        let mut files = Files::default();
+        files
+            .maps
+            .insert((dev, 1311), PathBuf::from("/home/u/big data/x.bin (deleted)"));
+        let mut c = classifier_with(files);
+        let mapped = described(S_IFREG, dev, 1311);
+        assert_eq!(c.fault_subject(7, &mapped).to_string(), "~/big data");
+        // The same file read through a descriptor reuses the mapping's path.
+        let read = SysInfo {
+            nr: i32::try_from(libc::SYS_read).unwrap(),
+            ..mapped
+        };
+        let b = c.classify(7, &read, &detail(0, &[]), 1);
+        assert_eq!((b.class, b.subject.to_string()), (Class::File, "~/big data".to_owned()));
+    }
+
+    #[test]
+    fn maps_lines_match_by_device_and_inode() {
+        let line = "7f0e1c000000-7f0e1e000000 r--s 00000000 103:02 1311    /usr/lib/libx.so";
+        assert_eq!(
+            mapped_path(line, (0x103 << 20) | 2, 1311),
+            Some("/usr/lib/libx.so")
+        );
+        assert_eq!(mapped_path(line, (0x103 << 20) | 2, 1312), None);
+        assert_eq!(mapped_path(line, (8 << 20) | 2, 1311), None);
+        let stack = "7ffd4b5e9000-7ffd4b60a000 rw-p 00000000 00:00 0          [stack]";
+        assert_eq!(mapped_path(stack, 0, 0), None);
+    }
+
+    #[test]
+    fn poll_waits_take_the_class_of_the_ready_descriptor() {
+        let mut c = classifier();
+        let poll = sys(libc::SYS_ppoll);
+        let mut sock = described(S_IFSOCK, 8, 5);
+        sock.family = AF_INET;
+        sock.addr[..4].copy_from_slice(&[127, 0, 0, 1]);
+        sock.port = 8080;
+        let b = c.classify_block(
+            1,
+            &BlockInfo {
+                ready: Some(&sock),
+                ..block(&poll)
+            },
+        );
+        assert_eq!(
+            (b.class, b.subject.to_string(), b.socket),
+            (Class::Net, "127.0.0.1:8080".to_owned(), Some(5))
+        );
+        let fifo = described(S_IFIFO, 9, 6);
+        let b = c.classify_block(
+            1,
+            &BlockInfo {
+                ready: Some(&fifo),
+                ..block(&poll)
+            },
+        );
+        assert_eq!((b.class, b.subject), (Class::Ipc, Subject::Process));
+        // Anonymous inodes (eventfd, timerfd, inotify) have no file type in kernel.
+        let eventfd = described(0, 17, 2115);
+        let b = c.classify_block(
+            1,
+            &BlockInfo {
+                ready: Some(&eventfd),
+                ..block(&poll)
+            },
+        );
+        assert_eq!((b.class, b.subject), (Class::Poll, Subject::Process));
+    }
+
+    #[test]
+    fn ipc_and_poll_waits_woken_from_outside_the_tree_name_the_waker() {
+        let mut c = classifier();
+        let waker: Arc<str> = Arc::from("dbus-daemon");
+        let woken = |c: &mut Classifier, sys: &SysInfo| {
+            let b = c.classify_block(
+                1,
+                &BlockInfo {
+                    waker: Some(&waker),
+                    ..block(sys)
+                },
+            );
+            (b.class, b.subject.to_string())
+        };
+        let mut fifo = sys(libc::SYS_read);
+        fifo.mode = S_IFIFO;
+        let woken_by = "woken by dbus-daemon".to_owned();
+        assert_eq!(woken(&mut c, &fifo), (Class::Ipc, woken_by.clone()));
+        assert_eq!(
+            woken(&mut c, &sys(libc::SYS_epoll_pwait)),
+            (Class::Poll, woken_by)
+        );
+        // Other classes keep their subject.
+        assert_eq!(
+            woken(&mut c, &sys(libc::SYS_nanosleep)),
+            (Class::Sleep, String::new())
         );
     }
 }

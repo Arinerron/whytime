@@ -13,7 +13,7 @@
 //! many blocked threads had an unreadable syscall. procctx needs nothing else: whytime only
 //! calls its event handlers and `get_key`, which never read `/proc`.
 //!
-//! # Format (version 2)
+//! # Format (version 3)
 //!
 //! Little-endian. A 24-byte preamble, then frames.
 //!
@@ -29,9 +29,10 @@
 //!
 //! | Kind | Frame | Payload |
 //! |---|---|---|
-//! | 1 | header: first, once | root pid `u32`, syscall probes attached `u8`, `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
+//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 3 (syscalls, readiness, faults), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
 //! | 2 | record | one ring buffer record, verbatim |
-//! | 3 | lookup | dev `u32`, ino `u64`, found `u8`, then the link target (rest of the payload) |
+//! | 3 | lookup | `/proc/<pid>/fd/<fd>`: dev `u32`, ino `u64`, found `u8`, then the link target (rest of the payload) |
+//! | 7 | mapping | `/proc/<pid>/maps`: dev `u32`, ino `u64`, found `u8`, then the mapped path (rest of the payload) |
 //! | 4 | task | tid `u32`, `task_state` (one entry of the final `tasks` sweep) |
 //! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration, 2 interrupt), exit code `opt i32`, dropped `u64` |
 //! | 6 | seed: attach mode only, once, before any record | window start `u64`, count `u32`, then per process: pid `u32`, start `u64` (procctx key), ppid `u32`, seeded at `u64`, comm `bytes`, argv `bytes` (NUL-separated), thread count `u32`, threads × (tid `u32`, entry time `u64`) |
@@ -65,7 +66,7 @@ const MAGIC: [u8; 8] = *b"WHYTRACE";
 /// Preamble length (magic, version, zero, ABI hash): the header frame's offset.
 const PREAMBLE: usize = MAGIC.len() + 16;
 /// Format version written and read.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Architecture whose syscall numbers this build classifies.
 const ARCH: &str = std::env::consts::ARCH;
 
@@ -75,6 +76,18 @@ const F_LOOKUP: u32 = 3;
 const F_TASK: u32 = 4;
 const F_END: u32 = 5;
 const F_SEED: u32 = 6;
+const F_MAPPING: u32 = 7;
+
+/// Which optional program sets were attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probes {
+    /// Syscall tracepoints.
+    pub syscalls: bool,
+    /// Poll/epoll readiness fentry programs.
+    pub readiness: bool,
+    /// Page-fault fentry/fexit programs.
+    pub faults: bool,
+}
 
 /// What the recording run knew when the window opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,8 +100,8 @@ pub struct Header {
     pub root_pid: u32,
     /// Home directory abbreviated to `~`.
     pub home: Option<PathBuf>,
-    /// Whether the syscall probes were attached.
-    pub syscalls: bool,
+    /// Which optional program sets were attached.
+    pub probes: Probes,
     /// `AT_CLKTCK`, procctx's start clock resolution.
     pub ticks_per_sec: NonZeroU64,
     /// Attach mode: the target (`root_pid`) and how it was seeded.
@@ -213,7 +226,9 @@ impl Recorder {
     pub fn header(&self, header: &Header) {
         let mut p = Enc::default();
         p.u32(header.root_pid)
-            .u8(u8::from(header.syscalls))
+            .u8(u8::from(header.probes.syscalls))
+            .u8(u8::from(header.probes.readiness))
+            .u8(u8::from(header.probes.faults))
             .u64(header.ticks_per_sec.get())
             .bytes(header.arch.as_bytes());
         match &header.home {
@@ -256,11 +271,12 @@ impl Recorder {
         self.frame(F_RECORD, &[bytes]);
     }
 
-    /// Writes the answer of an [`FdTarget`] lookup.
-    fn lookup(&self, dev: u32, ino: u64, target: Option<&Path>) {
+    /// Writes the answer of an [`FdTarget`] lookup, as frame `kind` ([`F_LOOKUP`] for
+    /// descriptor links, [`F_MAPPING`] for mappings).
+    fn lookup(&self, kind: u32, dev: u32, ino: u64, target: Option<&Path>) {
         let (found, path) = target.map_or((0, &[][..]), |path| (1, path.as_os_str().as_bytes()));
         self.frame(
-            F_LOOKUP,
+            kind,
             &[&dev.to_le_bytes(), &ino.to_le_bytes(), &[found], path],
         );
     }
@@ -330,18 +346,31 @@ impl<T> Logged<T> {
 impl<T: FdTarget> FdTarget for Logged<T> {
     fn fd_target(&self, tgid: u32, fd: i32, dev: u32, ino: u64) -> Option<PathBuf> {
         let target = self.inner.fd_target(tgid, fd, dev, ino);
-        self.recorder.lookup(dev, ino, target.as_deref());
+        self.recorder.lookup(F_LOOKUP, dev, ino, target.as_deref());
+        target
+    }
+
+    fn mapped_file(&self, tgid: u32, dev: u32, ino: u64) -> Option<PathBuf> {
+        let target = self.inner.mapped_file(tgid, dev, ino);
+        self.recorder.lookup(F_MAPPING, dev, ino, target.as_deref());
         target
     }
 }
 
-/// [`FdTarget`] answering from a trace file.
+/// Lookup answers by `(dev, ino)`.
+type Answers = HashMap<(u32, u64), Option<PathBuf>>;
+
+/// [`FdTarget`] answering from a trace file: descriptor links, then mappings.
 #[derive(Debug)]
-struct Replayed(HashMap<(u32, u64), Option<PathBuf>>);
+struct Replayed(Answers, Answers);
 
 impl FdTarget for Replayed {
     fn fd_target(&self, _tgid: u32, _fd: i32, dev: u32, ino: u64) -> Option<PathBuf> {
         self.0.get(&(dev, ino)).cloned().flatten()
+    }
+
+    fn mapped_file(&self, _tgid: u32, dev: u32, ino: u64) -> Option<PathBuf> {
+        self.1.get(&(dev, ino)).cloned().flatten()
     }
 }
 
@@ -354,8 +383,10 @@ struct Recording<'a> {
     seeding: Option<Seeding>,
     /// Ring buffer records in arrival order.
     records: Vec<&'a [u8]>,
-    /// Lookup answers by `(dev, ino)`.
-    lookups: HashMap<(u32, u64), Option<PathBuf>>,
+    /// Descriptor link answers by `(dev, ino)`.
+    lookups: Answers,
+    /// Mapping answers by `(dev, ino)`.
+    mappings: Answers,
     /// The final `tasks` sweep.
     tasks: Vec<(u32, TaskState)>,
     /// End frame.
@@ -401,6 +432,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
     let mut end = None;
     let mut records = Vec::new();
     let mut lookups = HashMap::new();
+    let mut mappings = HashMap::new();
     let mut tasks = Vec::new();
     while !file.bytes.is_empty() {
         let at = file.at;
@@ -422,11 +454,12 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
             F_SEED if !records.is_empty() => return Err(malformed(at, "seed frame after a record")),
             F_SEED => seeding = Some(p.seeding()?),
             F_RECORD => records.push(payload),
-            F_LOOKUP => {
+            F_LOOKUP | F_MAPPING => {
                 let key = (p.u32()?, p.u64()?);
                 let found = p.flag()?;
                 let target = found.then(|| PathBuf::from(OsStr::from_bytes(p.bytes)));
-                lookups.insert(key, target);
+                let answers = if kind == F_LOOKUP { &mut lookups } else { &mut mappings };
+                answers.insert(key, target);
             }
             F_TASK => {
                 let tid = p.u32()?;
@@ -450,6 +483,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
         seeding,
         records,
         lookups,
+        mappings,
         tasks,
         end,
     })
@@ -462,6 +496,7 @@ pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
         seeding,
         records,
         lookups,
+        mappings,
         tasks,
         end,
     } = parse(bytes)?;
@@ -471,7 +506,7 @@ pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
     let classifier = Classifier::new(
         SyscallTable::new(),
         header.home.clone(),
-        Box::new(Replayed(lookups)),
+        Box::new(Replayed(lookups, mappings)),
     );
     let mut trace = Trace::new(
         header.root_pid,
@@ -639,7 +674,11 @@ impl<'a> Dec<'a> {
 
     fn header(&mut self) -> Result<Header, Error> {
         let root_pid = self.u32()?;
-        let syscalls = self.flag()?;
+        let probes = Probes {
+            syscalls: self.flag()?,
+            readiness: self.flag()?,
+            faults: self.flag()?,
+        };
         let ticks_per_sec =
             NonZeroU64::new(self.u64()?).ok_or_else(|| malformed(self.at - 8, "zero AT_CLKTCK"))?;
         let arch = String::from_utf8(self.blob()?.to_vec())
@@ -667,7 +706,7 @@ impl<'a> Dec<'a> {
             command,
             root_pid,
             home,
-            syscalls,
+            probes,
             ticks_per_sec,
             attached,
         })
@@ -751,6 +790,10 @@ mod tests {
         fn fd_target(&self, _tgid: u32, _fd: i32, dev: u32, ino: u64) -> Option<PathBuf> {
             (dev == DEV && ino == INO).then(|| PathBuf::from("/home/u/proj/data.db"))
         }
+
+        fn mapped_file(&self, _tgid: u32, dev: u32, ino: u64) -> Option<PathBuf> {
+            (dev == DEV && ino == INO + 1).then(|| PathBuf::from("/home/u/maps/lib.so"))
+        }
     }
 
     /// Records a small run the way `whytime --record` does (with `attached`, the way
@@ -766,7 +809,11 @@ mod tests {
             command: vec!["app".into(), "--flag".into()],
             root_pid: 100,
             home: Some(PathBuf::from("/home/u")),
-            syscalls: true,
+            probes: Probes {
+                syscalls: true,
+                readiness: true,
+                faults: true,
+            },
             ticks_per_sec: NonZeroU64::new(100).expect("non-zero"),
             attached: attached.then_some(Attached {
                 pid: 100,
@@ -808,8 +855,15 @@ mod tests {
         live(&mut trace, &[1, 2, 3]);
         let second = episode(100, 100, seg(1_900, 100, 0), fsync, [2_000, 2_400, 2_500]);
         live(&mut trace, wire::as_bytes(&second));
-        let mut running = task(100, ST_RUNNING, seg(2_500, 0, 0));
-        running.last_ts = 2_500;
+        // A block inside a page fault on a mapped file: its path comes from the mappings.
+        let mut fault = episode(100, 100, seg(2_500, 100, 0), sys(SYS_fsync), [2_600, 2_800, 2_800]);
+        fault.flags = whytime_abi::EPF_FAULT;
+        fault.fault.mode = 0o100_000;
+        fault.fault.dev = DEV;
+        fault.fault.ino = INO + 1;
+        live(&mut trace, wire::as_bytes(&fault));
+        let mut running = task(100, ST_RUNNING, seg(2_800, 0, 0));
+        running.last_ts = 2_800;
         let tasks = [(100, running)];
         trace.sweep(&tasks, 3_000);
         let end = End {
@@ -855,7 +909,9 @@ mod tests {
         assert_eq!(replayed, live);
         // The path came from the recorded lookup and the recorded home, not this machine.
         assert!(replayed.contains("\"subject\": \"~/proj\""), "{replayed}");
-        assert!(replayed.contains("\"events\": 4"), "{replayed}");
+        // The page fault's file came from the recorded mapping.
+        assert!(replayed.contains("\"subject\": \"~/maps\""), "{replayed}");
+        assert!(replayed.contains("\"events\": 5"), "{replayed}");
     }
 
     #[test]

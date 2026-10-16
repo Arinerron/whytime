@@ -54,5 +54,17 @@ path = "src/bin/wt-syscalls.rs"
 name = "wt-flock"
 path = "src/bin/wt-flock.rs"
 
+[[bin]]
+name = "wt-poll"
+path = "src/bin/wt-poll.rs"
+
+[[bin]]
+name = "wt-fault"
+path = "src/bin/wt-fault.rs"
+
+[[bin]]
+name = "wt-fifo"
+path = "src/bin/wt-fifo.rs"
+
 [lints]
 workspace = true

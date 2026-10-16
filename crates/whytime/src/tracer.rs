@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd as _, RawFd};
 
 use anyhow::Context as _;
 use aya::maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf};
-use aya::programs::{BtfTracePoint, ProgramError};
+use aya::programs::{Program, ProgramError};
 use aya::sys::SyscallError;
 use aya::{Btf, Ebpf, EbpfLoader, Pod};
 use whytime_abi::{STAT_NR, TaskState};
@@ -25,6 +25,20 @@ pub const SCHED: [(&str, &str); 5] = [
 /// its own it only clears state, while `sys_enter` alone would leave stale syscalls behind.
 pub const SYSCALLS: [(&str, &str); 2] =
     [("on_sys_exit", "sys_exit"), ("on_sys_enter", "sys_enter")];
+
+/// Readiness programs, `(program, kernel function)` (fentry): which file ended a
+/// poll/select or epoll wait. Without them those waits stay class `poll`.
+pub const READINESS: [(&str, &str); 2] = [
+    ("on_pollwake", "pollwake"),
+    ("on_ep_poll_callback", "ep_poll_callback"),
+];
+
+/// Page-fault programs (fexit, then fentry, so a half-attached pair only clears the mark).
+/// Without them blocks in page faults are not class `fault`.
+pub const FAULTS: [(&str, &str); 2] = [
+    ("on_fault_exit", "handle_mm_fault"),
+    ("on_fault_enter", "handle_mm_fault"),
+];
 
 /// `bpf_map_update_elem` flag: fail with `EEXIST` instead of replacing an entry.
 const BPF_NOEXIST: u64 = 1;
@@ -55,18 +69,23 @@ impl std::fmt::Debug for Maps {
     }
 }
 
-/// A successful load: the scheduler programs are attached; the syscall ones may not be.
+/// A successful load: the scheduler programs are attached; the optional sets may not be.
 #[derive(Debug)]
 pub struct Loaded {
     /// The tracer.
     pub tracer: Tracer,
     /// Why the syscall programs could not be attached, if they could not.
     pub syscalls: Result<(), anyhow::Error>,
+    /// Why the readiness programs could not be attached, if they could not.
+    pub readiness: Result<(), anyhow::Error>,
+    /// Why the page-fault programs could not be attached, if they could not.
+    pub faults: Result<(), anyhow::Error>,
 }
 
 impl Tracer {
     /// Loads the object, fills the syscall table and attaches every program. Fails only if
-    /// the object or a scheduler program cannot be loaded or attached.
+    /// the object or a scheduler program cannot be loaded or attached; the optional sets
+    /// report their own outcome.
     pub fn load(syscalls: &SyscallTable) -> anyhow::Result<Loaded> {
         raise_memlock();
         let btf = Btf::from_sys_fs().context("reading kernel BTF (/sys/kernel/btf/vmlinux)")?;
@@ -75,8 +94,15 @@ impl Tracer {
             whytime_bpf::OBJECT.len(),
             whytime_bpf::ABI_HASH
         );
+        // 0 (unknown) leaves the waker of interrupt-context wakeups as the interrupted task.
+        let preempt_count_from_rq = std::fs::read("/sys/kernel/btf/vmlinux")
+            .ok()
+            .and_then(|raw| crate::percpu::preempt_count_from_rq(&raw))
+            .unwrap_or(0);
+        log::debug!("preempt_count is {preempt_count_from_rq:+} bytes from runqueues");
         let mut ebpf = EbpfLoader::new()
             .btf(Some(&btf))
+            .override_global("preempt_count_from_rq", &preempt_count_from_rq, true)
             .load(whytime_bpf::OBJECT)
             .context("creating BPF maps")?;
 
@@ -85,12 +111,10 @@ impl Tracer {
             flags.set(nr, bits, 0).context("filling sys_flags")?;
         }
 
-        for (prog, tracepoint) in SCHED {
-            attach(&mut ebpf, &btf, prog, tracepoint)?;
-        }
-        let syscalls = SYSCALLS
-            .into_iter()
-            .try_for_each(|(prog, tracepoint)| attach(&mut ebpf, &btf, prog, tracepoint));
+        attach_all(&mut ebpf, &btf, &SCHED)?;
+        let syscalls = attach_all(&mut ebpf, &btf, &SYSCALLS);
+        let readiness = attach_all(&mut ebpf, &btf, &READINESS);
+        let faults = attach_all(&mut ebpf, &btf, &FAULTS);
 
         let maps = Maps {
             ring: RingBuf::try_from(take(&mut ebpf, "events")?)?,
@@ -101,6 +125,8 @@ impl Tracer {
         Ok(Loaded {
             tracer: Self { ebpf, maps },
             syscalls,
+            readiness,
+            faults,
         })
     }
 
@@ -208,21 +234,39 @@ fn take(ebpf: &mut Ebpf, name: &str) -> anyhow::Result<aya::maps::Map> {
         .with_context(|| format!("BPF object has no map {name}"))
 }
 
-fn attach(ebpf: &mut Ebpf, btf: &Btf, prog: &str, tracepoint: &str) -> anyhow::Result<()> {
-    let program: &mut BtfTracePoint = ebpf
+/// Loads and attaches `(program, target)` pairs in order, stopping at the first failure.
+fn attach_all(ebpf: &mut Ebpf, btf: &Btf, programs: &[(&str, &str)]) -> anyhow::Result<()> {
+    programs
+        .iter()
+        .try_for_each(|&(prog, target)| attach(ebpf, btf, prog, target))
+}
+
+/// Loads `prog` against `target` (a tracepoint for `tp_btf`, a kernel function for
+/// `fentry`/`fexit`) and attaches it.
+fn attach(ebpf: &mut Ebpf, btf: &Btf, prog: &str, target: &str) -> anyhow::Result<()> {
+    macro_rules! load_attach {
+        ($program:expr, $kind:literal) => {{
+            if let Err(err) = $program.load(target, btf) {
+                if let ProgramError::LoadError { verifier_log, .. } = &err {
+                    log::debug!("verifier log for {prog}:\n{verifier_log}");
+                }
+                return Err(err).with_context(|| format!("loading {}/{target}", $kind));
+            }
+            $program
+                .attach()
+                .map(drop)
+                .with_context(|| format!("attaching {}/{target}", $kind))
+        }};
+    }
+    match ebpf
         .program_mut(prog)
         .with_context(|| format!("BPF object has no program {prog}"))?
-        .try_into()?;
-    if let Err(err) = program.load(tracepoint, btf) {
-        if let ProgramError::LoadError { verifier_log, .. } = &err {
-            log::debug!("verifier log for {prog}:\n{verifier_log}");
-        }
-        return Err(err).with_context(|| format!("loading tp_btf/{tracepoint}"));
+    {
+        Program::BtfTracePoint(program) => load_attach!(program, "tp_btf"),
+        Program::FEntry(program) => load_attach!(program, "fentry"),
+        Program::FExit(program) => load_attach!(program, "fexit"),
+        _ => anyhow::bail!("BPF program {prog} has an unsupported type"),
     }
-    program
-        .attach()
-        .with_context(|| format!("attaching tp_btf/{tracepoint}"))?;
-    Ok(())
 }
 
 /// Inserts `key` unless present; `Ok(false)` when it was.

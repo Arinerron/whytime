@@ -39,6 +39,15 @@ wire::wire! {
         pub run_ns: u64,
         /// Nanoseconds runnable but preempted (waiting for a CPU) within the segment.
         pub rq_ns: u64,
+        /// Longest single runnable-but-preempted stretch within the segment; 0 when none.
+        pub preempt_max_ns: u64,
+        /// Thread-group id of the CPU holder during that stretch: the task that preempted
+        /// this one, or for a new task the one that ran just before its first switch-in.
+        pub preempt_tgid: u32,
+        /// Zero.
+        pub _pad: u32,
+        /// `comm` of that CPU holder.
+        pub preempt_comm: [u8; 16],
     }
 
     /// The syscall a thread is in, with what the kernel knows about its file descriptor.
@@ -131,9 +140,10 @@ wire::wire! {
         pub wake_ts: u64,
         /// The syscall the thread blocked in.
         pub sys: SysInfo,
-        /// Thread id of the task that woke it (0 when unknown).
+        /// Thread id of the task that woke it; 0 when unknown or when the wakeup came from
+        /// interrupt or softirq context (where the current task is unrelated).
         pub waker_tid: u32,
-        /// Thread-group id of the task that woke it (0 when unknown).
+        /// Thread-group id of the task that woke it; 0 under the same conditions.
         pub waker_tgid: u32,
         /// `prev_state` at the switch-out (`TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, ...).
         pub block_state: u32,
@@ -141,6 +151,22 @@ wire::wire! {
         pub _pad: u32,
         /// Syscall arguments, filesystem and path of the file the thread blocked on.
         pub detail: SysDetail,
+        /// `EPF_*` bits.
+        pub flags: u32,
+        /// Thread-group id of the task that ran on the CPU just before this thread was
+        /// switched in (0 for an idle CPU).
+        pub run_holder_tgid: u32,
+        /// `comm` of that task (`swapper/N` for an idle CPU).
+        pub run_holder_comm: [u8; 16],
+        /// `comm` of the waker when it is a process-context task outside the traced tree;
+        /// empty otherwise.
+        pub waker_comm: [u8; 16],
+        /// With `EPF_READY`: the file whose readiness ended a poll/select/epoll wait (`nr` is
+        /// `NR_NONE`; `fd` is its epoll item's descriptor, or -1 for poll/select).
+        pub ready: SysInfo,
+        /// With `EPF_FAULT`: the file mapped at the page fault the thread blocked in (`nr` is
+        /// `NR_NONE`, `fd` -1); `mode` 0 means anonymous memory.
+        pub fault: SysInfo,
     }
 
     /// A tracked thread exited (`sched_process_exit`).
@@ -175,7 +201,7 @@ wire::wire! {
         pub state: u32,
         /// `prev_state` of the last voluntary switch-out.
         pub block_state: u32,
-        /// Thread id of the waker of the current block.
+        /// Thread id of the waker of the current block (see [`EpisodeRecord::waker_tid`]).
         pub waker_tid: u32,
         /// Thread-group id of the waker of the current block.
         pub waker_tgid: u32,
@@ -183,6 +209,26 @@ wire::wire! {
         pub _pad: u32,
         /// Arguments of the syscall in flight and its block-time description.
         pub detail: SysDetail,
+        /// With `has_ready`: the file whose readiness ended the current block.
+        pub ready: SysInfo,
+        /// The file of the page fault in progress, described when the thread blocks in it;
+        /// `mode` 0 means anonymous memory.
+        pub fault: SysInfo,
+        /// `vma->vm_file` (kernel pointer) of the page fault in progress; 0 for anonymous
+        /// memory.
+        pub fault_file: u64,
+        /// 1 while the thread is inside `handle_mm_fault`.
+        pub in_fault: u32,
+        /// 1 when `ready` describes the readiness that ended the current block.
+        pub has_ready: u32,
+        /// Thread-group id of the task that took the CPU at this thread's last preemption.
+        pub pend_tgid: u32,
+        /// Zero.
+        pub _pad2: u32,
+        /// `comm` of that task.
+        pub pend_comm: [u8; 16],
+        /// `comm` of the waker of the current block when it is outside the traced tree.
+        pub waker_comm: [u8; 16],
     }
 }
 
@@ -209,6 +255,11 @@ wire::wire_consts! {
 
     /// [`SysInfo::nr`] outside syscalls.
     pub const NR_NONE: i32 = -1;
+
+    /// [`EpisodeRecord::flags`]: the thread blocked inside a page fault (`fault` is valid).
+    pub const EPF_FAULT: u32 = 1;
+    /// [`EpisodeRecord::flags`]: `ready` names the file whose readiness ended the block.
+    pub const EPF_READY: u32 = 2;
 
     /// `sys_flags` bit: argument 0 is a file descriptor to describe.
     pub const SYSF_FD0: u32 = 1;

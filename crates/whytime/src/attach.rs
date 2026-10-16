@@ -261,7 +261,7 @@ impl Session {
         let creds = crate::sudo_credentials()?;
         let home = crate::home_dir(creds.as_ref().map(|creds| creds.uid));
         let syscalls = SyscallTable::new();
-        let (mut tracer, syscalls_attached) = crate::load(&syscalls)?;
+        let (mut tracer, probes) = crate::load(&syscalls)?;
         let ticks_per_sec = crate::ticks_per_sec()?;
         let recorder = crate::recorder(args, creds.as_ref())?;
         // From here on, Ctrl-C ends the observation instead of killing whytime.
@@ -279,7 +279,7 @@ impl Session {
             command: command(root),
             root_pid: target.pid,
             home: home.clone(),
-            syscalls: syscalls_attached,
+            probes,
             ticks_per_sec,
             attached: Some(Attached {
                 pid: target.pid,
