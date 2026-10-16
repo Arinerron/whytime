@@ -130,8 +130,8 @@ MIT, see [LICENSE](LICENSE). The BPF object declares `Dual MIT/GPL` at load time
 kernel only grants GPL-only helpers to programs with a GPL-compatible license string (MIT
 code may be distributed under the GPL). The vendored libbpf headers in
 `crates/whytime-bpf/bpf/include/bpf/` keep their own license, `LGPL-2.1 OR BSD-2-Clause`.
-The SVG flamegraph renderer, [inferno](https://github.com/jonhoo/inferno), is CDDL-1.0
-(file-level copyleft; linked as a library from crates.io).
+The SVG flamegraph is drawn by whytime itself (`svg.rs`); every Rust dependency is MIT,
+Apache-2.0, Zlib or Unicode-3.0 licensed (or dual-licensed with one of them).
 
 ## Status: MVP
 

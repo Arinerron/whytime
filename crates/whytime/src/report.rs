@@ -122,8 +122,6 @@ pub struct Meta {
     pub readiness: bool,
     /// Page-fault probes attached.
     pub faults: bool,
-    /// Stack capture for a flamegraph: `None` when not requested, else whether it worked.
-    pub stacks: Option<bool>,
     /// Attach mode: the target and how it was seeded.
     pub attached: Option<Attached>,
 }
@@ -231,12 +229,6 @@ impl Report {
             notes.push(
                 "page-fault probes unavailable: time blocked in page faults is not reported as \
                  \"fault\""
-                    .to_owned(),
-            );
-        }
-        if meta.stacks == Some(false) {
-            notes.push(
-                "stack capture unavailable: no flamegraph (see `whytime doctor`, probe.stacks)"
                     .to_owned(),
             );
         }

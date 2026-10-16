@@ -4,13 +4,15 @@ use std::io;
 use std::os::fd::{AsRawFd as _, RawFd};
 
 use anyhow::Context as _;
-use aya::maps::{Array, HashMap, MapData, MapError, PerCpuArray, RingBuf, StackTraceMap};
+use aya::maps::{
+    Array, ArrayOfMaps, HashMap, MapData, MapError, PerCpuArray, RingBuf, StackTraceMap,
+};
 use aya::programs::perf_event::{PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent};
 use aya::programs::{Program, ProgramError};
 use aya::sys::SyscallError;
 use aya::{Btf, Ebpf, EbpfLoader, Pod};
 use whytime_abi::{
-    SAMPLE_HZ, STACKS_MAX, STAT_RING_FULL, STAT_STACK_COLLISION, STAT_STACK_FULL,
+    SAMPLE_HZ, STACK_DEPTH, STACKS_MAX, STAT_RING_FULL, STAT_STACK_INLINE, STAT_STACK_LOST,
     STAT_TASKS_FULL, STAT_TRACKED_FULL, TaskState,
 };
 
@@ -48,6 +50,10 @@ pub const FAULTS: [(&str, &str); 2] = [
 /// CPU when stack capture is on.
 pub const SAMPLER: &str = "on_sample";
 
+/// Test-only override of each stack map's capacity (`WHYTIME_STACK_MAP_ENTRIES`, at most
+/// [`STACKS_MAX`]): a tiny map makes most stacks take the STACK record path.
+const MAP_ENTRIES_ENV: &str = "WHYTIME_STACK_MAP_ENTRIES";
+
 /// `bpf_map_update_elem` flag: fail with `EEXIST` instead of replacing an entry.
 const BPF_NOEXIST: u64 = 1;
 
@@ -63,8 +69,21 @@ pub struct Maps {
     tasks: HashMap<MapData, u32, TaskState>,
     tracked: HashMap<MapData, u32, u32>,
     stats: PerCpuArray<MapData, u64>,
-    /// The `stacks` map, when stack capture is on.
-    stacks: Option<StackTraceMap<MapData>>,
+    /// The stack maps, when stack capture is on.
+    stacks: Option<StackMaps>,
+}
+
+/// The stack capture maps: two stack maps used alternately by generation, the generation
+/// the programs store into, and the barrier (see `whytime.bpf.c`).
+pub struct StackMaps {
+    /// `stacks0` and `stacks1`: generation `g` stores into `maps[g % 2]`.
+    maps: [StackTraceMap<MapData>; 2],
+    /// `stack_gen`: entry 0 is the current generation.
+    generation: Array<MapData, u32>,
+    /// `stack_barrier`: an update returns after an RCU grace period.
+    barrier: ArrayOfMaps<MapData, Array<MapData, u32>>,
+    /// Entries per stack map.
+    pub capacity: u32,
 }
 
 impl std::fmt::Debug for Tracer {
@@ -76,6 +95,14 @@ impl std::fmt::Debug for Tracer {
 impl std::fmt::Debug for Maps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Maps").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for StackMaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StackMaps")
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
     }
 }
 
@@ -96,18 +123,14 @@ pub struct Loaded {
 
 impl Tracer {
     /// Loads the object, fills the syscall table and attaches every program; with `stacks`,
-    /// also turns on stack capture at blocks and attaches the on-CPU sampler. Fails only if
-    /// the object or a scheduler program cannot be loaded or attached; the optional sets
-    /// (stack capture included) report their own outcome. If the scheduler programs fail
-    /// with stack capture on, the load is retried without it.
+    /// the object built with stack capture (stack maps, stacks at blocks, the on-CPU
+    /// sampler). Fails only if the object or a scheduler program cannot be loaded or
+    /// attached; the optional sets report their own outcome. If anything about stack capture
+    /// fails, the plain object is loaded instead and `stacks` says why.
     pub fn load(syscalls: &SyscallTable, stacks: bool) -> anyhow::Result<Loaded> {
         raise_memlock();
         let btf = Btf::from_sys_fs().context("reading kernel BTF (/sys/kernel/btf/vmlinux)")?;
-        log::debug!(
-            "loading BPF object: {} bytes, wire abi {:#018x}",
-            whytime_bpf::OBJECT.len(),
-            whytime_bpf::ABI_HASH
-        );
+        log::debug!("wire abi {:#018x}", whytime_bpf::ABI_HASH);
         // 0 (unknown) leaves the waker of interrupt-context wakeups as the interrupted task.
         let preempt_count_from_rq = std::fs::read("/sys/kernel/btf/vmlinux")
             .ok()
@@ -120,7 +143,7 @@ impl Tracer {
         match Self::load_with(&btf, syscalls, preempt_count_from_rq, true) {
             Ok(loaded) => Ok(loaded),
             Err(err) => {
-                log::debug!("loading with stack capture failed ({err:#}); retrying without");
+                log::debug!("loading with stack capture failed ({err:#}); loading without");
                 let mut loaded = Self::load_with(&btf, syscalls, preempt_count_from_rq, false)?;
                 loaded.stacks = Some(Err(err));
                 Ok(loaded)
@@ -128,21 +151,36 @@ impl Tracer {
         }
     }
 
+    /// Loads the plain object, or with `stacks` the stack capture one, in which case every
+    /// part of stack capture must work too.
     fn load_with(
         btf: &Btf,
         syscalls: &SyscallTable,
         preempt_count_from_rq: i64,
         stacks: bool,
     ) -> anyhow::Result<Loaded> {
-        let stacks_enabled = u32::from(stacks);
-        let mut ebpf = EbpfLoader::new()
+        let entries = if stacks {
+            check_max_stack()?;
+            stack_map_entries()
+        } else {
+            0
+        };
+        let object = if stacks {
+            whytime_bpf::STACKS_OBJECT
+        } else {
+            whytime_bpf::OBJECT
+        };
+        log::debug!("loading BPF object: {} bytes, stack capture {stacks}", object.len());
+        let mut loader = EbpfLoader::new();
+        loader
             .btf(Some(btf))
-            .override_global("preempt_count_from_rq", &preempt_count_from_rq, true)
-            .override_global("stacks_enabled", &stacks_enabled, true)
-            // Without capture the map is never written: one entry instead of ~16 MiB.
-            .map_max_entries("stacks", if stacks { STACKS_MAX } else { 1 })
-            .load(whytime_bpf::OBJECT)
-            .context("creating BPF maps")?;
+            .override_global("preempt_count_from_rq", &preempt_count_from_rq, true);
+        if stacks {
+            loader
+                .map_max_entries("stacks0", entries)
+                .map_max_entries("stacks1", entries);
+        }
+        let mut ebpf = loader.load(object).context("creating BPF maps")?;
 
         let mut flags: Array<_, u32> = Array::try_from(map(&mut ebpf, "sys_flags")?)?;
         for (nr, bits) in syscalls.bpf_flags() {
@@ -150,27 +188,37 @@ impl Tracer {
         }
 
         attach_all(&mut ebpf, btf, &SCHED)?;
+        let stack_maps = if stacks {
+            attach_sampler(&mut ebpf)?;
+            Some(StackMaps {
+                maps: [
+                    StackTraceMap::try_from(take(&mut ebpf, "stacks0")?)?,
+                    StackTraceMap::try_from(take(&mut ebpf, "stacks1")?)?,
+                ],
+                generation: Array::try_from(take(&mut ebpf, "stack_gen")?)?,
+                barrier: ArrayOfMaps::try_from(take(&mut ebpf, "stack_barrier")?)?,
+                capacity: entries,
+            })
+        } else {
+            None
+        };
         let syscalls = attach_all(&mut ebpf, btf, &SYSCALLS);
         let readiness = attach_all(&mut ebpf, btf, &READINESS);
         let faults = attach_all(&mut ebpf, btf, &FAULTS);
-        let sampler = stacks.then(|| attach_sampler(&mut ebpf));
 
         let maps = Maps {
             ring: RingBuf::try_from(take(&mut ebpf, "events")?)?,
             tasks: HashMap::try_from(take(&mut ebpf, "tasks")?)?,
             tracked: HashMap::try_from(take(&mut ebpf, "tracked")?)?,
             stats: PerCpuArray::try_from(take(&mut ebpf, "stats")?)?,
-            stacks: match sampler {
-                Some(Ok(())) => Some(StackTraceMap::try_from(take(&mut ebpf, "stacks")?)?),
-                _ => None,
-            },
+            stacks: stack_maps,
         };
         Ok(Loaded {
             tracer: Self { ebpf, maps },
             syscalls,
             readiness,
             faults,
-            stacks: sampler,
+            stacks: stacks.then_some(Ok(())),
         })
     }
 
@@ -221,9 +269,14 @@ impl Tracer {
         self.maps.drain(f);
     }
 
-    /// The `stacks` map, when stack capture is on (once): stacks are read from it while the
+    /// The in-kernel state of every thread still tracked.
+    pub fn tasks(&self) -> Vec<(u32, TaskState)> {
+        self.maps.tasks()
+    }
+
+    /// The stack maps, when stack capture is on (once): stacks are read from them while the
     /// run goes and after the programs are detached.
-    pub fn take_stacks(&mut self) -> Option<StackTraceMap<MapData>> {
+    pub fn take_stacks(&mut self) -> Option<StackMaps> {
         self.maps.stacks.take()
     }
 
@@ -270,10 +323,15 @@ impl Maps {
         self.stat_sum(&[STAT_RING_FULL, STAT_TASKS_FULL, STAT_TRACKED_FULL])
     }
 
-    /// Stacks lost to `stacks` map collisions or a full map (all CPUs); the records that
-    /// referred to them carry the error instead.
+    /// Stacks lost in kernel (all CPUs): the stack map could not take them and the ring
+    /// buffer had no room for a copy; the records that referred to them carry the error.
     pub fn lost_stacks(&self) -> u64 {
-        self.stat_sum(&[STAT_STACK_COLLISION, STAT_STACK_FULL])
+        self.stat_sum(&[STAT_STACK_LOST])
+    }
+
+    /// Stacks the stack maps could not take, copied into STACK records instead (all CPUs).
+    pub fn inline_stacks(&self) -> u64 {
+        self.stat_sum(&[STAT_STACK_INLINE])
     }
 
     fn stat_sum(&self, slots: &[u32]) -> u64 {
@@ -283,6 +341,81 @@ impl Maps {
             .map(|per_cpu| per_cpu.iter().sum::<u64>())
             .sum()
     }
+}
+
+impl StackMaps {
+    /// Makes newly started programs store stacks into `generation` (its map must
+    /// be empty); [`barrier`](Self::barrier) waits for the ones still on the previous.
+    pub fn set_generation(&mut self, generation: u32) -> Result<(), MapError> {
+        self.generation.set(0, generation, 0)
+    }
+
+    /// Returns once every program running when it was called has finished (an RCU grace
+    /// period: a map-in-map update waits for one).
+    pub fn barrier(&mut self) -> Result<(), MapError> {
+        self.barrier.set(0, &self.generation, 0)
+    }
+
+    /// The addresses of stack `id` in `generation`'s map, innermost first; `None`
+    /// when it cannot be read.
+    pub fn read(&self, generation: u32, id: u32) -> Option<Vec<u64>> {
+        match self.maps[slot(generation)].get(&id, 0) {
+            Ok(stack) => Some(stack.frames().iter().map(|frame| frame.ip).collect()),
+            Err(err) => {
+                log::debug!("reading stack {generation}:{id}: {err}");
+                None
+            }
+        }
+    }
+
+    /// Empties `generation`'s map; returns how many stacks it removed.
+    pub fn clear(&mut self, generation: u32) -> usize {
+        let map = &mut self.maps[slot(generation)];
+        let ids: Vec<u32> = map.stack_ids().filter_map(Result::ok).collect();
+        ids.iter()
+            .filter(|id| match map.remove(id) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::debug!("removing stack {generation}:{id}: {err}");
+                    false
+                }
+            })
+            .count()
+    }
+}
+
+/// Index of `generation`'s map among the two stack maps.
+pub fn slot(generation: u32) -> usize {
+    usize::from(generation % 2 == 1)
+}
+
+/// Fails with `EINVAL` (the stack maps' creation error) when `kernel.perf_event_max_stack`
+/// is below [`STACK_DEPTH`]: the kernel refuses stack maps holding more frames than it.
+fn check_max_stack() -> anyhow::Result<()> {
+    const SYSCTL: &str = "/proc/sys/kernel/perf_event_max_stack";
+    let Some(max) = std::fs::read_to_string(SYSCTL)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+    else {
+        return Ok(());
+    };
+    if max < STACK_DEPTH {
+        return Err(anyhow::Error::new(io::Error::from_raw_os_error(libc::EINVAL)).context(
+            format!(
+                "kernel.perf_event_max_stack is {max}, below the {STACK_DEPTH} frames per stack \
+                 of whytime's stack maps"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Entries per stack map: [`STACKS_MAX`], or less with [`MAP_ENTRIES_ENV`].
+fn stack_map_entries() -> u32 {
+    std::env::var(MAP_ENTRIES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map_or(STACKS_MAX, |entries| entries.clamp(1, STACKS_MAX))
 }
 
 fn map<'a>(ebpf: &'a mut Ebpf, name: &str) -> anyhow::Result<&'a mut aya::maps::Map> {

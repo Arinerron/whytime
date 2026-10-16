@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use bpfdoctor::{
     Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name,
 };
+use whytime_abi::STACK_DEPTH;
 
 use crate::sys::SyscallTable;
 use crate::tracer::{self, FAULTS, READINESS, SAMPLER, SCHED, SYSCALLS, Tracer};
@@ -179,14 +180,17 @@ fn fentry_fixes(err: &anyhow::Error, tool: &Tool, functions: &str) -> Vec<Fix> {
     }
 }
 
-/// Fixes for a failed stack-capture set (stack map, perf_event sampler).
+/// Fixes for a failed stack-capture set (stack maps, perf_event sampler).
 fn stack_fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
     match tracer::errno(err) {
         Some(libc::EPERM | libc::EACCES) => fixes(err, tool),
         Some(libc::EINVAL) => vec![
             Fix::new(
-                "sudo sysctl kernel.perf_event_max_stack=127",
-                "the stack map holds 127 frames per stack, which the sysctl must allow",
+                format!("sudo sysctl kernel.perf_event_max_stack={STACK_DEPTH}"),
+                format!(
+                    "the stack maps hold {STACK_DEPTH} frames per stack, which the sysctl must \
+                     allow (runs without --flamegraph/--folded do not need it)"
+                ),
             ),
             debug_fix(tool),
         ],
@@ -287,10 +291,10 @@ static OPTIONAL: [OptionalSpec; 4] = [
     OptionalSpec {
         id: "probe.stacks",
         title: "Stack capture (flamegraphs)",
-        impact: "--flamegraph and --folded produce no flamegraph (the report is unaffected)",
+        impact: "whytime refuses --flamegraph and --folded (runs without them are unaffected)",
         explain: "a perf_event program on every CPU samples on-CPU stacks, and sched_switch \
-                  records where threads block, into a BPF stack map; only with --flamegraph \
-                  or --folded",
+                  records where threads block, into BPF stack maps; only with --flamegraph \
+                  or --folded, which load a separate BPF object with them",
         attach: Attach::Stacks,
     },
 ];

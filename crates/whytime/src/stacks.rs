@@ -1,79 +1,186 @@
 //! Stacks for flamegraphs, when stack capture is on (`--flamegraph`, `--folded`).
 //!
-//! The kernel side records stacks as references into its `stacks` map: the user and kernel
-//! stack of every block (episode records and the final sweep) and of every on-CPU sample
-//! (sample records). A user address only means something in its process's address space at
-//! that time, so the [`Collector`] normalizes each user stack as its record arrives, while
-//! the process still runs: every address becomes (mapped file, file offset) through a cache
-//! of the process image's `/proc/PID/maps` (read at exec, copied at fork, re-read on a miss
-//! while that image is current), and each mapped file is opened then (through
-//! `/proc/PID/map_files`, else `/proc/PID/root`, and checked against the mapping's dev:ino), so
-//! a file deleted or replaced later still symbolizes correctly. At the window's end the
-//! stacks no record carried (threads blocked at the end) are read too, then every frame is
-//! symbolized: user frames from the files' ELF symbol tables (`.symtab`, else `.dynsym`; Rust
-//! and C++ names demangled), kernel frames from `/proc/kallsyms`. The resulting [`Symbols`]
-//! are all a flamegraph takes from outside the trace; trace files record them.
+//! The kernel side refers to stacks: the user and kernel stack of every block (episode
+//! records and the final sweep) and of every on-CPU sample (sample records). A reference is
+//! an id in one of two stack maps, picked by the capture's generation, or, when that map could
+//! not take the stack (bucket collision, full map), a copy in a STACK record sent just before,
+//! named by thread and capture time ([`StackKey`]).
+//!
+//! Generations keep the maps from filling with stale stacks over a long run. Every
+//! [`FLIP_NS`] (or when the current map looks a quarter full) the [`Collector`] flips: the
+//! programs move to the other, empty map, and once no program uses the old one (an RCU grace
+//! period), the old generation's stacks that blocked threads still refer to are read (their
+//! episodes come later), the records already reserved are committed (a second grace period)
+//! and drained, which reads every stack they refer to, and the old map is emptied for the
+//! generation after next.
+//!
+//! A user address only means something in its process's address space at that time, so the
+//! Collector normalizes each user stack as its record arrives, while the process still runs:
+//! every address becomes (mapped file, file offset) through a cache of the process image's
+//! `/proc/PID/maps` (read at exec, copied at fork, re-read on a miss while that image is
+//! current), and each mapped file is opened then (through `/proc/PID/map_files`, else
+//! `/proc/PID/root`, and checked against the mapping's dev:ino), so a file deleted or replaced
+//! later still symbolizes correctly. Kernel stacks are read as their records arrive too. At
+//! the window's end the stacks no record carried (threads blocked at the end) are read, then
+//! every distinct stack is symbolized once: user frames from the files' ELF symbol tables
+//! (`.symtab`, else `.dynsym`; Rust and C++ names demangled), kernel frames from
+//! `/proc/kallsyms`. The resulting [`Symbols`] are all a flamegraph takes from outside the
+//! trace; trace files record them.
 //!
 //! Frames that cannot be named say why: `[file]` (an address in a mapped file without a
 //! covering symbol, e.g. a stripped binary), `[vdso]`, `[unknown]` (no executable mapping:
 //! JIT code, or a broken frame-pointer chain), `[kernel]` (the kernel stack, when
 //! `/proc/kallsyms` hides addresses).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
+use std::hash::Hash;
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::MetadataExt as _;
 
-use aya::maps::{MapData, StackTraceMap};
 use object::{Object as _, ObjectSegment as _, SymbolKind};
 use procctx::ProcKey;
 use whytime_abi::{
-    EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EV_SAMPLE, EpisodeRecord, EvHeader, ExitRecord,
-    ForkRecord, SampleRecord,
+    EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EV_SAMPLE, EV_STACK, EpisodeRecord, EvHeader,
+    ExitRecord, ForkRecord, ST_BLOCKED, ST_WOKEN, STACK_INLINE, SampleRecord, StackRecord,
+    TaskState,
 };
 
 use crate::timeline::{SegKind, StackIds, Trace};
+use crate::tracer::{StackMaps, slot};
+
+/// Time between stack generation flips.
+const FLIP_NS: u64 = 1_000_000_000;
+/// Shortest time between flips started because the map looked a quarter full.
+const EARLY_FLIP_NS: u64 = 10_000_000;
+/// Test-only override of [`FLIP_NS`] in milliseconds (`WHYTIME_STACK_FLIP_MS`, 1 to 60000).
+const FLIP_ENV: &str = "WHYTIME_STACK_FLIP_MS";
+
+/// A stack the kernel captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StackKey {
+    /// Stack `id` in `generation`'s stack map.
+    Map {
+        /// Generation.
+        generation: u32,
+        /// Stack id.
+        id: u32,
+    },
+    /// The copy in a STACK record of thread `tid`'s stack captured at `at`.
+    Inline {
+        /// Thread.
+        tid: u32,
+        /// Capture time.
+        at: u64,
+        /// Kernel (else user) stack.
+        kernel: bool,
+    },
+}
+
+impl StackKey {
+    /// The stack a reference (`TaskState::user_stack` encoding) names, if any: taken by
+    /// thread `tid` at `at` in `generation`, a `kernel` or user stack.
+    pub fn of(encoded: i32, generation: u32, tid: u32, at: u64, kernel: bool) -> Option<Self> {
+        if encoded == STACK_INLINE {
+            return Some(Self::Inline { tid, at, kernel });
+        }
+        let id = u32::try_from(encoded).ok()?.checked_sub(1)?;
+        Some(Self::Map { generation, id })
+    }
+
+    /// The kernel stack `ids` (taken by thread `tid`) refers to, if any.
+    pub fn kernel(tid: u32, ids: StackIds) -> Option<Self> {
+        Self::of(ids.kernel, ids.generation, tid, ids.at, true)
+    }
+}
 
 /// A user stack: the process lifetime and image it was taken in (see [`StackIds::image`])
-/// and its id in the kernel's `stacks` map.
+/// and the stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UserKey {
     /// The process.
     pub proc: ProcKey,
     /// Its image.
     pub image: u32,
-    /// Stack id.
-    pub id: u32,
+    /// The stack.
+    pub stack: StackKey,
 }
 
 impl UserKey {
-    /// The user stack `ids` refers to in process `proc`, if it refers to one.
-    pub fn of(proc: ProcKey, ids: StackIds) -> Option<Self> {
+    /// The user stack `ids` (taken by thread `tid` of process `proc`) refers to, if any.
+    pub fn of(proc: ProcKey, tid: u32, ids: StackIds) -> Option<Self> {
         Some(Self {
             proc,
             image: ids.image,
-            id: stack_id(ids.user)?,
+            stack: StackKey::of(ids.user, ids.generation, tid, ids.at, false)?,
         })
     }
-}
-
-/// The `stacks` map id an encoded stack reference (`TaskState::user_stack`) names.
-pub fn stack_id(encoded: i32) -> Option<u32> {
-    u32::try_from(encoded).ok()?.checked_sub(1)
 }
 
 /// Symbolized stacks, frames outermost first: everything a flamegraph needs besides the
 /// trace.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Symbols {
-    /// User stacks.
-    pub user: BTreeMap<UserKey, Vec<String>>,
-    /// Kernel stacks by `stacks` map id, BPF and tracing frames removed.
-    pub kernel: BTreeMap<u32, Vec<String>>,
+    /// Distinct stacks' frames (one entry serves every key with those frames).
+    pub stacks: Vec<Vec<String>>,
+    /// User stacks: index into `stacks`.
+    pub user: BTreeMap<UserKey, u32>,
+    /// Kernel stacks, BPF and tracing frames removed: index into `stacks`.
+    pub kernel: BTreeMap<StackKey, u32>,
+}
+
+impl Symbols {
+    /// Adds a stack's frames; returns its index.
+    pub fn push(&mut self, frames: Vec<String>) -> u32 {
+        self.stacks.push(frames);
+        u32::try_from(self.stacks.len() - 1).unwrap_or(u32::MAX)
+    }
+
+    /// The frames of user stack `key`.
+    pub fn user(&self, key: &UserKey) -> Option<&[String]> {
+        self.frames(self.user.get(key))
+    }
+
+    /// The frames of kernel stack `key`.
+    pub fn kernel(&self, key: &StackKey) -> Option<&[String]> {
+        self.frames(self.kernel.get(key))
+    }
+
+    fn frames(&self, index: Option<&u32>) -> Option<&[String]> {
+        let index = usize::try_from(*index?).ok()?;
+        self.stacks.get(index).map(Vec::as_slice)
+    }
+}
+
+/// Distinct values, numbered in insertion order.
+#[derive(Debug)]
+struct Interner<T> {
+    values: Vec<T>,
+    ids: HashMap<T, u32>,
+}
+
+impl<T: Clone + Eq + Hash> Interner<T> {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            ids: HashMap::new(),
+        }
+    }
+
+    /// The number of `value`, added if new.
+    fn id(&mut self, value: T) -> u32 {
+        if let Some(&id) = self.ids.get(&value) {
+            return id;
+        }
+        let id = u32::try_from(self.values.len()).unwrap_or(u32::MAX);
+        self.ids.insert(value.clone(), id);
+        self.values.push(value);
+        id
+    }
 }
 
 /// Where a user address points.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Loc {
     /// At `offset` in mapped file `file` (an index into [`Collector::files`]).
     File { file: usize, offset: u64 },
@@ -123,13 +230,39 @@ struct MappedFile {
     file: Option<File>,
 }
 
-/// Collects and normalizes stacks during a live run.
+/// Collects and normalizes stacks during a live run, and flips stack generations.
+#[derive(Debug)]
 pub struct Collector {
-    map: StackTraceMap<MapData>,
+    maps: StackMaps,
+    /// The generation the programs store into.
+    generation: u32,
+    /// Per map slot, the oldest generation whose stacks it may hold: generation `g`'s ids
+    /// can be read while `since[slot(g)] <= g`.
+    since: [u32; 2],
+    /// Whether every barrier of the flip in progress worked, so the old map may be emptied.
+    barriers_held: bool,
+    /// Time between flips.
+    interval: u64,
+    /// When the last flip ended, and when the next is due.
+    flipped_at: u64,
+    flip_at: u64,
+    /// Ids of the current generation read so far: a lower bound of its map's fill.
+    fresh: HashSet<u32>,
+    /// Flips done and stacks they emptied (debug log).
+    flips: u32,
+    cleared: usize,
     /// The current image of each live process, by pid.
     images: HashMap<u32, Image>,
-    /// Normalized user stacks, outermost frame first.
-    stacks: HashMap<UserKey, Vec<Loc>>,
+    /// Old generations' stacks that blocked threads referred to at a flip, innermost first.
+    kept: HashMap<StackKey, Vec<u64>>,
+    /// Normalized user stacks: index into `locs`; `None` when unreadable.
+    user: HashMap<UserKey, Option<u32>>,
+    /// Distinct normalized user stacks, outermost frame first.
+    locs: Interner<Vec<Loc>>,
+    /// Kernel stacks: index into `kips`; `None` when unreadable.
+    kernel: HashMap<StackKey, Option<u32>>,
+    /// Distinct kernel stacks' addresses, innermost first.
+    kips: Interner<Vec<u64>>,
     files: Vec<MappedFile>,
     /// `(dev, ino)` → index into `files`.
     file_ids: HashMap<(u64, u64), usize>,
@@ -137,26 +270,114 @@ pub struct Collector {
     kallsyms: Kallsyms,
 }
 
-impl std::fmt::Debug for Collector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Collector")
-            .field("images", &self.images.len())
-            .field("stacks", &self.stacks.len())
-            .field("files", &self.files.len())
-            .finish_non_exhaustive()
-    }
-}
-
 impl Collector {
-    /// A collector reading the kernel's `stacks` map.
-    pub fn new(map: StackTraceMap<MapData>) -> Self {
+    /// A collector reading the stack maps `maps` (generation 0 current), starting at `now`.
+    pub fn new(maps: StackMaps, now: u64) -> Self {
+        let interval = std::env::var(FLIP_ENV)
+            .ok()
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .map_or(FLIP_NS, |ms| ms.clamp(1, 60_000) * 1_000_000);
         Self {
-            map,
+            maps,
+            generation: 0,
+            since: [0, 1],
+            barriers_held: true,
+            interval,
+            flipped_at: now,
+            flip_at: now.saturating_add(interval),
+            fresh: HashSet::new(),
+            flips: 0,
+            cleared: 0,
             images: HashMap::new(),
-            stacks: HashMap::new(),
+            kept: HashMap::new(),
+            user: HashMap::new(),
+            locs: Interner::new(),
+            kernel: HashMap::new(),
+            kips: Interner::new(),
             files: Vec::new(),
             file_ids: HashMap::new(),
             kallsyms: Kallsyms::default(),
+        }
+    }
+
+    /// Whether a flip is due at `now`: the interval passed, or the current map looks a
+    /// quarter full.
+    pub fn flip_due(&self, now: u64) -> bool {
+        let filling = self.fresh.len().saturating_mul(4)
+            >= usize::try_from(self.maps.capacity).unwrap_or(usize::MAX);
+        now >= self.flip_at || (filling && now >= self.flipped_at.saturating_add(EARLY_FLIP_NS))
+    }
+
+    /// When the next flip is due (the event loop wakes up for it).
+    pub fn next_flip(&self) -> u64 {
+        self.flip_at
+    }
+
+    /// Starts a flip at `now`: the programs store into the next generation's (empty) map
+    /// from now on, and once this returns none still uses the old one. Then
+    /// [`keep`](Self::keep), drain the ring through [`observe`](Self::observe), and
+    /// [`retire`](Self::retire). False when the generation could not be changed (no flip;
+    /// the next try is an interval later).
+    pub fn advance(&mut self, now: u64) -> bool {
+        let next = self.generation + 1;
+        if let Err(err) = self.maps.set_generation(next) {
+            log::debug!("starting stack generation {next}: {err}");
+            self.flipped_at = now;
+            self.flip_at = now.saturating_add(self.interval);
+            return false;
+        }
+        self.generation = next;
+        self.barriers_held = self.barrier();
+        true
+    }
+
+    /// Reads the old generation's stacks that threads blocked in it still refer to (their
+    /// episodes, or the sweep, come later), then waits until every record already reserved is
+    /// committed, so the drain that follows sees every other reference.
+    pub fn keep(&mut self, tasks: &[(u32, TaskState)]) {
+        let old = self.generation - 1;
+        for (_, state) in tasks {
+            if !matches!(state.state, ST_BLOCKED | ST_WOKEN) || state.stack_gen != old {
+                continue;
+            }
+            for encoded in [state.user_stack, state.kernel_stack] {
+                // Copies (STACK_INLINE) are not in a map: their records came at the block.
+                let Some(key @ StackKey::Map { id, .. }) = StackKey::of(encoded, old, 0, 0, false)
+                else {
+                    continue;
+                };
+                if !self.kept.contains_key(&key)
+                    && let Some(ips) = self.read_map(old, id)
+                {
+                    self.kept.insert(key, ips);
+                }
+            }
+        }
+        self.barriers_held &= self.barrier();
+    }
+
+    /// Ends a flip at `now`: empties the old generation's map for the generation after next,
+    /// unless a barrier failed (its stacks then stay: only more collisions).
+    pub fn retire(&mut self, now: u64) {
+        let old = self.generation - 1;
+        if self.barriers_held {
+            self.cleared += self.maps.clear(old);
+            self.since[slot(old)] = old + 2;
+        }
+        self.fresh.clear();
+        self.flips += 1;
+        self.flipped_at = now;
+        self.flip_at = now.saturating_add(self.interval);
+    }
+
+    /// Waits for running programs; false (logged) when it could not.
+    fn barrier(&mut self) -> bool {
+        match self.maps.barrier() {
+            Ok(()) => true,
+            Err(err) => {
+                log::debug!("stack map barrier: {err}");
+                false
+            }
         }
     }
 
@@ -173,8 +394,8 @@ impl Collector {
         }
     }
 
-    /// Follows a ring buffer record `trace` has just ingested: tracks process images, and
-    /// normalizes a user stack it carries the first time it is seen.
+    /// Follows a ring buffer record `trace` has just ingested: tracks process images, keeps
+    /// stack copies, and reads the stacks a record refers to the first time they are seen.
     pub fn observe(&mut self, trace: &Trace, bytes: &[u8]) {
         let Some(hdr) = wire::from_bytes::<EvHeader>(bytes) else {
             return;
@@ -202,88 +423,177 @@ impl Collector {
                     self.images.remove(&hdr.tgid);
                 }
             }
+            EV_STACK => {
+                if let Some(r) = wire::from_bytes::<StackRecord>(bytes) {
+                    self.copy(trace, hdr, r);
+                }
+            }
             EV_EPISODE | EV_SAMPLE => {
-                let user = if hdr.kind == EV_SAMPLE {
-                    wire::from_bytes::<SampleRecord>(bytes).map(|r| r.user_stack)
+                let refs = if hdr.kind == EV_SAMPLE {
+                    wire::from_bytes::<SampleRecord>(bytes)
+                        .map(|r| (r.user_stack, r.kernel_stack, r.stack_gen, hdr.ts))
                 } else {
-                    wire::from_bytes::<EpisodeRecord>(bytes).map(|r| r.user_stack)
+                    wire::from_bytes::<EpisodeRecord>(bytes)
+                        .map(|r| (r.user_stack, r.kernel_stack, r.stack_gen, r.block_ts))
                 };
-                // The image the timeline filed the stack under: the process's current one.
-                let Some((proc, image)) = trace.current_image(hdr.tgid) else {
+                let Some((user, kernel, generation, at)) = refs else {
                     return;
                 };
-                if let Some(id) = user.and_then(stack_id) {
-                    let key = UserKey { proc, image, id };
-                    if !self.stacks.contains_key(&key) {
-                        self.resolve(key, true);
-                    }
+                if let Some(stack) = StackKey::of(kernel, generation, hdr.tid, at, true) {
+                    self.resolve_kernel(stack);
+                }
+                // The image the timeline filed the stack under: the process's current one.
+                if let Some((proc, image)) = trace.current_image(hdr.tgid)
+                    && let Some(stack) = StackKey::of(user, generation, hdr.tid, at, false)
+                {
+                    self.resolve_user(UserKey { proc, image, stack }, true);
                 }
             }
             _ => {}
         }
     }
 
-    /// Reads the stacks the trace refers to that no record brought (and kernel stacks), then
-    /// symbolizes everything. Stacks that cannot be read are left out (`[stack lost]`).
+    /// Keeps the stack copy `r` (thread and capture time in `hdr`) under its
+    /// [`StackKey::Inline`]; a user stack is normalized now, in the process's current image.
+    fn copy(&mut self, trace: &Trace, hdr: &EvHeader, r: &StackRecord) {
+        let nr = usize::try_from(r.nr).map_or(0, |nr| nr.min(r.ips.len()));
+        let ips = &r.ips[..nr];
+        let kernel = r.kernel != 0;
+        let stack = StackKey::Inline {
+            tid: hdr.tid,
+            at: hdr.ts,
+            kernel,
+        };
+        if kernel {
+            let id = (!ips.is_empty()).then(|| self.kips.id(ips.to_vec()));
+            self.kernel.insert(stack, id);
+        } else if let Some((proc, image)) = trace.current_image(hdr.tgid) {
+            let id = (!ips.is_empty()).then(|| {
+                let locs = self.normalize(proc.pid, (proc, image), ips, true);
+                self.locs.id(locs)
+            });
+            self.user.insert(UserKey { proc, image, stack }, id);
+        }
+    }
+
+    /// Reads the stacks the trace refers to that no record brought (threads blocked at the
+    /// end), then symbolizes every distinct stack once. Stacks that cannot be read are left
+    /// out (`[stack lost]`).
     pub fn finish(mut self, trace: &Trace) -> Symbols {
+        log::debug!(
+            "stack generations: {} flips emptied {} map entries; {} stacks kept across flips",
+            self.flips,
+            self.cleared,
+            self.kept.len()
+        );
         let (users, kernels) = referenced(trace);
         for &key in &users {
-            if !self.stacks.contains_key(&key) {
-                let current = trace.current_image(key.proc.pid) == Some((key.proc, key.image));
-                self.resolve(key, current);
-            }
+            let current = trace.current_image(key.proc.pid) == Some((key.proc, key.image));
+            self.resolve_user(key, current);
+        }
+        for &key in &kernels {
+            self.resolve_kernel(key);
         }
         let mut elves: Vec<Option<Option<ElfSymbols>>> = Vec::new();
         elves.resize_with(self.files.len(), || None);
+        let mut names = Interner::new();
+        let mut user_names: HashMap<u32, u32> = HashMap::new();
         let mut symbols = Symbols::default();
         for key in users {
-            // A valid id never names an empty stack (that is -EFAULT): empty = unreadable.
-            let Some(locs) = self.stacks.get(&key).filter(|locs| !locs.is_empty()) else {
+            let Some(&Some(locs)) = self.user.get(&key) else {
                 continue;
             };
-            let frames = locs
-                .iter()
-                .map(|loc| match *loc {
-                    Loc::File { file, offset } => {
-                        let elf = elves[file].get_or_insert_with(|| {
-                            self.files[file].file.as_ref().and_then(ElfSymbols::load)
-                        });
-                        elf.as_ref()
-                            .and_then(|elf| elf.name(offset))
-                            .unwrap_or_else(|| format!("[{}]", self.files[file].name))
-                    }
-                    Loc::Special(name) => name.to_owned(),
-                    Loc::Unknown => "[unknown]".to_owned(),
-                })
-                .collect();
-            symbols.user.insert(key, collapse_unknown(frames));
+            let index = *user_names.entry(locs).or_insert_with(|| {
+                let frames = self.locs.values[usize::try_from(locs).unwrap_or(usize::MAX)]
+                    .iter()
+                    .map(|loc| match *loc {
+                        Loc::File { file, offset } => {
+                            let elf = elves[file].get_or_insert_with(|| {
+                                self.files[file].file.as_ref().and_then(ElfSymbols::load)
+                            });
+                            elf.as_ref()
+                                .and_then(|elf| elf.name(offset))
+                                .unwrap_or_else(|| format!("[{}]", self.files[file].name))
+                        }
+                        Loc::Special(name) => name.to_owned(),
+                        Loc::Unknown => "[unknown]".to_owned(),
+                    })
+                    .collect();
+                names.id(collapse_unknown(frames))
+            });
+            symbols.user.insert(key, index);
         }
-        for id in kernels {
-            let ips = self.read_stack(id);
-            if !ips.is_empty() {
-                symbols.kernel.insert(id, self.kallsyms.symbolize(&ips));
-            }
+        let mut kernel_names: HashMap<u32, u32> = HashMap::new();
+        for key in kernels {
+            let Some(&Some(ips)) = self.kernel.get(&key) else {
+                continue;
+            };
+            let index = *kernel_names.entry(ips).or_insert_with(|| {
+                let ips = &self.kips.values[usize::try_from(ips).unwrap_or(usize::MAX)];
+                names.id(self.kallsyms.symbolize(ips))
+            });
+            symbols.kernel.insert(key, index);
         }
+        symbols.stacks = names.values;
         symbols
     }
 
-    /// The addresses of stack `id`, innermost first; empty when it cannot be read.
-    fn read_stack(&self, id: u32) -> Vec<u64> {
-        match self.map.get(&id, 0) {
-            Ok(stack) => stack.frames().iter().map(|frame| frame.ip).collect(),
-            Err(err) => {
-                log::debug!("reading stack {id}: {err}");
-                Vec::new()
-            }
+    /// The addresses of `stack`, innermost first: kept at a flip, or read from its
+    /// generation's map while it holds that generation. `None` when unreadable (copies are
+    /// taken as their STACK record arrives, never here).
+    fn raw(&mut self, stack: StackKey) -> Option<Vec<u64>> {
+        let StackKey::Map { generation, id } = stack else {
+            return None;
+        };
+        match self.kept.get(&stack) {
+            Some(ips) => Some(ips.clone()),
+            None => self.read_map(generation, id),
         }
+        .filter(|ips| !ips.is_empty())
     }
 
-    /// Reads and normalizes user stack `key`; `current` says its image is the process's
-    /// current one, so `/proc/PID/maps` describes it.
-    fn resolve(&mut self, key: UserKey, current: bool) {
-        let pid = key.proc.pid;
-        let image = (key.proc, key.image);
-        let ips = self.read_stack(key.id);
+    /// Stack `id` of `generation`, if its map still holds that generation.
+    fn read_map(&mut self, generation: u32, id: u32) -> Option<Vec<u64>> {
+        if generation > self.generation || self.since[slot(generation)] > generation {
+            return None;
+        }
+        if generation == self.generation {
+            self.fresh.insert(id);
+        }
+        self.maps.read(generation, id)
+    }
+
+    /// Reads kernel stack `stack` unless known.
+    fn resolve_kernel(&mut self, stack: StackKey) {
+        if self.kernel.contains_key(&stack) {
+            return;
+        }
+        let id = self.raw(stack).map(|ips| self.kips.id(ips));
+        self.kernel.insert(stack, id);
+    }
+
+    /// Reads and normalizes user stack `key` unless known; `current` says its image is the
+    /// process's current one, so `/proc/PID/maps` describes it.
+    fn resolve_user(&mut self, key: UserKey, current: bool) {
+        if self.user.contains_key(&key) {
+            return;
+        }
+        let id = self.raw(key.stack).map(|ips| {
+            let locs = self.normalize(key.proc.pid, (key.proc, key.image), &ips, current);
+            self.locs.id(locs)
+        });
+        self.user.insert(key, id);
+    }
+
+    /// User addresses `ips` (innermost first) of process `pid`'s `image` as locations,
+    /// outermost first.
+    fn normalize(
+        &mut self,
+        pid: u32,
+        image: (ProcKey, u32),
+        ips: &[u64],
+        current: bool,
+    ) -> Vec<Loc> {
         let mut refreshed = false;
         let mut locs = Vec::with_capacity(ips.len());
         for (depth, &ip) in ips.iter().enumerate() {
@@ -299,7 +609,7 @@ impl Collector {
             locs.push(found.map_or(Loc::Unknown, |mapping| self.locate(pid, &mapping, addr)));
         }
         locs.reverse();
-        self.stacks.insert(key, locs);
+        locs
     }
 
     /// The mapping of `image` (process `pid`) containing `addr`.
@@ -349,8 +659,8 @@ impl Collector {
     }
 }
 
-/// Every user stack and kernel stack id the trace refers to.
-fn referenced(trace: &Trace) -> (BTreeSet<UserKey>, BTreeSet<u32>) {
+/// Every user and kernel stack the trace refers to.
+fn referenced(trace: &Trace) -> (BTreeSet<UserKey>, BTreeSet<StackKey>) {
     let mut users = BTreeSet::new();
     let mut kernels = BTreeSet::new();
     for thread in &trace.threads {
@@ -360,8 +670,8 @@ fn referenced(trace: &Trace) -> (BTreeSet<UserKey>, BTreeSet<u32>) {
             _ => None,
         });
         for ids in thread.samples.iter().map(|s| s.stacks).chain(blocks) {
-            users.extend(UserKey::of(proc, ids));
-            kernels.extend(stack_id(ids.kernel));
+            users.extend(UserKey::of(proc, thread.tid, ids));
+            kernels.extend(StackKey::kernel(thread.tid, ids));
         }
     }
     (users, kernels)

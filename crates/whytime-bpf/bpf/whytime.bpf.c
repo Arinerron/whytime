@@ -15,10 +15,12 @@
  * Optional fentry programs refine that: pollwake/ep_poll_callback record which file ended a
  * poll/select/epoll wait, and handle_mm_fault entry/exit mark blocks inside page faults.
  *
- * Stack capture (flamegraphs) is off unless user space sets `stacks_enabled` at load: then
- * sched_switch also records the user and kernel stack of every voluntary switch-out of a
- * tracked thread, and a perf_event CPU-clock sampler emits SAMPLE records with the stacks
- * of tracked threads it finds on a CPU. Off, the verifier drops that code.
+ * Stack capture (flamegraphs) is compiled in only with WHYTIME_STACKS, a second object that
+ * user space loads for --flamegraph/--folded: sched_switch then also records the user and
+ * kernel stack of every voluntary switch-out of a tracked thread, and a perf_event CPU-clock
+ * sampler emits SAMPLE records with the stacks of tracked threads it finds on a CPU. Stacks
+ * go to two stack maps used alternately by generation (see `stack_ref`); a stack neither
+ * can take is copied whole into a STACK record.
  *
  * Untracked tasks cost one hash lookup per handler (two in sched_switch).
  */
@@ -105,17 +107,40 @@ struct {
 	__type(value, struct task_state);
 } task_zero SEC(".maps");
 
-/* Stack id -> STACK_DEPTH addresses, leaf first. User space sizes it to STACKS_MAX entries
- * when stack capture is on and to one entry otherwise. */
-struct {
+#ifdef WHYTIME_STACKS
+/* Stack id -> STACK_DEPTH addresses, leaf first, in two maps used alternately: generation g
+ * stores into stacks0 when g is even, stacks1 when odd, and every reference carries g. User
+ * space flips generations on a timer; after a flip it reads what the old generation's
+ * references still need, then empties that map for the generation after next. Without
+ * this, entries are never freed and a long run fills the map with stale stacks. */
+struct stack_map {
 	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
 	__uint(max_entries, STACKS_MAX);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, STACK_DEPTH * sizeof(u64));
-} stacks SEC(".maps");
+};
+struct stack_map stacks0 SEC(".maps");
+struct stack_map stacks1 SEC(".maps");
 
-/* 1 when stack capture is on (set by user space at load); 0 lets the verifier drop it. */
-const volatile u32 stacks_enabled = 0;
+/* [0]: the current stack generation, set by user space. */
+struct gen_map {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+};
+struct gen_map stack_gen SEC(".maps");
+
+/* Never used by the programs: user space stores `stack_gen` in it after a flip, because a
+ * map-in-map update returns only after an RCU grace period, when every program that may have
+ * read the old generation has finished. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__array(values, struct gen_map);
+} stack_barrier SEC(".maps");
+#endif
 
 static __always_inline void stat_inc(u32 slot)
 {
@@ -134,25 +159,6 @@ static __always_inline void *reserve(u64 size)
 	return e;
 }
 
-/* bpf_get_stackid errors that lose a stack (-EFAULT, an empty stack, is not a loss). */
-#define EEXIST 17
-#define ENOMEM 12
-
-/* The current task's user (`flags` BPF_F_USER_STACK) or kernel stack as a task_state stack
- * field: id + 1, or the negative errno (collisions and a full map are counted). */
-static __always_inline s32 stack_ref(void *ctx, u64 flags)
-{
-	long id = bpf_get_stackid(ctx, &stacks, flags);
-
-	if (id >= 0)
-		return id + 1;
-	if (id == -EEXIST)
-		stat_inc(STAT_STACK_COLLISION);
-	else if (id == -ENOMEM)
-		stat_inc(STAT_STACK_FULL);
-	return id;
-}
-
 static __always_inline void fill_hdr(struct ev_header *h, u32 kind, u32 tid, u32 tgid, u64 ts)
 {
 	h->kind = kind;
@@ -161,6 +167,57 @@ static __always_inline void fill_hdr(struct ev_header *h, u32 kind, u32 tid, u32
 	h->_pad = 0;
 	h->ts = ts;
 }
+
+#ifdef WHYTIME_STACKS
+/* bpf_get_stackid errors that mean the map could not take the stack. */
+#define EEXIST 17
+#define ENOMEM 12
+
+/* The current stack generation. */
+static __always_inline u32 stack_generation(void)
+{
+	u32 zero = 0;
+	u32 *gen = bpf_map_lookup_elem(&stack_gen, &zero);
+
+	return gen ? *gen : 0;
+}
+
+/* The current task's user (`flags` BPF_F_USER_STACK) or kernel stack as a stack reference
+ * (see task_state.user_stack): id + 1 in generation `gen`'s map; when the map cannot take
+ * it (bucket collision, full), STACK_INLINE after copying it whole into a STACK record for
+ * thread `tid` at capture time `ts`; else the negative errno. */
+static __always_inline s32 stack_ref(void *ctx, u32 gen, u64 flags, u32 tid, u32 tgid, u64 ts)
+{
+	struct stack_record *e;
+	long id, bytes;
+
+	if (gen & 1)
+		id = bpf_get_stackid(ctx, &stacks1, flags);
+	else
+		id = bpf_get_stackid(ctx, &stacks0, flags);
+	if (id >= 0)
+		return id + 1;
+	if (id != -EEXIST && id != -ENOMEM)
+		return id;
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e) {
+		stat_inc(STAT_STACK_LOST);
+		return id;
+	}
+	bytes = bpf_get_stack(ctx, e->ips, sizeof(e->ips), flags);
+	if (bytes <= 0) {
+		bpf_ringbuf_discard(e, 0);
+		stat_inc(STAT_STACK_LOST);
+		return id;
+	}
+	fill_hdr(&e->hdr, EV_STACK, tid, tgid, ts);
+	e->kernel = !(flags & BPF_F_USER_STACK);
+	e->nr = bytes / sizeof(u64);
+	bpf_ringbuf_submit(e, 0);
+	stat_inc(STAT_STACK_INLINE);
+	return STACK_INLINE;
+}
+#endif
 
 /* Copies the open segment into a record and starts a new one at `now`. */
 static __always_inline void close_segment(struct task_state *t, struct cpu_segment *out, u64 now)
@@ -439,11 +496,12 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 			note_block(p);
 			if (p->sys.nr != NR_NONE && !(p->detail.flags & SYSD_DESCRIBED))
 				describe_blocked(p);
+#ifdef WHYTIME_STACKS
 			/* `current` is still `prev`: its stacks are where it blocked. */
-			if (stacks_enabled) {
-				p->user_stack = stack_ref(ctx, BPF_F_USER_STACK);
-				p->kernel_stack = stack_ref(ctx, 0);
-			}
+			p->stack_gen = stack_generation();
+			p->user_stack = stack_ref(ctx, p->stack_gen, BPF_F_USER_STACK, ptid, p->tgid, now);
+			p->kernel_stack = stack_ref(ctx, p->stack_gen, 0, ptid, p->tgid, now);
+#endif
 		} else {
 			p->state = ST_RUNNABLE;
 			/* `next` holds the CPU while this thread waits for it. */
@@ -479,6 +537,8 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 				e->fault = n->fault;
 				e->user_stack = n->user_stack;
 				e->kernel_stack = n->kernel_stack;
+				e->stack_gen = n->stack_gen;
+				e->_pad2 = 0;
 				__builtin_memcpy(e->comm, next->comm, sizeof(e->comm));
 				bpf_ringbuf_submit(e, 0);
 			}
@@ -808,31 +868,43 @@ int BPF_PROG(on_fault_exit)
 	return 0;
 }
 
+#ifdef WHYTIME_STACKS
 /* ---- on-CPU stack sampling ---------------------------------------------------------- */
 
-/* CPU-clock sampler, one perf event per CPU (SAMPLE_HZ), attached only with stack capture
- * on. Runs in the timer interrupt: `current` is the interrupted task, and its user stack
- * comes from the registers saved at its last kernel entry. */
+/* CPU-clock sampler, one perf event per CPU (SAMPLE_HZ). Runs in the timer interrupt:
+ * `current` is the interrupted task, and its user stack comes from the registers saved at its
+ * last kernel entry. The stacks are taken before the record is reserved, so a STACK record
+ * holding a copy precedes the sample in the ring. */
 SEC("perf_event")
 int on_sample(void *ctx)
 {
 	u64 id = bpf_get_current_pid_tgid();
-	u32 tid = (u32)id;
+	u32 tid = (u32)id, tgid, gen;
 	struct task_state *t;
 	struct sample_record *e;
+	s32 user, kernel;
+	u64 now;
 
-	if (!stacks_enabled || !tid)
+	if (!tid)
 		return 0;
 	t = bpf_map_lookup_elem(&tasks, &tid);
 	if (!t)
 		return 0;
+	tgid = t->tgid;
+	now = bpf_ktime_get_ns();
+	gen = stack_generation();
+	user = stack_ref(ctx, gen, BPF_F_USER_STACK, tid, tgid, now);
+	kernel = stack_ref(ctx, gen, 0, tid, tgid, now);
 	e = reserve(sizeof(*e));
 	if (!e)
 		return 0;
-	fill_hdr(&e->hdr, EV_SAMPLE, tid, t->tgid, bpf_ktime_get_ns());
-	e->user_stack = stack_ref(ctx, BPF_F_USER_STACK);
-	e->kernel_stack = stack_ref(ctx, 0);
+	fill_hdr(&e->hdr, EV_SAMPLE, tid, tgid, now);
+	e->user_stack = user;
+	e->kernel_stack = kernel;
+	e->stack_gen = gen;
+	e->_pad = 0;
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
+#endif

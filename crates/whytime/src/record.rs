@@ -32,14 +32,14 @@
 //!
 //! | Kind | Frame | Payload |
 //! |---|---|---|
-//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 3 (syscalls, readiness, faults), stack capture `u8` (0 not requested, 1 on, 2 unavailable), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
+//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 3 (syscalls, readiness, faults), stack capture `u8` (0 off, 1 on), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
 //! | 2 | record | one ring buffer record, verbatim |
 //! | 3 | lookup | `/proc/<pid>/fd/<fd>`: dev `u32`, ino `u64`, found `u8`, then the link target (rest of the payload) |
 //! | 7 | mapping | `/proc/<pid>/maps`: dev `u32`, ino `u64`, found `u8`, then the mapped path (rest of the payload) |
 //! | 4 | task | tid `u32`, `task_state` (one entry of the final `tasks` sweep) |
 //! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration, 2 interrupt), exit code `opt i32`, dropped `u64` |
 //! | 6 | seed: attach mode only, once, before any record | window start `u64`, count `u32`, then per process: pid `u32`, start `u64` (procctx key), ppid `u32`, seeded at `u64`, comm `bytes`, argv `bytes` (NUL-separated), thread count `u32`, threads × (tid `u32`, entry time `u64`) |
-//! | 8 | stack: with stack capture on, when the window ends, before the end frame | space `u8` (0 user: then pid `u32`, start `u64` (procctx key), image `u32`; 1 kernel), stack id `u32`, frame count `u32`, frames × name `bytes` (UTF-8, outermost first) |
+//! | 8 | stack: with stack capture on, when the window ends, before the end frame; one per distinct symbolized stack | frame count `u32`, frames × name `bytes` (UTF-8, outermost first), key count `u32`, keys × (space `u8`: 0 user, then pid `u32`, start `u64` (procctx key), image `u32`; 1 kernel; then stack `u8`: 0 map, then generation `u32`, id `u32`; 1 copy, then tid `u32`, capture time `u64`) |
 //!
 //! Frames are written as the run goes; tasks and the end frame when the window ends, so a
 //! file without an end frame was cut short and is rejected. Bump [`VERSION`] when the
@@ -62,7 +62,7 @@ use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget};
 use crate::report::{Attached, EndedBy};
-use crate::stacks::{Symbols, UserKey};
+use crate::stacks::{StackKey, Symbols, UserKey};
 use crate::sys::SyscallTable;
 use crate::timeline::{self, ProcSeed, Trace};
 
@@ -93,9 +93,8 @@ pub struct Probes {
     pub readiness: bool,
     /// Page-fault fentry/fexit programs.
     pub faults: bool,
-    /// Stack capture (block-time stacks and the on-CPU sampler): `None` when not
-    /// requested, else whether it is on.
-    pub stacks: Option<bool>,
+    /// Stack capture (block-time stacks and the on-CPU sampler).
+    pub stacks: bool,
 }
 
 /// What the recording run knew when the window opened.
@@ -244,11 +243,7 @@ impl Recorder {
             .u8(u8::from(header.probes.syscalls))
             .u8(u8::from(header.probes.readiness))
             .u8(u8::from(header.probes.faults))
-            .u8(match header.probes.stacks {
-                None => 0,
-                Some(true) => 1,
-                Some(false) => 2,
-            })
+            .u8(u8::from(header.probes.stacks))
             .u64(header.ticks_per_sec.get())
             .bytes(header.arch.as_bytes());
         match &header.home {
@@ -266,25 +261,35 @@ impl Recorder {
         self.frame(F_HEADER, &[&p.0]);
     }
 
-    /// Writes the symbolized stacks (stack frames).
+    /// Writes the symbolized stacks: one stack frame per distinct stack, with the keys of
+    /// every user and kernel stack that has its frames.
     pub fn stacks(&self, symbols: &Symbols) {
-        let frames = |p: &mut Enc, id: u32, frames: &[String]| {
-            p.u32(id)
-                .u32(u32::try_from(frames.len()).unwrap_or(u32::MAX));
+        let mut keys: Vec<Vec<(Option<&UserKey>, StackKey)>> =
+            vec![Vec::new(); symbols.stacks.len()];
+        let users = symbols.user.iter().map(|(key, &i)| (i, Some(key), key.stack));
+        let kernels = symbols.kernel.iter().map(|(&stack, &i)| (i, None, stack));
+        for (i, user, stack) in users.chain(kernels) {
+            if let Some(keys) = usize::try_from(i).ok().and_then(|i| keys.get_mut(i)) {
+                keys.push((user, stack));
+            }
+        }
+        for (frames, keys) in symbols.stacks.iter().zip(&keys) {
+            let mut p = Enc::default();
+            p.u32(u32::try_from(frames.len()).unwrap_or(u32::MAX));
             for name in frames {
                 p.bytes(name.as_bytes());
             }
-        };
-        for (key, names) in &symbols.user {
-            let mut p = Enc::default();
-            p.u8(0).u32(key.proc.pid).u64(key.proc.start).u32(key.image);
-            frames(&mut p, key.id, names);
-            self.frame(F_STACK, &[&p.0]);
-        }
-        for (&id, names) in &symbols.kernel {
-            let mut p = Enc::default();
-            p.u8(1);
-            frames(&mut p, id, names);
+            p.u32(u32::try_from(keys.len()).unwrap_or(u32::MAX));
+            for &(user, stack) in keys {
+                match user {
+                    Some(key) => p.u8(0).u32(key.proc.pid).u64(key.proc.start).u32(key.image),
+                    None => p.u8(1),
+                };
+                match stack {
+                    StackKey::Map { generation, id } => p.u8(0).u32(generation).u32(id),
+                    StackKey::Inline { tid, at, .. } => p.u8(1).u32(tid).u64(at),
+                };
+            }
             self.frame(F_STACK, &[&p.0]);
         }
     }
@@ -516,7 +521,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
                 p.done()?;
                 tasks.push((tid, state));
             }
-            F_STACK if header.as_ref().is_some_and(|h| h.probes.stacks != Some(true)) => {
+            F_STACK if header.as_ref().is_some_and(|h| !h.probes.stacks) => {
                 return Err(malformed(at, "stack frame in a trace without stack capture"));
             }
             F_STACK => p.stack(&mut symbols)?,
@@ -582,7 +587,7 @@ pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
             trace.window.start
         );
     }
-    let symbols = (header.probes.stacks == Some(true)).then_some(symbols);
+    let symbols = header.probes.stacks.then_some(symbols);
     Ok(Replay {
         trace,
         header,
@@ -732,32 +737,50 @@ impl<'a> Dec<'a> {
         }
     }
 
-    /// A stack frame's payload, added to `symbols`.
+    /// A stack frame's payload: one distinct stack and its keys, added to `symbols`.
     fn stack(&mut self, symbols: &mut Symbols) -> Result<(), Error> {
-        let user = match self.u8()? {
-            0 => Some((
-                ProcKey {
-                    pid: self.u32()?,
-                    start: self.u64()?,
-                },
-                self.u32()?,
-            )),
-            1 => None,
-            _ => return Err(malformed(self.at - 1, "unknown stack space")),
-        };
-        let id = self.u32()?;
-        // Not preallocated: the count is untrusted until every frame has been read.
+        // Not preallocated: counts are untrusted until every item has been read.
         let mut frames = Vec::new();
         for _ in 0..self.u32()? {
             let name = String::from_utf8(self.blob()?.to_vec())
                 .map_err(|_| malformed(self.at, "frame name is not UTF-8"))?;
             frames.push(name);
         }
+        let mut keys = Vec::new();
+        for _ in 0..self.u32()? {
+            let user = match self.u8()? {
+                0 => Some((
+                    ProcKey {
+                        pid: self.u32()?,
+                        start: self.u64()?,
+                    },
+                    self.u32()?,
+                )),
+                1 => None,
+                _ => return Err(malformed(self.at - 1, "unknown stack space")),
+            };
+            let stack = match self.u8()? {
+                0 => StackKey::Map {
+                    generation: self.u32()?,
+                    id: self.u32()?,
+                },
+                1 => StackKey::Inline {
+                    tid: self.u32()?,
+                    at: self.u64()?,
+                    kernel: user.is_none(),
+                },
+                _ => return Err(malformed(self.at - 1, "unknown stack kind")),
+            };
+            keys.push((user, stack));
+        }
         self.done()?;
-        match user {
-            Some((proc, image)) => symbols.user.insert(UserKey { proc, image, id }, frames),
-            None => symbols.kernel.insert(id, frames),
-        };
+        let index = symbols.push(frames);
+        for (user, stack) in keys {
+            match user {
+                Some((proc, image)) => symbols.user.insert(UserKey { proc, image, stack }, index),
+                None => symbols.kernel.insert(stack, index),
+            };
+        }
         Ok(())
     }
 
@@ -767,12 +790,7 @@ impl<'a> Dec<'a> {
             syscalls: self.flag()?,
             readiness: self.flag()?,
             faults: self.flag()?,
-            stacks: match self.u8()? {
-                0 => None,
-                1 => Some(true),
-                2 => Some(false),
-                _ => return Err(malformed(self.at - 1, "unknown stack capture state")),
-            },
+            stacks: self.flag()?,
         };
         let ticks_per_sec =
             NonZeroU64::new(self.u64()?).ok_or_else(|| malformed(self.at - 8, "zero AT_CLKTCK"))?;
@@ -869,7 +887,7 @@ fn malformed(at: usize, what: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use libc::SYS_fsync;
-    use whytime_abi::ST_RUNNING;
+    use whytime_abi::{ST_RUNNING, STACK_INLINE};
 
     use super::*;
     use crate::testkit::{episode, exec, sample, seg, sys, task};
@@ -909,7 +927,7 @@ mod tests {
                 syscalls: true,
                 readiness: true,
                 faults: true,
-                stacks: (!attached).then_some(true),
+                stacks: !attached,
             },
             ticks_per_sec: NonZeroU64::new(100).expect("non-zero"),
             attached: attached.then_some(Attached {
@@ -952,9 +970,11 @@ mod tests {
         fsync.ino = INO;
         let times = |a, b, c| [us(a), us(b), us(c)];
         let mut first = episode(100, 100, seg(us(1_000), us(100), 0), fsync, times(1_100, 1_900, 1_900));
-        // Blocked at user stack 0 and kernel stack 1; sampled on-CPU before at user stack 2.
-        (first.user_stack, first.kernel_stack) = (1, 2);
-        live(&mut trace, wire::as_bytes(&sample(us(1_050), 100, 100, [3, -libc::EFAULT])));
+        // Blocked at user stack 0 and kernel stack 1 of generation 1; sampled on-CPU before,
+        // its user stack a copy (the map could not take it).
+        (first.user_stack, first.kernel_stack, first.stack_gen) = (1, 2, 1);
+        let copied = sample(us(1_050), 100, 100, [STACK_INLINE, -libc::EFAULT]);
+        live(&mut trace, wire::as_bytes(&copied));
         live(&mut trace, wire::as_bytes(&first));
         // Undecodable records are counted in the report, so they are recorded too.
         live(&mut trace, &[1, 2, 3]);
@@ -989,11 +1009,18 @@ mod tests {
             pid: 100,
             start: 100,
         };
-        let user = |id| UserKey { proc, image: 0, id };
+        let user = |stack| UserKey { proc, image: 0, stack };
+        let names = |frames: &[&str]| frames.iter().map(|&f| f.to_owned()).collect();
         let mut symbols = Symbols::default();
-        symbols.user.insert(user(0), vec!["main".into(), "save".into()]);
-        symbols.user.insert(user(2), vec!["main".into(), "compute;fast".into()]);
-        symbols.kernel.insert(1, vec!["entry_SYSCALL_64".into(), "do_fsync".into()]);
+        let save = symbols.push(names(&["main", "save"]));
+        symbols.user.insert(user(StackKey::Map { generation: 1, id: 0 }), save);
+        // Another generation's id for the same frames shares their stack frame.
+        symbols.user.insert(user(StackKey::Map { generation: 4, id: 9 }), save);
+        let copy = StackKey::Inline { tid: 100, at: us(1_050), kernel: false };
+        let fast = symbols.push(names(&["main", "compute;fast"]));
+        symbols.user.insert(user(copy), fast);
+        let do_fsync = symbols.push(names(&["entry_SYSCALL_64", "do_fsync"]));
+        symbols.kernel.insert(StackKey::Map { generation: 1, id: 1 }, do_fsync);
         let mut folded = Vec::new();
         if !attached {
             recorder.stacks(&symbols);
@@ -1049,6 +1076,15 @@ mod tests {
         let (_, live, bytes) = record_run("stacks", ARCH, false);
         let replay = replay(&bytes).expect("replaying");
         let symbols = replay.symbols.expect("recorded stacks");
+        // One stack frame per distinct stack: two user keys share `main;save`.
+        let mut at = PREAMBLE;
+        let mut stack_frames = 0;
+        while at < bytes.len() {
+            let kind = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+            stack_frames += usize::from(kind == F_STACK);
+            at = next_frame(&bytes, at);
+        }
+        assert_eq!((stack_frames, symbols.stacks.len(), symbols.user.len()), (3, 3, 3));
         let (root, start) = (replay.trace.root.unwrap(), replay.trace.window.start.unwrap());
         let attribution = crate::attribute::attribute(&replay.trace, root, start, replay.end.end);
         let mut replayed = Vec::new();

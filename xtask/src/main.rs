@@ -356,6 +356,25 @@ fn test_e2e() -> anyhow::Result<()> {
                 move |out: &Output| check_attach_flame(out, &folded)
             }),
         ),
+        (
+            "flame-flip",
+            // A stack generation every 5 ms: flips while the thread sleeps, its block-time
+            // stacks kept across them.
+            flame_debug(whytime, &["WHYTIME_STACK_FLIP_MS=5"], &path("flip.folded"), &bin("wt-flame")),
+            Box::new({
+                let folded = in_flame("flip.folded");
+                move |out: &Output| check_flame_flip(out, &folded, Need::Kept)
+            }),
+        ),
+        (
+            "flame-copy",
+            // One-entry stack maps: most stacks are copied into STACK records.
+            flame_debug(whytime, &["WHYTIME_STACK_MAP_ENTRIES=1"], &path("copy.folded"), &bin("wt-flame")),
+            Box::new({
+                let folded = in_flame("copy.folded");
+                move |out: &Output| check_flame_flip(out, &folded, Need::Copied)
+            }),
+        ),
     ];
 
     let mut failed = 0;
@@ -1101,20 +1120,7 @@ fn check_flamegraph(out: &Output, folded_path: &Path, svg: &Path, work: &Path) -
         (total - wall_us).abs() <= wall_us * 0.01,
         "the folded stacks sum to {total:.0} µs, the wall time is {wall_us:.0} µs"
     );
-    let mut summary = Vec::new();
-    for (function, class) in [("burn_cpu_here", "cpu"), ("sleep_here", "sleep")] {
-        let us = stacks_us(&stacks, |f| f.ends_with(function)) as f64;
-        let line = class_share(&report, class, |_| true) * wall_us;
-        ensure!(
-            (us - line).abs() <= wall_us * 0.05,
-            "stacks through {function}: {us:.0} µs, but the {class} line is {line:.0} µs"
-        );
-        summary.push(format!(
-            "{function} {:.1}% ({class} line {:.1}%)",
-            us / wall_us * 100.0,
-            line / wall_us * 100.0
-        ));
-    }
+    let summary = through_functions(&report, &stacks, wall_us)?;
     let drawn = std::fs::read_to_string(svg).with_context(|| format!("reading {}", svg.display()))?;
     ensure!(
         drawn.starts_with("<?xml") && drawn.contains("burn_cpu_here"),
@@ -1133,8 +1139,85 @@ fn check_flamegraph(out: &Output, folded_path: &Path, svg: &Path, work: &Path) -
         "wall {:.3}s, folded total {:.1}%: {}",
         wall_us / 1e6,
         total / wall_us * 100.0,
-        summary.join(", ")
+        summary
     ))
+}
+
+/// The stacks through `burn_cpu_here` and `sleep_here` of `wt-flame` match the report's
+/// `cpu` and `sleep` lines within 5% of wall; a summary.
+#[allow(clippy::cast_precision_loss)]
+fn through_functions(
+    report: &Value,
+    stacks: &[(Vec<String>, u64)],
+    wall_us: f64,
+) -> anyhow::Result<String> {
+    let mut summary = Vec::new();
+    for (function, class) in [("burn_cpu_here", "cpu"), ("sleep_here", "sleep")] {
+        let us = stacks_us(stacks, |f| f.ends_with(function)) as f64;
+        let line = class_share(report, class, |_| true) * wall_us;
+        ensure!(
+            (us - line).abs() <= wall_us * 0.05,
+            "stacks through {function}: {us:.0} µs, but the {class} line is {line:.0} µs"
+        );
+        summary.push(format!(
+            "{function} {:.1}% ({class} line {:.1}%)",
+            us / wall_us * 100.0,
+            line / wall_us * 100.0
+        ));
+    }
+    Ok(summary.join(", "))
+}
+
+/// What a stack capture stress scenario must show in whytime's debug log.
+#[derive(Clone, Copy)]
+enum Need {
+    /// At least 20 generation flips, and a blocked thread's stack kept across one.
+    Kept,
+    /// A stack copied into a STACK record.
+    Copied,
+}
+
+/// `sudo -n env VARS WHYTIME_LOG=debug whytime --json --folded FOLDED -- wt-flame 600 400`.
+fn flame_debug(whytime: &Path, vars: &[&str], folded: &str, wt_flame: &str) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.args(["-n", "env"])
+        .args(vars)
+        .arg("WHYTIME_LOG=debug")
+        .arg(whytime)
+        .args(["--json", "--folded", folded, "--", wt_flame, "600", "400"]);
+    cmd
+}
+
+/// `wt-flame 600 400` under a stack capture stress setting: what `need` asks for happened,
+/// no `[stack lost]`, and the stacks still match the report (as in `flamegraph`).
+#[allow(clippy::cast_precision_loss)]
+fn check_flame_flip(out: &Output, folded_path: &Path, need: Need) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let wall_us = report["wall_ns"].as_u64().unwrap_or(0) as f64 / 1e3;
+    let stacks = folded(folded_path)?;
+    let lost = stacks_us(&stacks, |f| f.starts_with("[stack lost]"));
+    ensure!(lost == 0, "{lost} µs of stacks are [stack lost]");
+    let summary = through_functions(&report, &stacks, wall_us)?;
+    let log = String::from_utf8_lossy(&out.stderr);
+    // `N flips emptied M map entries; K stacks kept across flips`, `C stacks copied ...`.
+    let number_before = |marker: &str| {
+        log.lines()
+            .filter_map(|line| line.split_once(marker))
+            .filter_map(|(head, _)| head.rsplit(' ').next()?.parse::<u64>().ok())
+            .next()
+    };
+    let flips = number_before(" flips emptied").context("no stack generation summary")?;
+    let kept = number_before(" stacks kept across flips").context("no kept-stacks count")?;
+    let copied = number_before(" stacks copied into STACK records").context("no copy count")?;
+    match need {
+        Need::Kept => {
+            ensure!(flips >= 20, "only {flips} stack generation flips");
+            ensure!(kept >= 1, "no stack of a blocked thread was kept across a flip");
+        }
+        Need::Copied => ensure!(copied >= 1, "no stack was copied into a STACK record"),
+    }
+    Ok(format!("{flips} flips, {kept} kept, {copied} copied, no [stack lost]: {summary}"))
 }
 
 /// `--folded` on `wt-fsync`: some stack has a kernel frame (`_[k]`) naming fsync, unless the

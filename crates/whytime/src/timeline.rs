@@ -14,8 +14,8 @@ use std::sync::Arc;
 use procctx::{Config, ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable, StartClock};
 use whytime_abi::{
     CpuSegment, EPF_FAULT, EPF_READY, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK, EV_SAMPLE,
-    EpisodeRecord, EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE,
-    ST_RUNNING, ST_WOKEN, SampleRecord, TaskState,
+    EV_STACK, EpisodeRecord, EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED,
+    ST_RUNNABLE, ST_RUNNING, ST_WOKEN, SampleRecord, StackRecord, TaskState,
 };
 
 use crate::classify::{BlockInfo, Blocked, Classifier};
@@ -72,17 +72,22 @@ pub struct Block {
     pub stacks: StackIds,
 }
 
-/// The stacks of one moment of a thread, as references into the kernel's `stacks` map
-/// (encoded like `TaskState::user_stack`: 0 none, > 0 id + 1, < 0 `-errno`).
+/// The stacks of one moment of a thread, as the kernel referred to them (encoded like
+/// `TaskState::user_stack`: 0 none, > 0 id + 1 in `generation`'s stack map,
+/// `STACK_INLINE` a copy in a STACK record, other < 0 `-errno`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StackIds {
     /// User stack.
     pub user: i32,
     /// Kernel stack.
     pub kernel: i32,
+    /// Stack generation of the ids.
+    pub generation: u32,
     /// The process image the user stack's addresses belong to: the index into
     /// [`Proc::comms`] current when it was taken (each exec adds an entry).
     pub image: u32,
+    /// Capture time (block or sample time): with the thread, it names STACK record copies.
+    pub at: u64,
 }
 
 /// An on-CPU stack sample.
@@ -275,6 +280,8 @@ impl Trace {
             EV_EPISODE => wire::from_bytes::<EpisodeRecord>(bytes).map(|r| self.on_episode(r)),
             EV_EXIT => wire::from_bytes::<ExitRecord>(bytes).map(|r| self.on_exit(r)),
             EV_SAMPLE => wire::from_bytes::<SampleRecord>(bytes).map(|r| self.on_sample(r)),
+            // Stack copies are for stack capture (`stacks.rs`), not the timeline.
+            EV_STACK => wire::from_bytes::<StackRecord>(bytes).map(drop),
             _ => None,
         });
         if applied.is_none() {
@@ -397,7 +404,8 @@ impl Trace {
             waker_tid: r.waker_tid,
             waker_tgid: r.waker_tgid,
             waker_comm,
-            stacks: self.stack_ids(proc, r.user_stack, r.kernel_stack),
+            // The raw block time: the key of STACK record copies.
+            stacks: self.stack_ids(proc, r.user_stack, r.kernel_stack, r.stack_gen, r.block_ts),
         };
         self.name(thread, block_ts, &r.comm);
         self.push_block(thread, block_ts, wake_ts, block);
@@ -411,7 +419,7 @@ impl Trace {
             return;
         };
         let proc = self.threads[thread].proc;
-        let stacks = self.stack_ids(proc, r.user_stack, r.kernel_stack);
+        let stacks = self.stack_ids(proc, r.user_stack, r.kernel_stack, r.stack_gen, r.hdr.ts);
         self.name(thread, r.hdr.ts, &r.comm);
         let samples = &mut self.threads[thread].samples;
         // Arrival order is time order; a straggler is put in its place.
@@ -425,12 +433,22 @@ impl Trace {
         );
     }
 
-    /// Stack references taken now in process `proc`, in its current image.
-    fn stack_ids(&self, proc: ProcId, user: i32, kernel: i32) -> StackIds {
+    /// Stack references of `generation`, captured at `at`, taken now in process `proc`, in
+    /// its current image.
+    fn stack_ids(
+        &self,
+        proc: ProcId,
+        user: i32,
+        kernel: i32,
+        generation: u32,
+        at: u64,
+    ) -> StackIds {
         StackIds {
             user,
             kernel,
+            generation,
             image: u32::try_from(self.procs[proc].comms.len() - 1).unwrap_or(u32::MAX),
+            at,
         }
     }
 
@@ -513,7 +531,13 @@ impl Trace {
                         waker_tid: state.waker_tid,
                         waker_tgid: state.waker_tgid,
                         waker_comm,
-                        stacks: self.stack_ids(proc, state.user_stack, state.kernel_stack),
+                        stacks: self.stack_ids(
+                            proc,
+                            state.user_stack,
+                            state.kernel_stack,
+                            state.stack_gen,
+                            state.block_ts,
+                        ),
                     };
                     self.push_block(thread, state.block_ts, wake, block);
                     self.push(thread, wake, end, SegKind::Runq);

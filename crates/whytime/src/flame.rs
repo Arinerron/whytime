@@ -15,12 +15,12 @@
 //! - waiting for a CPU: `[runqueue]`;
 //! - `other (untraced)`: nothing below the line.
 //!
-//! User frames come from [`Symbols`]; kernel frames get the `_[k]` suffix of the
-//! FlameGraph/inferno convention. A stack lost in kernel (stack map collision or full) is
+//! User frames come from [`Symbols`]; kernel frames get the `_[k]` suffix of the FlameGraph
+//! convention. A stack lost in kernel (neither the stack map nor the ring buffer had room) is
 //! `[stack lost]`. Folded output is Brendan Gregg's format (`frame;frame;... count`, one
 //! line per distinct stack, sorted) with counts in microseconds (rounded; stacks under
-//! 0.5 µs are left out), so the counts sum to the wall time; the SVG is inferno's, root
-//! frames colored by class.
+//! 0.5 µs are left out), so the counts sum to the wall time; the SVG ([`svg`]) draws the same
+//! counts, root frames colored by class.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -29,8 +29,6 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use inferno::flamegraph::color::{Color, PaletteMap};
-use inferno::flamegraph::{self, Options};
 use procctx::ProcKey;
 use whytime_abi::SAMPLE_HZ;
 
@@ -39,7 +37,8 @@ use crate::classify::Class;
 use crate::cli::OutputArgs;
 use crate::record::create_owned;
 use crate::report::{format_duration, line_label};
-use crate::stacks::{Symbols, UserKey, stack_id};
+use crate::stacks::{StackKey, Symbols, UserKey};
+use crate::svg;
 use crate::timeline::{Sample, Seg, SegKind, StackIds, Thread, Trace};
 
 /// Farthest a sample may be from an on-CPU stretch that has none and still stand for it:
@@ -153,45 +152,49 @@ pub fn fold(trace: &Trace, attribution: &Attribution, symbols: &Symbols) -> Fold
 }
 
 impl Folded {
-    /// The lines of the folded format: `stack microseconds`, sorted by stack.
-    fn lines(&self) -> impl Iterator<Item = String> {
+    /// The folded stacks with their rounded microseconds, sorted by stack; empty ones left
+    /// out.
+    fn counts(&self) -> impl Iterator<Item = (&str, u64)> {
         self.stacks.iter().filter_map(|(stack, ns)| {
             let us = ns.saturating_add(500) / 1000;
-            (us > 0).then(|| format!("{stack} {us}"))
+            (us > 0).then_some((stack.as_str(), us))
         })
     }
 
     /// Writes the folded format.
     pub fn write_folded(&self, w: &mut dyn Write) -> io::Result<()> {
-        for line in self.lines() {
-            writeln!(w, "{line}")?;
+        for (stack, us) in self.counts() {
+            writeln!(w, "{stack} {us}")?;
         }
         w.flush()
     }
 
-    /// Writes the SVG flamegraph, titled `title`, with `subtitle` under it.
+    /// Writes the SVG flamegraph of the folded counts, titled `title`, with `subtitle` under
+    /// it.
     pub fn write_svg(&self, w: &mut dyn Write, title: &str, subtitle: &str) -> io::Result<()> {
-        let lines: Vec<String> = self.lines().collect();
-        let mut palette = PaletteMap::default();
-        for (root, &class) in &self.roots {
-            palette.insert(root, class_color(class));
-        }
-        let mut options = Options::default();
-        title.clone_into(&mut options.title);
-        options.subtitle = Some(subtitle.to_owned());
-        "µs".clone_into(&mut options.count_name);
-        // Colors from function names, so a replay draws the same graph.
-        options.hash = true;
-        options.palette_map = Some(&mut palette);
-        flamegraph::from_lines(&mut options, lines.iter().map(String::as_str), &mut *w)?;
-        w.flush()
+        let stacks: Vec<(String, u64)> = self
+            .counts()
+            .map(|(stack, us)| (stack.to_owned(), us))
+            .collect();
+        let root_colors = self
+            .roots
+            .iter()
+            .map(|(root, &class)| (root.clone(), class_color(class)))
+            .collect();
+        let chart = svg::Chart {
+            title,
+            subtitle,
+            stacks: &stacks,
+            root_colors: &root_colors,
+        };
+        svg::write(w, &chart)
     }
 }
 
 /// Root frame colors: on-CPU warm, waiting for a CPU yellow, sleeping grey, storage blue,
 /// network green, waits on other tasks (locks, IPC, poll, signals, terminals) purple.
-fn class_color(class: Class) -> Color {
-    let (r, g, b) = match class {
+fn class_color(class: Class) -> (u8, u8, u8) {
+    match class {
         Class::Cpu | Class::Child => (229, 96, 48),
         Class::Runqueue => (230, 196, 64),
         Class::Sleep => (168, 168, 168),
@@ -201,8 +204,7 @@ fn class_color(class: Class) -> Color {
             (164, 112, 212)
         }
         Class::Other => (204, 204, 204),
-    };
-    Color { r, g, b }
+    }
 }
 
 /// A frame name safe in the folded format: `;` separates frames and a line holds one stack.
@@ -219,8 +221,8 @@ fn frame(name: &str) -> String {
 struct Folder<'a> {
     trace: &'a Trace,
     symbols: &'a Symbols,
-    /// Rendered frames below the thread, by process and stack references.
-    leaves: HashMap<(ProcKey, StackIds), String>,
+    /// Rendered frames below the thread, by process, thread and stack references.
+    leaves: HashMap<(ProcKey, u32, StackIds), String>,
     folded: Folded,
 }
 
@@ -257,7 +259,7 @@ impl Folder<'_> {
             self.add(&prefix, "", from - cursor);
             match &seg.kind {
                 SegKind::Blocked(block) => {
-                    let leaf = self.leaf(proc.key, block.stacks);
+                    let leaf = self.leaf(proc.key, thread.tid, block.stacks);
                     self.add(&prefix, &leaf, to - from);
                 }
                 SegKind::Mixed { run, rq } if span.class != Class::Runqueue => {
@@ -296,7 +298,7 @@ impl Folder<'_> {
         let hi = samples.partition_point(|s| s.ts < end);
         if lo == hi {
             let leaf = match nearest(samples, lo, from, end) {
-                Some(sample) => self.leaf(proc, sample.stacks),
+                Some(sample) => self.leaf(proc, thread.tid, sample.stacks),
                 None => "[no sample]".to_owned(),
             };
             self.add(prefix, &leaf, ns);
@@ -306,14 +308,14 @@ impl Folder<'_> {
         for (i, sample) in (0..).zip(&samples[lo..hi]) {
             // Even shares; the remainder goes one nanosecond each to the first samples.
             let share = ns / count + u64::from(i < ns % count);
-            let leaf = self.leaf(proc, sample.stacks);
+            let leaf = self.leaf(proc, thread.tid, sample.stacks);
             self.add(prefix, &leaf, share);
         }
     }
 
-    /// The frames below the thread for stacks `ids` of process `proc`.
-    fn leaf(&mut self, proc: ProcKey, ids: StackIds) -> String {
-        if let Some(leaf) = self.leaves.get(&(proc, ids)) {
+    /// The frames below thread `tid` for its stacks `ids` in process `proc`.
+    fn leaf(&mut self, proc: ProcKey, tid: u32, ids: StackIds) -> String {
+        if let Some(leaf) = self.leaves.get(&(proc, tid, ids)) {
             return leaf.clone();
         }
         let mut frames: Vec<String> = Vec::new();
@@ -321,7 +323,7 @@ impl Folder<'_> {
             0 if ids.kernel == 0 => frames.push("[no stack]".to_owned()),
             0 => {}
             user if user == -libc::EFAULT => {}
-            _ => match UserKey::of(proc, ids).and_then(|key| self.symbols.user.get(&key)) {
+            _ => match UserKey::of(proc, tid, ids).and_then(|key| self.symbols.user(&key)) {
                 Some(user) => frames.extend(user.iter().map(|name| frame(name))),
                 None => frames.push("[stack lost]".to_owned()),
             },
@@ -329,13 +331,13 @@ impl Folder<'_> {
         match ids.kernel {
             0 => {}
             kernel if kernel == -libc::EFAULT => {}
-            _ => match stack_id(ids.kernel).and_then(|id| self.symbols.kernel.get(&id)) {
+            _ => match StackKey::kernel(tid, ids).and_then(|key| self.symbols.kernel(&key)) {
                 Some(kernel) => frames.extend(kernel.iter().map(|name| frame(name) + "_[k]")),
                 None => frames.push("[stack lost]_[k]".to_owned()),
             },
         }
         let leaf = frames.join(";");
-        self.leaves.insert((proc, ids), leaf.clone());
+        self.leaves.insert((proc, tid, ids), leaf.clone());
         leaf
     }
 
@@ -372,25 +374,39 @@ fn nearest(samples: &[Sample], at: usize, from: u64, end: u64) -> Option<Sample>
 #[cfg(test)]
 mod tests {
     use libc::SYS_nanosleep;
+    use whytime_abi::STACK_INLINE;
 
     use super::*;
     use crate::testkit::{episode, exec, exit, feed, sample, seg, sys, trace};
 
-    /// Symbols for process 100 (procctx start 100, as testkit's exec gives it): user stacks
-    /// 0.. from `user`, kernel stacks from `kernel` (`(id, frames)`).
-    fn symbols(user: &[&[&str]], kernel: &[(u32, &[&str])]) -> Symbols {
-        let proc = ProcKey {
-            pid: 100,
-            start: 100,
-        };
-        let names = |frames: &[&str]| frames.iter().map(|&f| f.to_owned()).collect();
-        Symbols {
-            user: (0..)
-                .zip(user)
-                .map(|(id, frames)| (UserKey { proc, image: 0, id }, names(frames)))
-                .collect(),
-            kernel: kernel.iter().map(|&(id, frames)| (id, names(frames))).collect(),
+    /// Process 100 as testkit's exec keys it (procctx start 100).
+    const PROC: ProcKey = ProcKey {
+        pid: 100,
+        start: 100,
+    };
+
+    /// Frames from names.
+    fn names(frames: &[&str]) -> Vec<String> {
+        frames.iter().map(|&f| f.to_owned()).collect()
+    }
+
+    /// Symbols for process 100: user stacks `(key, frames)`, kernel stacks `(key, frames)`.
+    fn symbols(user: &[(StackKey, &[&str])], kernel: &[(StackKey, &[&str])]) -> Symbols {
+        let mut symbols = Symbols::default();
+        for &(stack, frames) in user {
+            let index = symbols.push(names(frames));
+            symbols.user.insert(UserKey { proc: PROC, image: 0, stack }, index);
         }
+        for &(stack, frames) in kernel {
+            let index = symbols.push(names(frames));
+            symbols.kernel.insert(stack, index);
+        }
+        symbols
+    }
+
+    /// Stack `id` of generation 0's map.
+    fn map(id: u32) -> StackKey {
+        StackKey::Map { generation: 0, id }
     }
 
     /// Folds `[0, end)` of `trace` (root process 100).
@@ -416,8 +432,12 @@ mod tests {
         // No sample in the last stretch: the nearest one (700) stands for it.
         feed(&mut t, &exit(2_500, 100, 100, seg(2_000, 500, 0), 0, true));
         let symbols = symbols(
-            &[&["main", "hot"], &["main", "warm"], &["main", "nap"]],
-            &[(3, &["do_nanosleep"])],
+            &[
+                (map(0), &["main", "hot"]),
+                (map(1), &["main", "warm"]),
+                (map(2), &["main", "nap"]),
+            ],
+            &[(map(3), &["do_nanosleep"])],
         );
         assert_eq!(
             folded(&t, 2_500, &symbols),
@@ -449,6 +469,46 @@ mod tests {
                 ("on-CPU (app);app;worker;[stack lost];[stack lost]_[k]".to_owned(), 1_000),
                 ("other (untraced)".to_owned(), 500),
                 ("timer sleep (app);app;worker;[no stack]".to_owned(), 9_999_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn stacks_are_found_by_generation_and_copies_by_thread_and_capture_time() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(0, 100, 100, "app", seg(0, 0, 0)));
+        // Id 1 names different stacks in generations 0 and 1; the third sample's user stack
+        // is a copy, as is the kernel stack of the block that follows.
+        feed(&mut t, &sample(100, 100, 100, [2, 0]));
+        let mut later = sample(300, 100, 100, [2, 0]);
+        later.stack_gen = 1;
+        feed(&mut t, &later);
+        feed(&mut t, &sample(500, 100, 100, [STACK_INLINE, 0]));
+        let mut nap = episode(100, 100, seg(0, 600, 0), sys(SYS_nanosleep), [600, 1_000, 1_000]);
+        (nap.user_stack, nap.kernel_stack) = (-libc::EFAULT, STACK_INLINE);
+        feed(&mut t, &nap);
+        // A copy that never arrived is lost, like a stack the kernel could not store.
+        let mut gone = sample(1_100, 100, 100, [STACK_INLINE, 0]);
+        gone.stack_gen = 1;
+        feed(&mut t, &gone);
+        feed(&mut t, &exit(1_200, 100, 100, seg(1_000, 200, 0), 0, true));
+        let copy = |at, kernel| StackKey::Inline { tid: 100, at, kernel };
+        let symbols = symbols(
+            &[
+                (map(1), &["main", "old"]),
+                (StackKey::Map { generation: 1, id: 1 }, &["main", "new"]),
+                (copy(500, false), &["main", "copied"]),
+            ],
+            &[(copy(600, true), &["do_nanosleep"])],
+        );
+        assert_eq!(
+            folded(&t, 1_200, &symbols),
+            [
+                ("on-CPU (app);app;[stack lost]".to_owned(), 200),
+                ("on-CPU (app);app;main;copied".to_owned(), 200),
+                ("on-CPU (app);app;main;new".to_owned(), 200),
+                ("on-CPU (app);app;main;old".to_owned(), 200),
+                ("timer sleep (app);app;do_nanosleep_[k]".to_owned(), 400),
             ]
         );
     }

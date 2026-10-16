@@ -271,7 +271,9 @@ impl Session {
         let ticks_per_sec = crate::ticks_per_sec()?;
         let recorder = crate::recorder(args, creds.as_ref())?;
         let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
-        let stacks = tracer.take_stacks().map(Collector::new);
+        let stacks = tracer
+            .take_stacks()
+            .map(|maps| Collector::new(maps, monotonic_ns()));
         // From here on, Ctrl-C ends the observation instead of killing whytime.
         let signals = take_signals().context("setting up signal handling")?;
 
@@ -388,6 +390,7 @@ impl Session {
             let stacks = &mut self.stacks;
             self.tracer
                 .drain(|record| crate::ingest(trace, recorder, stacks.as_mut(), record));
+            crate::flip_stacks(&mut self.tracer, trace, recorder, stacks.as_mut());
             let now = monotonic_ns();
             if trace.window.exit.is_some() {
                 return Ok(End::Exit(now));
@@ -397,7 +400,10 @@ impl Session {
             {
                 return Ok(End::Deadline(deadline));
             }
-            for token in epoll.wait(crate::wait_timeout(deadline, now))? {
+            // Flips also come due while the ring is quiet (threads blocked across them).
+            let next_flip = stacks.as_ref().map(Collector::next_flip);
+            let wake = deadline.into_iter().chain(next_flip).min();
+            for token in epoll.wait(crate::wait_timeout(wake, now))? {
                 match token {
                     TARGET => return Ok(End::Exit(monotonic_ns())),
                     SIGNALS => return Ok(End::Interrupt(monotonic_ns())),

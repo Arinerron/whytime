@@ -22,6 +22,7 @@ mod report;
 mod snapshot;
 mod spawn;
 mod stacks;
+mod svg;
 mod sys;
 #[cfg(test)]
 mod testkit;
@@ -111,11 +112,17 @@ fn preflight(tool: &bpfdoctor::Tool) -> bool {
     true
 }
 
-/// Reports a failure to start tracing, with the doctor checks its errno points at; returns
-/// [`EXIT_SETUP`].
+/// Reports a failure to start tracing, with the doctor checks it points at (by errno, or
+/// `probe.stacks` when stack capture is what failed); returns [`EXIT_SETUP`].
 fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
-    eprintln!("whytime: {}", doctor::describe(err));
-    let ids = tracer::errno(err).map_or(&[][..], ids_for_errno);
+    let ids = if err.downcast_ref::<StacksUnavailable>().is_some() {
+        // The whole chain: the sysctl or errno that made it unavailable.
+        eprintln!("whytime: {err:#}");
+        &["probe.stacks"][..]
+    } else {
+        eprintln!("whytime: {}", doctor::describe(err));
+        tracer::errno(err).map_or(&[][..], ids_for_errno)
+    };
     if !ids.is_empty() {
         let report = doctor::full().run_ids(&RealEnv, tool, ids);
         if report
@@ -129,10 +136,24 @@ fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
     EXIT_SETUP
 }
 
-/// Loads and attaches the programs, with stack capture when `stacks`; says which optional
-/// program sets are attached, warning about the others.
+/// `--flamegraph`/`--folded` asked for stack capture and it cannot work: whytime stops before
+/// running anything rather than run without the flamegraph.
+#[derive(Debug)]
+struct StacksUnavailable;
+
+impl std::fmt::Display for StacksUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stack capture for --flamegraph/--folded is unavailable")
+    }
+}
+
+/// Loads and attaches the programs, with stack capture when `stacks` (which must then work);
+/// says which optional program sets are attached, warning about the others.
 fn load(syscalls: &SyscallTable, stacks: bool) -> anyhow::Result<(Tracer, Probes)> {
     let loaded = Tracer::load(syscalls, stacks)?;
+    if let Some(Err(err)) = loaded.stacks {
+        return Err(err.context(StacksUnavailable));
+    }
     if let Err(err) = &loaded.syscalls {
         log::warn!("syscall tracepoints unavailable ({err:#}); blocked time will not be classified");
     }
@@ -148,14 +169,11 @@ fn load(syscalls: &SyscallTable, stacks: bool) -> anyhow::Result<(Tracer, Probes
              reported as fault"
         );
     }
-    if let Some(Err(err)) = &loaded.stacks {
-        log::warn!("stack capture unavailable ({err:#}); there will be no flamegraph");
-    }
     let probes = Probes {
         syscalls: loaded.syscalls.is_ok(),
         readiness: loaded.readiness.is_ok(),
         faults: loaded.faults.is_ok(),
-        stacks: loaded.stacks.as_ref().map(Result::is_ok),
+        stacks,
     };
     Ok((loaded.tracer, probes))
 }
@@ -215,7 +233,9 @@ impl Session {
         let ticks_per_sec = ticks_per_sec()?;
         let recorder = recorder(args, creds.as_ref())?;
         let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
-        let stacks = tracer.take_stacks().map(Collector::new);
+        let stacks = tracer
+            .take_stacks()
+            .map(|maps| Collector::new(maps, monotonic_ns()));
 
         let signals = take_signals().context("setting up signal handling")?;
         let mut child = Child::spawn(&args.command, creds.as_ref()).context("forking")?;
@@ -329,6 +349,7 @@ impl Session {
             let stacks = &mut self.stacks;
             self.tracer
                 .drain(|record| ingest(trace, recorder, stacks.as_mut(), record));
+            flip_stacks(&mut self.tracer, trace, recorder, stacks.as_mut());
             let deadline = duration_ns
                 .zip(trace.window.start)
                 .map(|(d, start)| start.saturating_add(d));
@@ -338,7 +359,9 @@ impl Session {
             {
                 return Ok(Outcome::Deadline(deadline));
             }
-            let timeout = wait_timeout(deadline, now);
+            // Flips also come due while the ring is quiet (threads blocked across them).
+            let next_flip = stacks.as_ref().map(Collector::next_flip);
+            let timeout = wait_timeout(deadline.into_iter().chain(next_flip).min(), now);
             for token in epoll.wait(timeout)? {
                 match token {
                     CHILD => return self.command.child.wait().map(Outcome::Exited),
@@ -387,6 +410,27 @@ fn ingest(
     }
 }
 
+/// With stack capture, flips the stack generation when one is due: the programs move to the
+/// other map, the old generation's stacks still referred to are read (blocked threads', and
+/// the records in flight, drained into `trace`), then the old map is emptied.
+fn flip_stacks(
+    tracer: &mut Tracer,
+    trace: &mut Trace,
+    recorder: Option<&Recorder>,
+    stacks: Option<&mut Collector>,
+) {
+    let Some(stacks) = stacks else {
+        return;
+    };
+    let now = monotonic_ns();
+    if !stacks.flip_due(now) || !stacks.advance(now) {
+        return;
+    }
+    stacks.keep(&tracer.tasks());
+    tracer.drain(|record| ingest(trace, recorder, Some(&mut *stacks), record));
+    stacks.retire(monotonic_ns());
+}
+
 /// With stack capture on, the symbolized stacks of the swept trace; warns about stacks the
 /// kernel lost.
 fn symbolize(stacks: Option<Collector>, trace: &Trace, maps: &tracer::Maps) -> Option<Symbols> {
@@ -394,9 +438,11 @@ fn symbolize(stacks: Option<Collector>, trace: &Trace, maps: &tracer::Maps) -> O
     let lost = maps.lost_stacks();
     if lost > 0 {
         log::warn!(
-            "{lost} stacks lost to stack map collisions or a full map: shown as [stack lost]"
+            "{lost} stacks lost: neither the stack map nor the ring buffer had room (shown as \
+             [stack lost])"
         );
     }
+    log::debug!("{} stacks copied into STACK records", maps.inline_stacks());
     Some(stacks.finish(trace))
 }
 
@@ -436,7 +482,6 @@ fn meta(header: &Header, end: &End) -> Meta {
         syscalls: header.probes.syscalls,
         readiness: header.probes.readiness,
         faults: header.probes.faults,
-        stacks: header.probes.stacks,
         attached: header.attached,
     }
 }
