@@ -120,6 +120,12 @@ optional fields, new `class` values); removing or renaming a field or changing i
 bumps the schema to `whytime.report/2`. Consumers must ignore unknown fields and treat an
 unknown `class` as `other`. The field reference is in [AGENTS.md](AGENTS.md#report).
 
+## Contributing
+
+Bug reports, ideas and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md)
+and the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as
+described in [SECURITY.md](SECURITY.md). Release notes are in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE). The BPF object declares `Dual MIT/GPL` at load time because the

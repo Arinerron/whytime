@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Arinerron/whytime/security/policy
+    about: Please report vulnerabilities privately as described in the security policy, not in a public issue.
+  - name: How whytime attributes time, and its limits
+    url: https://github.com/Arinerron/whytime/blob/main/AGENTS.md#attribution-model-what-the-numbers-mean
+    about: Read this first if a report looks surprising; known limits are listed there.

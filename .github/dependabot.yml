@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # tracekit is a git submodule pinned at a release tag; it is updated in its own
+    # repository and bumped here by hand.
+    exclude-paths:
+      - "tracekit/**"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/setup
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"

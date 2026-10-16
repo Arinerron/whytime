@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a new capability, report detail, or supported environment.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. A concrete workload where whytime's answer is missing or
+        unhelpful today makes a request much easier to act on.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to find out, and where does whytime fall short today?
+      placeholder: When I run whytime on ..., the report says ... but I need to know ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What whytime should do or report. Sketch the report line, flag or output you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other tools or workarounds you tried, and why they are not enough.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Kernel (`uname -r`), distribution, and anything else relevant (containers, VMs, architecture).
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to work on this?
+      options:
+        - "No"
+        - "Yes, with guidance"
+        - "Yes, I have a design in mind"
