@@ -87,9 +87,9 @@ fn test_e2e() -> anyhow::Result<()> {
             Box::new(check_child),
         ),
         (
-            "futex",
-            sudo(&[&bin("wt-futex"), "800"]),
-            Box::new(check_futex),
+            "lock-holder",
+            sudo(&[&bin("wt-futex"), "500"]),
+            Box::new(check_lock_holder),
         ),
         (
             "tcp-slow",
@@ -114,6 +114,21 @@ fn test_e2e() -> anyhow::Result<()> {
             "setcap",
             setcap_copy(whytime, &work, &bin("wt-sleep"))?,
             Box::new(check_setcap),
+        ),
+        (
+            "threads-cpu",
+            sudo(&[&bin("wt-threads"), "4", "600"]),
+            Box::new(check_threads_cpu),
+        ),
+        (
+            "threads-timed",
+            sudo(&[&bin("wt-threads"), "4", "600", "50"]),
+            Box::new(check_threads_cpu),
+        ),
+        (
+            "vfork",
+            sudo(&[&bin("wt-vfork"), "600"]),
+            Box::new(check_vfork),
         ),
         (
             "record-replay",
@@ -256,6 +271,8 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         "wt-futex",
         "wt-tcp",
         "wt-attach",
+        "wt-threads",
+        "wt-vfork",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -448,15 +465,45 @@ fn check_child(out: &Output) -> anyhow::Result<String> {
     ))
 }
 
-fn check_futex(out: &Output) -> anyhow::Result<String> {
+/// The main thread waits on a mutex whose holder sleeps: following the futex waker makes
+/// that `sleep`, not `futex`.
+fn check_lock_holder(out: &Output) -> anyhow::Result<String> {
     exited(out, 0)?;
     let report = report(out)?;
-    let futex = class_share(&report, "futex", |_| true);
-    ensure!(futex >= 0.5, "futex share {futex:.3} < 0.5");
+    let sleep = class_share(&report, "sleep", |_| true);
+    ensure!(sleep >= 0.8, "sleep share {sleep:.3} < 0.8");
     Ok(format!(
-        "wall {:.3}s, futex {:.1}%",
+        "wall {:.3}s, holder's sleep {:.1}%",
         wall_secs(&report),
-        futex * 100.0
+        sleep * 100.0
+    ))
+}
+
+/// The main thread waits for CPU-bound threads of its own process (joins, or timed condition
+/// waits that mostly time out): `cpu`, not `futex`.
+fn check_threads_cpu(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let cpu = class_share(&report, "cpu", |s| s == "wt-threads");
+    ensure!(cpu >= 0.8, "on-CPU (wt-threads) share {cpu:.3} < 0.8");
+    Ok(format!(
+        "wall {:.3}s, on-CPU {:.1}%",
+        wall_secs(&report),
+        cpu * 100.0
+    ))
+}
+
+/// The parent blocks in `clone` while its `CLONE_VFORK` child computes before exec: `child`
+/// (the child still carries the parent's comm), not `other`.
+fn check_vfork(out: &Output) -> anyhow::Result<String> {
+    exited(out, 0)?;
+    let report = report(out)?;
+    let child = class_share(&report, "child", |s| s == "wt-vfork");
+    ensure!(child >= 0.8, "waiting on child wt-vfork {child:.3} < 0.8");
+    Ok(format!(
+        "wall {:.3}s, waiting on child: wt-vfork (before exec) {:.1}%",
+        wall_secs(&report),
+        child * 100.0
     ))
 }
 

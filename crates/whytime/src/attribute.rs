@@ -1,29 +1,42 @@
-//! Critical-path attribution: every nanosecond of the window goes to exactly one line.
+//! Critical-path attribution: every nanosecond of the window goes to exactly one span.
 //!
 //! The walk follows the wrapped command's main thread through the window. On-CPU time of the
-//! command's own process is `cpu`; preempted and woken-not-yet-running time is `runqueue`;
-//! blocked time goes to the class of what it blocked on. Two kinds of block are explained by
-//! another process instead, by descending into it for the same interval:
+//! command's own process (any thread) is `cpu`; on-CPU time of a descendant process is
+//! `child` ("waiting on child: <comm>"); preempted and woken-not-yet-running time is
+//! `runqueue`; blocked time goes to the class of what it blocked on, unless another tracked
+//! task explains the block. Then the walk follows that task over the same interval, applying
+//! the same rules recursively, so the followed task's own blocks keep their class (a lock
+//! holder's sleep is `sleep`):
 //!
-//! - waiting for a child (`wait4`/`waitid`): the child that ended the wait (the waker when it
-//!   is a child, else the child that exited last inside the block, else the youngest child
-//!   still alive at its end);
-//! - waiting on a pipe or local socket woken by another tracked process: that process.
+//! - `futex`, `ipc` (pipes, local sockets) and `poll` blocks woken by a tracked thread: that
+//!   thread (the lock holder, the writer, the readiness source), in any tracked process,
+//!   including other threads of the same one. A `futex` or `poll` wait that ended without a
+//!   tracked waker (a timeout) and was retried at once is part of the next wait and takes
+//!   its waker (`Walker::retried_waker`);
+//! - waiting for a child (`wait4`/`waitid`): the child process that ended the wait (the
+//!   waker when it is a child, else the child that exited last inside the block, else the
+//!   youngest child still alive at its end), along its main thread;
+//! - a `clone`/`clone3`/`vfork` block ended by a child (`CLONE_VFORK`, as `posix_spawn`
+//!   uses): that child, which runs in its parent's memory until it execs or exits.
 //!
-//! Inside a descendant the same rules apply recursively, except that its on-CPU time is
-//! reported as `child` ("waiting on child: <comm>"): the command was waiting while a
-//! descendant computed. Time a descendant does not cover (before its fork, after its exit)
-//! stays with the waiting process's class. Futex waits are not followed (the lock holder is
-//! not known), so a lock held across a sleep shows as `futex`, not `sleep`.
+//! Time a followed task does not cover (before its birth, after its death) stays with the
+//! waiting block. A waker of 0 (unknown, or raised from interrupt context) is never followed.
+//! Neither is a task already being walked further out (mutual waits) nor anything deeper than
+//! [`MAX_DEPTH`]: the block then keeps its own class.
+//!
+//! The walk produces [`Span`]s that partition the window in time order; report lines sum
+//! them by class and subject.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use crate::classify::{Class, Subject};
-use crate::timeline::{ProcId, Seg, SegKind, ThreadId, Trace};
+use crate::timeline::{Block, ProcId, Seg, SegKind, ThreadId, Trace};
 
-/// Deepest descent followed; deeper blocks are reported as their own class.
+/// Deepest follow; deeper blocks keep their own class.
 const MAX_DEPTH: u32 = 64;
+
+/// A wait retried after less than `1 / RETRY_CPU_DIVISOR` of it on-CPU continues it.
+const RETRY_CPU_DIVISOR: u64 = 8;
 
 /// One report line before rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,110 +51,206 @@ pub struct Line {
     pub connections: Option<usize>,
 }
 
+/// One stretch of the critical path: `[start, end)` of the window, explained by `thread`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    /// Start, `CLOCK_MONOTONIC` nanoseconds.
+    pub start: u64,
+    /// End, exclusive.
+    pub end: u64,
+    /// Resource class.
+    pub class: Class,
+    /// What within the class, as in [`Line::subject`].
+    pub subject: String,
+    /// Process of `thread`.
+    pub proc: ProcId,
+    /// Thread whose timeline the stretch comes from.
+    pub thread: ThreadId,
+    /// Follows from the wrapped command's main line to `thread` (0: the main line itself).
+    pub depth: u32,
+}
+
 /// The attributed window.
 #[derive(Debug)]
 pub struct Attribution {
-    /// Lines, largest first; their `ns` sum to the window length.
+    /// Lines, largest first: the spans summed by class and subject, so their `ns` sum to the
+    /// window length.
     pub lines: Vec<Line>,
-    /// Processes the walk passed through.
-    pub critical: HashSet<ProcId>,
+    /// The critical path in time order: each span starts where the previous one ends, from
+    /// the window's start to its end. Adjacent stretches with equal fields are one span.
+    /// Within a mixed segment, whose on-CPU and preempted time interleave in unknown order,
+    /// the on-CPU part comes first.
+    pub spans: Vec<Span>,
+}
+
+impl Attribution {
+    /// Processes the critical path passed through.
+    pub fn critical(&self) -> HashSet<ProcId> {
+        self.spans.iter().map(|span| span.proc).collect()
+    }
 }
 
 /// Attributes `[start, end)` of the root process `root`.
 pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attribution {
     let mut walker = Walker {
         trace,
+        root,
         by_tgid: HashMap::new(),
-        acc: HashMap::new(),
+        by_tid: HashMap::new(),
+        parents: vec![None; trace.procs.len()],
+        spans: Vec::new(),
         sockets: HashMap::new(),
-        critical: HashSet::new(),
+        stack: Vec::new(),
+        retries: HashMap::new(),
     };
     for (id, proc) in trace.procs.iter().enumerate() {
         walker.by_tgid.entry(proc.key.pid).or_default().push(id);
+        for &child in &proc.children {
+            walker.parents[child] = Some(id);
+        }
     }
-    walker.walk(root, start, end, 0);
+    for (id, thread) in trace.threads.iter().enumerate() {
+        walker.by_tid.entry(thread.tid).or_default().push(id);
+    }
+    walker.walk_proc(root, start, end, 0);
+    let Walker { spans, sockets, .. } = walker;
 
-    let Walker {
-        acc,
-        sockets,
-        critical,
-        ..
-    } = walker;
-    let mut lines: Vec<Line> = acc
+    let mut totals: HashMap<(Class, &str), u64> = HashMap::new();
+    for span in &spans {
+        *totals.entry((span.class, &span.subject)).or_default() += span.end - span.start;
+    }
+    let mut lines: Vec<Line> = totals
         .into_iter()
-        .map(|((class, subject), ns)| {
-            let connections = sockets
-                .get(&subject)
+        .map(|((class, subject), ns)| Line {
+            class,
+            subject: subject.to_owned(),
+            ns,
+            connections: sockets
+                .get(subject)
                 .map(HashSet::len)
-                .filter(|_| class == Class::Net);
-            Line {
-                class,
-                subject,
-                ns,
-                connections,
-            }
+                .filter(|_| class == Class::Net),
         })
         .collect();
     lines.sort_by(|a, b| {
         b.ns.cmp(&a.ns)
             .then_with(|| (a.class, &a.subject).cmp(&(b.class, &b.subject)))
     });
-    Attribution { lines, critical }
+    Attribution { lines, spans }
+}
+
+/// The thread a span's time comes from.
+#[derive(Clone, Copy)]
+struct At {
+    proc: ProcId,
+    thread: ThreadId,
+    depth: u32,
+}
+
+/// What explains a block.
+#[derive(Clone, Copy)]
+enum Target {
+    /// One thread over the block: a futex, pipe or readiness waker.
+    Thread(ThreadId),
+    /// A process along its main line: a child waited for.
+    Proc(ProcId),
 }
 
 struct Walker<'a> {
     trace: &'a Trace,
+    /// The wrapped command: on-CPU time is `cpu` in it, `child` anywhere else.
+    root: ProcId,
     /// Every process lifetime that had a given tgid.
     by_tgid: HashMap<u32, Vec<ProcId>>,
-    acc: HashMap<(Class, String), u64>,
+    /// Every thread that had a given tid.
+    by_tid: HashMap<u32, Vec<ThreadId>>,
+    /// Parent of each process, when it was traced.
+    parents: Vec<Option<ProcId>>,
+    spans: Vec<Span>,
     /// Distinct socket inodes per `net` subject.
     sockets: HashMap<String, HashSet<u64>>,
-    critical: HashSet<ProcId>,
+    /// Threads being walked, outermost first. Each is blocked over the interval walked inside
+    /// it, so following one again would loop (A waits on B while B waits on A).
+    stack: Vec<ThreadId>,
+    /// Waker of each retried wait looked up so far, by thread and segment index.
+    retries: HashMap<(ThreadId, usize), Option<ThreadId>>,
 }
 
 impl Walker<'_> {
-    fn add(&mut self, class: Class, subject: String, ns: u64) {
-        if ns > 0 {
-            *self.acc.entry((class, subject)).or_default() += ns;
+    /// Appends `[start, end)`, merged into the previous span when every field matches.
+    fn emit(&mut self, at: At, start: u64, end: u64, class: Class, subject: String) {
+        if start >= end {
+            return;
+        }
+        debug_assert!(self.spans.last().is_none_or(|last| last.end == start));
+        if let Some(last) = self.spans.last_mut()
+            && (last.class, last.proc, last.thread, last.depth)
+                == (class, at.proc, at.thread, at.depth)
+            && last.subject == subject
+        {
+            last.end = end;
+            return;
+        }
+        self.spans.push(Span {
+            start,
+            end,
+            class,
+            subject,
+            proc: at.proc,
+            thread: at.thread,
+            depth: at.depth,
+        });
+    }
+
+    /// Time no record accounts for (lost records, or past the last sweep).
+    fn untraced(&mut self, at: At, from: u64, to: u64) {
+        if from < to {
+            self.emit(at, from, to, Class::Other, "untraced".to_owned());
         }
     }
 
-    /// Attributes `[a, b)` of process `p`, `depth` descents below the wrapped command.
-    fn walk(&mut self, p: ProcId, a: u64, b: u64, depth: u32) {
-        if a >= b {
-            return;
-        }
-        self.critical.insert(p);
-        let trace = self.trace;
+    /// Walks `[a, b)` of process `p` (which has a thread) along its main line, `depth`
+    /// follows below the wrapped command's.
+    fn walk_proc(&mut self, p: ProcId, a: u64, b: u64, depth: u32) {
         let mut cursor = a;
+        let mut last = self.trace.procs[p].threads[0];
         for (thread, from, to) in self.main_line(p) {
-            let (lo, hi) = (a.max(from), b.min(to));
+            let (lo, hi) = (from.max(cursor), to.min(b));
             if lo >= hi {
                 continue;
             }
-            let segs = &trace.threads[thread].segs;
-            let first = segs.partition_point(|s| s.end <= lo);
-            for seg in &segs[first..] {
-                if seg.start >= hi {
-                    break;
-                }
-                let (s0, s1) = (seg.start.max(lo).max(cursor), seg.end.min(hi));
-                if s0 >= s1 {
-                    continue;
-                }
-                self.untraced(cursor, s0);
-                self.segment(p, seg, s0, s1, depth);
-                cursor = s1;
-            }
+            self.untraced(At { proc: p, thread: last, depth }, cursor, lo);
+            self.walk_thread(thread, lo, hi, depth);
+            (cursor, last) = (hi, thread);
         }
-        self.untraced(cursor, b);
+        self.untraced(At { proc: p, thread: last, depth }, cursor, b);
     }
 
-    /// Time no thread of a process accounts for (lost records, or past the last sweep).
-    fn untraced(&mut self, from: u64, to: u64) {
-        if to > from {
-            self.add(Class::Other, "untraced".to_owned(), to - from);
+    /// Walks `[a, b)` of thread `t`.
+    fn walk_thread(&mut self, t: ThreadId, a: u64, b: u64, depth: u32) {
+        let thread = &self.trace.threads[t];
+        let at = At {
+            proc: thread.proc,
+            thread: t,
+            depth,
+        };
+        self.stack.push(t);
+        let mut cursor = a;
+        let segs = &thread.segs;
+        let first = segs.partition_point(|s| s.end <= a);
+        for (index, seg) in segs.iter().enumerate().skip(first) {
+            if seg.start >= b {
+                break;
+            }
+            let (s0, s1) = (seg.start.max(cursor), seg.end.min(b));
+            if s0 >= s1 {
+                continue;
+            }
+            self.untraced(at, cursor, s0);
+            self.segment(at, index, s0, s1);
+            cursor = s1;
         }
+        self.untraced(at, cursor, b);
+        self.stack.pop();
     }
 
     /// The thread that stands for the process at each moment: the original leader while it
@@ -180,81 +289,132 @@ impl Walker<'_> {
         line
     }
 
-    fn segment(&mut self, p: ProcId, seg: &Seg, s0: u64, s1: u64, depth: u32) {
+    fn segment(&mut self, at: At, index: usize, s0: u64, s1: u64) {
         let trace = self.trace;
-        let comm = || trace.procs[p].comm_at(s0).to_string();
+        let seg = &trace.threads[at.thread].segs[index];
+        let comm = || trace.procs[at.proc].comm_at(s0).to_string();
         let len = s1 - s0;
         match &seg.kind {
-            SegKind::Mixed { run, rq } => {
+            SegKind::Mixed { run, rq, .. } => {
                 let cpu = if run + rq == 0 {
                     len
                 } else {
                     u64::try_from(u128::from(len) * u128::from(*run) / u128::from(run + rq))
                         .unwrap_or(len)
                 };
-                let class = if depth == 0 { Class::Cpu } else { Class::Child };
+                let class = if at.proc == self.root {
+                    Class::Cpu
+                } else {
+                    Class::Child
+                };
                 let comm = comm();
-                self.add(Class::Runqueue, comm.clone(), len - cpu);
-                self.add(class, comm, cpu);
-            }
-            SegKind::Runq => self.add(Class::Runqueue, comm(), len),
-            SegKind::Blocked(block) => match block.what.class {
-                Class::Child => match self.child_for(p, seg, block.waker_tgid) {
-                    Some(child) if depth < MAX_DEPTH => {
-                        self.descend(child, s0, s1, depth, Class::Child);
-                    }
-                    Some(child) => {
-                        let subject = trace.procs[child].comm().to_string();
-                        self.add(Class::Child, subject, len);
-                    }
-                    None => self.add(Class::Child, "unknown child".to_owned(), len),
-                },
-                Class::Ipc if depth < MAX_DEPTH => match self.process_at(block.waker_tgid, seg.end)
-                {
-                    Some(waker) if waker != p => self.descend(waker, s0, s1, depth, Class::Ipc),
-                    _ => self.add(Class::Ipc, comm(), len),
-                },
-                class => {
-                    let subject = match &block.what.subject {
-                        Subject::Process => comm(),
-                        other => other.to_string(),
-                    };
-                    if let Some(socket) = block.what.socket {
-                        self.sockets
-                            .entry(subject.clone())
-                            .or_default()
-                            .insert(socket);
-                    }
-                    self.add(class, subject, len);
+                if cpu < len {
+                    self.emit(at, s0, s0 + cpu, class, comm.clone());
+                    self.emit(at, s0 + cpu, s1, Class::Runqueue, comm);
+                } else {
+                    self.emit(at, s0, s1, class, comm);
                 }
-            },
+            }
+            SegKind::Runq => self.emit(at, s0, s1, Class::Runqueue, comm()),
+            SegKind::Blocked(block) => self.blocked(at, index, block, s0, s1),
         }
     }
 
-    /// Explains `[s0, s1)` by process `q`; the parts outside its lifetime stay `class`,
-    /// subject `q`'s comm.
-    fn descend(&mut self, q: ProcId, s0: u64, s1: u64, depth: u32, class: Class) {
-        let proc = &self.trace.procs[q];
-        let lo = s0.max(proc.birth);
-        let hi = s1.min(proc.death.unwrap_or(u64::MAX));
-        let subject: Arc<str> = Arc::clone(proc.comm());
-        if lo >= hi {
-            self.add(class, subject.to_string(), s1 - s0);
+    /// Attributes `[s0, s1)` of `block`, segment `index` of `at`'s thread, to the task that
+    /// explains it, if one is known.
+    fn blocked(&mut self, at: At, index: usize, block: &Block, s0: u64, s1: u64) {
+        let trace = self.trace;
+        let seg = &trace.threads[at.thread].segs[index];
+        let comm = |p: ProcId| trace.procs[p].comm().to_string();
+        let explained = match block.what.class {
+            Class::Child => {
+                let Some(child) = self.child_for(at.proc, seg, block.waker_tgid) else {
+                    self.emit(at, s0, s1, Class::Child, "unknown child".to_owned());
+                    return;
+                };
+                Some((Target::Proc(child), (Class::Child, comm(child))))
+            }
+            class @ (Class::Futex | Class::Ipc | Class::Poll) => {
+                let waker = match self.thread_at(block.waker_tid, block.waker_tgid, seg.end) {
+                    None if class != Class::Ipc => self.retried_waker(at.thread, index, class),
+                    waker => waker,
+                };
+                waker.map(|waker| (Target::Thread(waker), self.own_line(at, block, s0)))
+            }
+            _ if spawns(&block.what.subject) => self
+                .process_at(block.waker_tgid, seg.end)
+                .filter(|&child| self.parents[child] == Some(at.proc))
+                .map(|child| (Target::Proc(child), (Class::Child, comm(child)))),
+            _ => None,
+        };
+        match explained {
+            Some((target, waiting)) => self.follow(at, target, s0, s1, waiting),
+            None => {
+                let (class, subject) = self.own_line(at, block, s0);
+                if let Some(socket) = block.what.socket {
+                    self.sockets
+                        .entry(subject.clone())
+                        .or_default()
+                        .insert(socket);
+                }
+                self.emit(at, s0, s1, class, subject);
+            }
+        }
+    }
+
+    /// Explains `[s0, s1)` of a block at `at` by walking `target` over it. Time outside the
+    /// target's life goes to `waiting` (class and subject), and so does all of it when the
+    /// target is already being walked or the walk is [`MAX_DEPTH`] deep.
+    fn follow(&mut self, at: At, target: Target, s0: u64, s1: u64, waiting: (Class, String)) {
+        let trace = self.trace;
+        let (birth, death, busy) = match target {
+            Target::Thread(t) => {
+                let thread = &trace.threads[t];
+                let proc_death = trace.procs[thread.proc].death;
+                let death = thread.death.into_iter().chain(proc_death).min();
+                (thread.birth, death, self.stack.contains(&t))
+            }
+            Target::Proc(q) => {
+                let proc = &trace.procs[q];
+                let busy = proc.threads.is_empty()
+                    || proc.threads.iter().any(|t| self.stack.contains(t));
+                (proc.birth, proc.death, busy)
+            }
+        };
+        let (lo, hi) = (s0.max(birth), s1.min(death.unwrap_or(u64::MAX)));
+        let (class, subject) = waiting;
+        if busy || at.depth >= MAX_DEPTH || lo >= hi {
+            self.emit(at, s0, s1, class, subject);
             return;
         }
-        self.add(class, subject.to_string(), (lo - s0) + (s1 - hi));
-        self.walk(q, lo, hi, depth + 1);
+        if s0 < lo {
+            self.emit(at, s0, lo, class, subject.clone());
+        }
+        match target {
+            Target::Thread(t) => self.walk_thread(t, lo, hi, at.depth + 1),
+            Target::Proc(q) => self.walk_proc(q, lo, hi, at.depth + 1),
+        }
+        self.emit(at, hi, s1, class, subject);
+    }
+
+    /// A block's own class and subject: the classified subject, or the blocked process's comm.
+    fn own_line(&self, at: At, block: &Block, ts: u64) -> (Class, String) {
+        let subject = match &block.what.subject {
+            Subject::Process => self.trace.procs[at.proc].comm_at(ts).to_string(),
+            other => other.to_string(),
+        };
+        (block.what.class, subject)
     }
 
     /// The child of `p` whose state change ended the wait `seg`.
     fn child_for(&self, p: ProcId, seg: &Seg, waker_tgid: u32) -> Option<ProcId> {
         let procs = &self.trace.procs;
-        let children = &procs[p].children;
         if let Some(waker) = self.process_at(waker_tgid, seg.end)
-            && children.contains(&waker)
+            && self.parents[waker] == Some(p)
         {
             return Some(waker);
         }
+        let children = &procs[p].children;
         let exited = children
             .iter()
             .copied()
@@ -275,24 +435,316 @@ impl Walker<'_> {
         })
     }
 
-    /// The process with thread-group id `tgid` alive at `ts`.
+    /// The latest process with thread-group id `tgid` born by `ts`, dead or alive: a process
+    /// can wake others while it exits (its parent, a pipe's reader), after its exit record.
     fn process_at(&self, tgid: u32, ts: u64) -> Option<ProcId> {
         if tgid == 0 {
             return None;
         }
-        self.by_tgid.get(&tgid)?.iter().copied().rev().find(|&id| {
-            let proc = &self.trace.procs[id];
-            proc.birth <= ts && proc.death.is_none_or(|d| d >= ts)
-        })
+        let procs = &self.trace.procs;
+        self.by_tgid
+            .get(&tgid)?
+            .iter()
+            .copied()
+            .rev()
+            .find(|&id| procs[id].birth <= ts)
     }
+
+    /// The latest thread `tid` of process `tgid` born by `ts`, dead or alive (an exiting
+    /// thread wakes its joiner).
+    fn thread_at(&self, tid: u32, tgid: u32, ts: u64) -> Option<ThreadId> {
+        if tid == 0 {
+            return None;
+        }
+        let threads = &self.trace.threads;
+        let thread = self
+            .by_tid
+            .get(&tid)?
+            .iter()
+            .copied()
+            .rev()
+            .find(|&t| threads[t].birth <= ts)?;
+        (self.trace.procs[threads[thread].proc].key.pid == tgid).then_some(thread)
+    }
+
+    /// The waker of a retried wait. A `futex` or `poll` wait that no tracked thread ended (a
+    /// timeout, typically) is one wait with the thread's next wait of the same `class` when
+    /// the thread ran less than 1/[`RETRY_CPU_DIVISOR`] of the first in between: it
+    /// re-checked and waited again (a timed condition wait, Python's GIL). The first wait of
+    /// such a chain that a tracked thread ended names the waker of all of them.
+    fn retried_waker(&mut self, t: ThreadId, index: usize, class: Class) -> Option<ThreadId> {
+        if let Some(&waker) = self.retries.get(&(t, index)) {
+            return waker;
+        }
+        let segs = &self.trace.threads[t].segs;
+        let mut chain = vec![index];
+        let mut wait = segs[index].end - segs[index].start;
+        let mut ran = 0_u64;
+        let mut waker = None;
+        for (i, seg) in segs.iter().enumerate().skip(index + 1) {
+            match &seg.kind {
+                SegKind::Mixed { run, .. } => {
+                    ran += run;
+                    if ran.saturating_mul(RETRY_CPU_DIVISOR) >= wait {
+                        break;
+                    }
+                }
+                SegKind::Runq => {}
+                SegKind::Blocked(block) if block.what.class == class => {
+                    waker = self.thread_at(block.waker_tid, block.waker_tgid, seg.end);
+                    if waker.is_some() {
+                        break;
+                    }
+                    if let Some(&known) = self.retries.get(&(t, i)) {
+                        waker = known;
+                        break;
+                    }
+                    chain.push(i);
+                    (wait, ran) = (seg.end - seg.start, 0);
+                }
+                SegKind::Blocked(_) => break,
+            }
+        }
+        for i in chain {
+            self.retries.insert((t, i), waker);
+        }
+        waker
+    }
+}
+
+/// Whether a block in this syscall can be a parent waiting for its `CLONE_VFORK` child.
+fn spawns(subject: &Subject) -> bool {
+    matches!(subject, Subject::Syscall("clone" | "clone3" | "vfork"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use libc::{SYS_nanosleep, SYS_wait4};
+    use procctx::ProcKey;
 
     use super::*;
+    use crate::classify::Blocked;
     use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
+    use crate::timeline::{Proc, Thread};
+
+    /// Adds process `pid` alive over `life`, `[birth, death)`.
+    fn proc(
+        t: &mut Trace,
+        pid: u32,
+        comm: &str,
+        life: (u64, u64),
+        parent: Option<ProcId>,
+    ) -> ProcId {
+        let id = t.procs.len();
+        t.procs.push(Proc {
+            key: ProcKey { pid, start: 0 },
+            birth: life.0,
+            death: Some(life.1),
+            comms: vec![(life.0, Arc::from(comm))],
+            threads: Vec::new(),
+            children: Vec::new(),
+            cpu_ns: 0,
+        });
+        if let Some(parent) = parent {
+            t.procs[parent].children.push(id);
+        }
+        id
+    }
+
+    /// Adds thread `tid` living exactly over `segs`.
+    fn thread(t: &mut Trace, proc: ProcId, tid: u32, segs: Vec<Seg>) -> ThreadId {
+        let id = t.threads.len();
+        t.threads.push(Thread {
+            tid,
+            proc,
+            birth: segs[0].start,
+            death: segs.last().map(|s| s.end),
+            segs,
+        });
+        t.procs[proc].threads.push(id);
+        id
+    }
+
+    fn run(start: u64, end: u64) -> Seg {
+        let kind = SegKind::Mixed {
+            run: end - start,
+            rq: 0,
+        };
+        Seg { start, end, kind }
+    }
+
+    fn runq(start: u64, end: u64) -> Seg {
+        let kind = SegKind::Runq;
+        Seg { start, end, kind }
+    }
+
+    /// A block of `class` ended by thread `waker.0` of process `waker.1`.
+    fn block(start: u64, end: u64, class: Class, subject: Subject, waker: (u32, u32)) -> Seg {
+        let block = Block {
+            what: Blocked {
+                class,
+                subject,
+                socket: None,
+            },
+            waker_tid: waker.0,
+            waker_tgid: waker.1,
+        };
+        let kind = SegKind::Blocked(Box::new(block));
+        Seg { start, end, kind }
+    }
+
+    fn futex(start: u64, end: u64, waker: (u32, u32)) -> Seg {
+        block(start, end, Class::Futex, Subject::Process, waker)
+    }
+
+    /// Checks that the spans tile `[start, end)` and the lines add up to it, and returns the
+    /// lines as `(class, subject, ns)`.
+    fn tiled(a: &Attribution, start: u64, end: u64) -> Vec<(Class, &str, u64)> {
+        let mut cursor = start;
+        for span in &a.spans {
+            assert_eq!(span.start, cursor, "gap or overlap before {span:?}");
+            assert!(span.end > span.start, "empty {span:?}");
+            cursor = span.end;
+        }
+        assert_eq!(cursor, end);
+        assert_eq!(a.lines.iter().map(|l| l.ns).sum::<u64>(), end - start);
+        let mut lines: Vec<_> = a
+            .lines
+            .iter()
+            .map(|l| (l.class, l.subject.as_str(), l.ns))
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    #[test]
+    fn a_lock_held_across_a_sleep_is_the_holders_sleep() {
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 100), None);
+        let main = vec![run(0, 10), futex(10, 90, (11, 10)), runq(90, 92), run(92, 100)];
+        thread(&mut t, app, 10, main);
+        let sleep = block(5, 88, Class::Sleep, Subject::Process, (0, 0));
+        let holder = thread(&mut t, app, 11, vec![run(0, 5), sleep, runq(88, 89), run(89, 95)]);
+
+        let a = attribute(&t, app, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [
+                (Class::Cpu, "app", 19),
+                (Class::Runqueue, "app", 3),
+                (Class::Sleep, "app", 78),
+            ]
+        );
+        let slept = a.spans.iter().find(|s| s.class == Class::Sleep).unwrap();
+        assert_eq!((slept.thread, slept.depth, slept.start, slept.end), (holder, 1, 10, 88));
+    }
+
+    #[test]
+    fn mutual_waits_terminate_in_the_waiting_class() {
+        // Three threads each "woken" by the next, in a ring: no task explains the time.
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 100), None);
+        thread(&mut t, app, 10, vec![futex(0, 100, (11, 10))]);
+        thread(&mut t, app, 11, vec![futex(0, 100, (12, 10))]);
+        let last = thread(&mut t, app, 12, vec![futex(0, 100, (10, 10))]);
+
+        let a = attribute(&t, app, 0, 100);
+        assert_eq!(tiled(&a, 0, 100), [(Class::Futex, "app", 100)]);
+        assert_eq!((a.spans[0].thread, a.spans[0].depth), (last, 2));
+    }
+
+    #[test]
+    fn descendants_compute_as_child_and_the_command_as_cpu() {
+        // sh waits for cc; cc computes, then reads a pipe that another thread of sh fills.
+        let mut t = trace(1);
+        let sh = proc(&mut t, 10, "sh", (0, 100), None);
+        let cc = proc(&mut t, 20, "cc", (0, 100), Some(sh));
+        let wait = block(0, 100, Class::Child, Subject::Process, (20, 20));
+        thread(&mut t, sh, 10, vec![wait]);
+        thread(&mut t, sh, 11, vec![run(0, 100)]);
+        let pipe = block(50, 100, Class::Ipc, Subject::Process, (11, 10));
+        thread(&mut t, cc, 20, vec![run(0, 50), pipe]);
+
+        let a = attribute(&t, sh, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(lines, [(Class::Cpu, "sh", 50), (Class::Child, "cc", 50)]);
+        assert_eq!(a.critical(), HashSet::from([sh, cc]));
+    }
+
+    #[test]
+    fn a_vfork_parent_waits_on_the_child_until_its_exec() {
+        let mut t = trace(1);
+        let py = proc(&mut t, 10, "py", (0, 100), None);
+        let spawn = block(5, 60, Class::Other, Subject::Syscall("clone3"), (20, 20));
+        thread(&mut t, py, 10, vec![run(0, 5), spawn, run(60, 100)]);
+        let child = proc(&mut t, 20, "py", (4, 90), Some(py));
+        t.procs[child].comms.push((60, Arc::from("true")));
+        thread(&mut t, child, 20, vec![run(4, 60), run(60, 90)]);
+
+        let a = attribute(&t, py, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(lines, [(Class::Cpu, "py", 45), (Class::Child, "py", 55)]);
+    }
+
+    #[test]
+    fn time_outside_the_wakers_life_keeps_the_blocks_class() {
+        // The waker thread starts after the wait began and is followed only from its birth.
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 100), None);
+        thread(&mut t, app, 10, vec![futex(0, 100, (11, 10))]);
+        thread(&mut t, app, 11, vec![run(30, 100)]);
+
+        let a = attribute(&t, app, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(lines, [(Class::Cpu, "app", 70), (Class::Futex, "app", 30)]);
+    }
+
+    #[test]
+    fn timed_out_waits_retried_at_once_belong_to_the_wake_that_ends_them() {
+        // Two waits time out (no waker), each re-checked in 1 ns; the third is ended by the
+        // worker, which computed all along.
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 110), None);
+        let main = vec![
+            futex(0, 40, (0, 0)),
+            run(40, 41),
+            futex(41, 80, (0, 0)),
+            run(80, 81),
+            futex(81, 100, (11, 10)),
+            run(100, 110),
+        ];
+        thread(&mut t, app, 10, main);
+        thread(&mut t, app, 11, vec![run(0, 100)]);
+
+        let a = attribute(&t, app, 0, 110);
+        assert_eq!(tiled(&a, 0, 110), [(Class::Cpu, "app", 110)]);
+    }
+
+    #[test]
+    fn work_between_waits_ends_the_retry() {
+        // The first wait times out and the thread works for most of its length before
+        // waiting again: the first wait stays unexplained.
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 100), None);
+        let main = vec![futex(0, 40, (0, 0)), run(40, 70), futex(70, 100, (11, 10))];
+        thread(&mut t, app, 10, main);
+        let sleep = block(0, 100, Class::Sleep, Subject::Process, (0, 0));
+        thread(&mut t, app, 11, vec![sleep]);
+
+        let a = attribute(&t, app, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [
+                (Class::Cpu, "app", 30),
+                (Class::Sleep, "app", 30),
+                (Class::Futex, "app", 40),
+            ]
+        );
+    }
 
     /// Nanoseconds of the line `(class, subject)`.
     fn ns(attribution: &Attribution, class: Class, subject: &str) -> u64 {

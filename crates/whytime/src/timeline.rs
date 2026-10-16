@@ -2,9 +2,10 @@
 //!
 //! Every tracked thread's life is a gap-free sequence of [`Seg`]ments: mixed on-CPU/preempted
 //! stretches (accumulated in kernel), blocks (classified on arrival), and wake-to-run runqueue
-//! waits. Processes own threads and know their parent, so the critical-path walk in
-//! [`crate::attribute`] can descend from the wrapped command into its descendants. Attach
-//! mode starts the trace from [`ProcSeed`]s, what `/proc` showed of the running tree.
+//! waits. Processes own threads and know their parent, and blocks know the task that ended
+//! them, so the critical-path walk in [`crate::attribute`] can follow the wrapped command into
+//! the threads and descendants it waited on. Attach mode starts the trace from
+//! [`ProcSeed`]s, what `/proc` showed of the running tree.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -59,6 +60,8 @@ pub enum SegKind {
 pub struct Block {
     /// What it waited for.
     pub what: Blocked,
+    /// Thread id of the task that ended the block; 0 when unknown.
+    pub waker_tid: u32,
     /// Thread-group id of the task that ended the block; 0 when unknown.
     pub waker_tgid: u32,
 }
@@ -328,7 +331,7 @@ impl Trace {
         };
         self.push_mixed(thread, &r.seg, block_ts);
         let what = self.classifier.classify(hdr.tgid, &r.sys, r.block_state);
-        self.push_block(thread, block_ts, wake_ts, what, r.waker_tgid);
+        self.push_block(thread, block_ts, wake_ts, what, r.waker_tid, r.waker_tgid);
         self.push(thread, wake_ts, run_ts, SegKind::Runq);
     }
 
@@ -385,7 +388,8 @@ impl Trace {
                     } else {
                         end
                     };
-                    self.push_block(thread, state.block_ts, wake, what, state.waker_tgid);
+                    let (tid, tgid) = (state.waker_tid, state.waker_tgid);
+                    self.push_block(thread, state.block_ts, wake, what, tid, tgid);
                     self.push(thread, wake, end, SegKind::Runq);
                 }
                 _ => {}
@@ -453,15 +457,21 @@ impl Trace {
         );
     }
 
+    /// Appends a block that the task `waker_tid` of `waker_tgid` ended.
     fn push_block(
         &mut self,
         thread: ThreadId,
         start: u64,
         end: u64,
         what: Blocked,
+        waker_tid: u32,
         waker_tgid: u32,
     ) {
-        let block = Block { what, waker_tgid };
+        let block = Block {
+            what,
+            waker_tid,
+            waker_tgid,
+        };
         self.push(thread, start, end, SegKind::Blocked(Box::new(block)));
     }
 

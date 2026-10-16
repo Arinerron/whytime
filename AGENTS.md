@@ -64,14 +64,14 @@ crates/whytime/            the binary
   src/timeline.rs          records → per-thread segments, procctx table, final sweep
   src/classify.rs          (syscall, fd type, socket) → class + subject; FdTarget: /proc path lookup
   src/sys.rs               syscall table (libc numbers) → kind + BPF sys_flags bits
-  src/attribute.rs         critical-path walk → lines that partition the window
+  src/attribute.rs         critical-path walk (follows wakers) → spans that partition the window
   src/report.rs            whytime.report/1 JSON + human rendering
   src/record.rs            trace files: Recorder (--record), format, parse + replay
   src/testkit.rs           #[cfg(test)] synthetic records and traces for unit tests
   src/doctor.rs            bpfdoctor Tool, probe.sched / probe.syscalls checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
 crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp,
-                           wt-attach
+                           wt-attach, wt-threads, wt-vfork
 xtask/                     cargo xtask test-e2e
 ```
 
@@ -230,14 +230,18 @@ so a CPU-bound task emits nothing until it blocks or exits.
 
 The window is `[exec of COMMAND, exit of COMMAND's last thread)` (attach mode: `[end of
 seeding, exit of the target's last thread / deadline / signal)`); `wall_ns` is its length.
-Every nanosecond is assigned to exactly one `(class, subject)` line, so shares sum to 1
-(the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rounding). The walk
-(`attribute.rs`):
+The walk (`attribute.rs`) cuts it into **spans** (`Attribution.spans`: `start, end, class,
+subject, proc, thread, depth`), time-ordered and gap-free; report lines are the spans summed
+by `(class, subject)`, so every nanosecond is in exactly one line and shares sum to 1 (the
+e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rounding). `critical` in JSON
+is "some span came from this process". The walk:
 
 - Follows COMMAND's **main thread**: the original leader while it lives, then whichever
   live thread outlives the rest (covers `pthread_exit` from main and multithreaded exec).
 - Mixed segments split proportionally into on-CPU and `runqueue` (preempted, or woken and
-  not yet running). On-CPU of COMMAND's own process is `cpu` ("on-CPU (comm)").
+  not yet running); in spans the on-CPU part comes first. On-CPU of COMMAND's own process
+  (any thread) is `cpu` ("on-CPU (comm)"); on-CPU of a descendant process is `child`
+  ("waiting on child: comm", subject = the descendant that was computing).
 - Blocked time goes to its class from the in-flight syscall and descriptor:
   `fsync` (fsync/fdatasync/sync_file_range/syncfs/msync and writes to `O_DSYNC`/`O_SYNC`
   files; subject = directory, `~`-abbreviated), `file` (other regular-file/blockdev I/O and
@@ -245,22 +249,43 @@ Every nanosecond is assigned to exactly one `(class, subject)` line, so shares s
   the socket's `daddr:dport`; distinct socket inodes = "connections"), `ipc` (pipes, FIFOs,
   unix sockets), `tty` (character devices), `futex`, `sleep` (nanosleep/clock_nanosleep),
   `poll` (poll/select/epoll), `signal`, `other` (unknown syscall, page faults/no syscall,
-  stopped, or `untraced` gaps from lost records).
-- **Descent**: a `wait4`/`waitid` block is explained by the child that ended it (the waker
-  if it is a child; else the child that exited last inside the block; else the youngest
-  child alive at its end). A pipe/unix-socket block woken by another tracked process is
-  explained by that process. The interval is walked recursively in that process; its
-  on-CPU time becomes `child` ("waiting on child: comm", subject = the descendant that was
-  computing), its blocks keep their own class (so `sh -c 'sleep 1'` reports `sleep`).
-  Parts of the interval outside the descendant's lifetime stay with the waiting class.
+  stopped, or `untraced` gaps from lost records) — unless the block is **followed**:
+- **Following**: a block explained by another tracked task is replaced by a walk of that
+  task over the same interval, recursively with the same rules (its blocks keep their own
+  class, so a lock held across a sleep is `sleep`, `sh -c 'sleep 1'` is `sleep`):
+  - `futex`, `ipc`, `poll` blocks whose waker (`Block.waker_tid`/`waker_tgid`) is a
+    tracked thread → that **thread** (any tracked process, including other threads of the
+    same one: joined workers, lock holders, pipe writers/readers, a child whose exit
+    signal ended a `pselect`);
+  - **retried waits**: a `futex`/`poll` block without a tracked waker (a timeout, usually)
+    takes the waker of the same thread's next block of that class if only `Mixed`/`Runq`
+    segments with less than 1/8 of the block's length on-CPU lie between (it re-checked
+    and waited again), chaining through further such blocks; memoized per segment.
+    Needed in practice: xz's main thread waits in 300 ms timed condvar waits, CPython's
+    GIL in 5 ms ones, so most of their waits end by timeout, not by the worker's wake;
+  - `wait4`/`waitid` → the child **process** that ended it (the waker if it is a child;
+    else the child that exited last inside the block; else the youngest child alive at its
+    end), along its main line;
+  - `clone`/`clone3`/`vfork` blocks woken by a child (`CLONE_VFORK`: `posix_spawn`, `vfork`)
+    → that child until its exec/exit; its pre-exec CPU is `child` with the parent's comm.
+  Waker 0 (unknown, or interrupt context, contract with the kernel side) is never
+  followed. Lookups take the latest task with that tid/tgid born by the wake, dead or alive
+  (exit-time wakeups may follow the exit record). Parts of the interval outside the
+  followed task's lifetime keep the waiting block's line (for waits: `child`, subject the
+  child). A task already on the walk stack (mutual waits, A↔B) and anything at
+  `MAX_DEPTH` (64) is not followed; the block keeps its own class.
 
 Honesty limits (state them when presenting results):
 
-- One critical path. Work that ran in parallel with the path (other threads of COMMAND,
-  sibling children not waited on at that moment) does not appear; `processes[].cpu_ns`
-  in JSON shows every process's total CPU.
-- Futex waits are not followed to the lock holder (unknown in MVP), so a lock held across a
-  sleep or I/O shows as `futex`. Same for `poll`/`epoll`: the readiness source is unknown.
+- One critical path. Work that ran in parallel with the path (threads or children other
+  than the one that ended a wait) does not appear; `processes[].cpu_ns` in JSON shows every
+  process's total CPU. Joining N parallel workers shows the one that finished the wait.
+- Following trusts the last waker: a futex is followed to the thread that woke it (the
+  releasing lock holder, the signalling producer), which is the critical path only if that
+  thread was what the waiter needed. A `poll`/`epoll` wait is followed only when a tracked
+  thread raised the wakeup; readiness from outside the tree (network, devices, daemons)
+  stays `poll`. Retried waits are joined without knowing the futex address, by timing
+  only; a timed wait whose chain ends without a tracked wake stays `futex`/`poll`.
 - Hidden dependencies outside the tree (a daemon, the X server, a remote service) are only
   visible as the resource COMMAND blocked on (`net`, `ipc`).
 - Network subjects are `ip:port`; DNS/hostname correlation is a later milestone (the report
@@ -268,8 +293,8 @@ Honesty limits (state them when presenting results):
 - `file`/`fsync` paths come from `/proc/<pid>/fd/<fd>` when the record is processed and are
   checked against the kernel's dev:ino; otherwise the subject is `dev M:m ino N`.
 - A wake that races the switch-out (seen before the block is recorded) is not observed;
-  that whole off-CPU gap counts as blocked (µs scale), and child descent falls back to the
-  exit-time heuristic.
+  that whole off-CPU gap counts as blocked (µs scale) with waker 0, so it is not followed
+  (child waits fall back to the exit-time heuristic).
 - Mixed segments split on-CPU vs. preempted proportionally when clipped to a sub-interval.
 - Attach mode does not see time before the attach. Each pre-existing thread's first
   interval is classified from `/proc` at attach (state letter, `/proc/TID/syscall`, fd
@@ -348,9 +373,11 @@ Rules that keep replay exact:
 fields (`exec`, `fork`, `episode`, `exit`, `task`, `seg`, `sys`), so fields appended to the
 ABI keep a neutral 0 and tests survive layout growth; `testkit::trace(pid)` is a `Trace` with
 no `/proc` access. Timeline, attribution and attach-seeding tests feed records like the ring
-buffer would and assert on segments and lines; `record.rs` tests round-trip a recorded run
-(wrap and attach) to the identical JSON report and reject damaged files. `snapshot.rs` tests
-read this process's own `/proc` (threads blocked on a socket and a pipe).
+buffer would and assert on segments and lines; follow-the-waker tests in `attribute.rs` push
+`Proc`/`Thread`/`Seg`s into such a trace directly and check that the spans tile the window.
+`record.rs` tests round-trip a recorded run (wrap and attach) to the identical JSON report and
+reject damaged files. `snapshot.rs` tests read this process's own `/proc` (threads blocked on
+a socket and a pipe).
 
 ## Privileges
 
@@ -407,14 +434,21 @@ Targets, to be measured (not yet benchmarked):
 3. `fsync`: `wt-fsync ~/.cache/whytime-e2e 200` (ext4; the suite refuses tmpfs) → top line
    `fsync`/`file` ≥ 0.5
 4. `child`: `wt-child 1000` (spawns `wt-burn`, waits) → `child` subject `wt-burn` ≥ 0.8
-5. `futex`: `wt-futex 800` → `futex` ≥ 0.5
+5. `lock-holder`: `wt-futex 500` (a thread sleeps holding a mutex the main thread waits
+   on) → `sleep` ≥ 0.8 (the futex is followed to the holder)
 6. `tcp-slow`: xtask runs a 127.0.0.1 server in its own process (outside the tree) that
    replies 300 ms after accept; `wt-tcp ADDR 3` → `net` subject = server `ip:port` ≥ 0.6
 7. `exit-code`: `sh -c 'exit 7'` → exit 7
 8. `nopriv`: the build output run as the user without caps → exit 125 and a `setcap` line
 9. `setcap`: copy to `~/.cache/whytime-e2e/bin`, `setcap cap_bpf,cap_perfmon+ep`, run
    unprivileged on `wt-sleep 300` → `sleep` ≥ 0.9
-10. `record-replay`: `--json --record F -- wt-child 300`, then unprivileged
+10. `threads-cpu`: `wt-threads 4 600` (main joins 4 spinning threads) → `cpu` subject
+    `wt-threads` ≥ 0.8
+11. `threads-timed`: `wt-threads 4 600 50` (main first waits on a condvar in 50 ms timed
+    waits, most of which time out) → `cpu` subject `wt-threads` ≥ 0.8 (retried waits)
+12. `vfork`: `wt-vfork 600` (`clone(CLONE_VM|CLONE_VFORK)` child spins 600 ms, then execs
+    `wt-sleep 0`) → `child` subject `wt-vfork` ≥ 0.8
+13. `record-replay`: `--json --record F -- wt-child 300`, then unprivileged
     `whytime report F --json` → JSON identical to the live report (every field), human
     replay exits 0, F belongs to the invoking user; F cut in half → exit 2, "truncated"
 
@@ -423,20 +457,21 @@ wait 0.3 s, `sudo -n whytime --json -p $!` with the scenario's flags, then print
 alive` if the target still runs (it must, unless it exited by itself), stop it, and exit
 with whytime's status (must be 0):
 
-11. `attach-blocked`: `wt-sleep 30000`, `--duration 1s` → `ended_by` duration, `sleep` ≥
+14. `attach-blocked`: `wt-sleep 30000`, `--duration 1s` → `ended_by` duration, `sleep` ≥
     0.9 (classified from `/proc` at attach), wall 1.0 s ± 10%, target alive
-12. `attach-running`: `wt-burn 30000`, `--duration 1s` → `cpu` ≥ 0.9, target alive
-13. `attach-threads`: `wt-futex 30000` (two threads), `--duration 1s` → `futex` ≥ 0.9
-14. `attach-exit`: `sh -c '"$0" 1200; exit 3' wt-sleep` (pre-existing child) → `ended_by`
+15. `attach-running`: `wt-burn 30000`, `--duration 1s` → `cpu` ≥ 0.9, target alive
+16. `attach-threads`: `wt-futex 30000` (two threads), `--duration 1s` → `futex` ≥ 0.9 (the
+    holder never releases in the window, so there is no waker to follow)
+17. `attach-exit`: `sh -c '"$0" 1200; exit 3' wt-sleep` (pre-existing child) → `ended_by`
     exit, `exit_code` 3, `wt-sleep` in `processes[]` with ppid = target, `sleep` ≥ 0.9
-15. `attach-spawn`: `wt-attach 1500 800` (sleeps, then forks `wt-burn 800` after the
+18. `attach-spawn`: `wt-attach 1500 800` (sleeps, then forks `wt-burn 800` after the
     attach) → `ended_by` exit, `wt-burn` in `processes[]`, `child` subject `wt-burn` ≥ 0.3
-16. `attach-interrupt`: `wt-sleep 30000`, `sudo -n pkill -INT -P <sudo pid>` after 1 s
+19. `attach-interrupt`: `wt-sleep 30000`, `sudo -n pkill -INT -P <sudo pid>` after 1 s
     (whytime inherits SIGINT ignored from the background job) → `ended_by` interrupt,
     `sleep` ≥ 0.9, target alive
-17. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
+20. `attach-nopid`: unprivileged `whytime -p 4194304` (above any `pid_max`) → exit 1, "no
     process"
-18. `attach-record`: `sh -c 'while :; do "$0" "$1" 20; done' wt-fsync DIR` (seeds, then
+21. `attach-record`: `sh -c 'while :; do "$0" "$1" 20; done' wt-fsync DIR` (seeds, then
     fork/exec/exit, fsync records and file lookups in the window), `--duration 1s --record
     F` → `ended_by` duration, target alive, `quality.events` > 0, then the `record-replay`
     checks: unprivileged `whytime report F --json` identical to the live report, human
