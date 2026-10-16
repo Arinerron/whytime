@@ -180,8 +180,9 @@ whytime completions SHELL                 shell completion script on stdout
 | `--record FILE` | run, attach | also save a trace file for `whytime report` |
 | `-p`, `--pid PID` | attach | observe PID and its descendants instead of running a command |
 
-`-h`/`--help` and `-V`/`--version` work everywhere. `WHYTIME_LOG=debug` prints debug logging,
-including the BPF verifier log when loading fails.
+`-h`/`--help` and `-V`/`--version` work everywhere. Options go before the command (an
+unknown one is an error); `--` is optional unless the command starts with `-`.
+`WHYTIME_LOG=debug` prints debug logging, including the BPF verifier log when loading fails.
 
 ### Wrap a command
 
@@ -201,6 +202,9 @@ status:
 | 126 / 127 | the command is not executable / not found |
 
 Ctrl-C goes to the command, as without whytime; whytime still reports when it exits.
+Signals that were ignored when whytime started (under `nohup`, or in a non-interactive
+shell's background job) stay ignored for the command, which also gets whytime's resource
+limits unchanged.
 
 ### Attach to a running process
 
@@ -390,9 +394,11 @@ A trace file holds the raw kernel records and every lookup the report used (in a
 also what whytime read from `/proc` at the attach), so `whytime report` reproduces the report
 byte for byte on any machine, without BPF and without the traced processes. Every report
 option works on replay; `--flamegraph`/`--folded` need a trace recorded with one of them
-(the stacks and their symbols are in the file). Under `sudo` the file belongs to you.
+(the stacks and their symbols are in the file). Under `sudo`, whytime creates this file and
+the other output files as you: it writes only where you could, and the files are yours.
 `whytime report` exits 0, or 2 if the file is truncated, damaged, recorded by an incompatible
-whytime version, or has no stacks for a requested flamegraph.
+whytime version, or has no stacks for a requested flamegraph, or if an output file or the
+report cannot be written.
 
 Trace files can contain command lines, paths and hostnames: read
 [SECURITY.md](SECURITY.md#trace-files-contain-sensitive-data) before sharing one.

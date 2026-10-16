@@ -32,6 +32,7 @@ mod timeline;
 mod tracer;
 
 use std::ffi::{CStr, CString, OsStr};
+use std::fs::File;
 use std::io::{self, Write as _};
 use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
@@ -47,10 +48,10 @@ use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget, ProcFd};
 use crate::cli::{Cli, OutputArgs, RunArgs, Sub};
-use crate::flame::Outputs;
+use crate::logger::stderr;
 use crate::record::{End, Header, Logged, Probes, Recorder};
 use crate::report::{EndedBy, Meta, Report};
-use crate::spawn::{Child, Credentials, StartError};
+use crate::spawn::{Child, Credentials, Disposition, StartError};
 use crate::stacks::{Collector, Symbols};
 use crate::sys::SyscallTable;
 use crate::timeline::{Trace, proc_table};
@@ -66,7 +67,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let code = match cli.sub {
         Some(Sub::Doctor { json }) => doctor::run(json).unwrap_or_else(|err| {
-            eprintln!("whytime: {err}");
+            stderr!("whytime: {err}");
             EXIT_SETUP
         }),
         Some(Sub::Report { file, output }) => replay(&file, &output),
@@ -77,7 +78,7 @@ fn main() -> ExitCode {
             match io::stdout().write_all(&script) {
                 Ok(()) => 0,
                 Err(err) => {
-                    eprintln!("whytime: writing completions: {err}");
+                    stderr!("whytime: writing completions: {err}");
                     1
                 }
             }
@@ -108,21 +109,25 @@ fn preflight(tool: &bpfdoctor::Tool) -> bool {
     let preflight = Doctor::preflight().run(&RealEnv, tool);
     if preflight.has_fail() {
         doctor::print(&preflight);
-        eprintln!("whytime: cannot trace on this system (details: whytime doctor)");
+        stderr!("whytime: cannot trace on this system (details: whytime doctor)");
         return false;
     }
     true
 }
 
 /// Reports a failure to start tracing, with the doctor checks it points at (by errno, or
-/// `probe.stacks` when stack capture is what failed); returns [`EXIT_SETUP`].
+/// `probe.stacks` when stack capture is what failed; none for an output file whytime could
+/// not create); returns [`EXIT_SETUP`].
 fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
     let ids = if err.downcast_ref::<StacksUnavailable>().is_some() {
         // The whole chain: the sysctl or errno that made it unavailable.
-        eprintln!("whytime: {err:#}");
+        stderr!("whytime: {err:#}");
         &["probe.stacks"][..]
+    } else if err.downcast_ref::<Creating>().is_some() {
+        stderr!("whytime: {err:#}");
+        &[][..]
     } else {
-        eprintln!("whytime: {}", doctor::describe(err));
+        stderr!("whytime: {}", doctor::describe(err));
         tracer::errno(err).map_or(&[][..], ids_for_errno)
     };
     if !ids.is_empty() {
@@ -146,6 +151,17 @@ struct StacksUnavailable;
 impl std::fmt::Display for StacksUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("stack capture for --flamegraph/--folded is unavailable")
+    }
+}
+
+/// Creating an output file (`--record`, `--perfetto`, ...) failed: a problem with its path,
+/// not with tracing.
+#[derive(Debug)]
+struct Creating(PathBuf);
+
+impl std::fmt::Display for Creating {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "creating {}", self.0.display())
     }
 }
 
@@ -205,8 +221,8 @@ struct Session {
     recorder: Option<Recorder>,
     /// Stack capture, when on.
     stacks: Option<Collector>,
-    /// `--flamegraph`/`--folded` files.
-    outputs: Outputs,
+    /// `--perfetto`, `--flamegraph` and `--folded` files.
+    outputs: OutputFiles,
 }
 
 /// The running COMMAND and the signals whytime forwards to it.
@@ -240,24 +256,25 @@ impl Session {
         let (mut tracer, probes) = load(&syscalls, args.output.stacks())?;
         let ticks_per_sec = ticks_per_sec()?;
         let recorder = recorder(args, creds.as_ref())?;
-        let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
+        let outputs = OutputFiles::create(&args.output, creds.as_ref())?;
         let stacks = tracer
             .take_stacks()
             .map(|maps| Collector::new(maps, monotonic_ns()));
 
-        let signals = take_signals().context("setting up signal handling")?;
-        let mut child = Child::spawn(&args.command, creds.as_ref()).context("forking")?;
+        let (signals, dispositions) = take_signals().context("setting up signal handling")?;
+        let mut child =
+            Child::spawn(&args.command, creds.as_ref(), &dispositions).context("forking")?;
         // Dropping `child` before release makes it exit 125 without running COMMAND.
         tracer.track(child.pid())?;
         let program = args.command[0].to_string_lossy().into_owned();
         match child.release() {
             Ok(()) => {}
             Err(StartError::Exec(err)) => {
-                eprintln!("whytime: {program}: {err}");
+                stderr!("whytime: {program}: {err}");
                 return Ok(Started::Failed(child.wait().unwrap_or(127)));
             }
             Err(StartError::Setup(err)) => {
-                eprintln!("whytime: dropping privileges to the invoking user: {err}");
+                stderr!("whytime: dropping privileges to the invoking user: {err}");
                 let _ = child.wait();
                 return Ok(Started::Failed(EXIT_SETUP));
             }
@@ -295,7 +312,7 @@ impl Session {
         let outcome = match self.observe(args.duration) {
             Ok(outcome) => outcome,
             Err(err) => {
-                eprintln!("whytime: tracing failed: {err:#}");
+                stderr!("whytime: tracing failed: {err:#}");
                 return self.command.wait_forwarding();
             }
         };
@@ -381,14 +398,13 @@ impl Session {
     }
 }
 
-/// With `--record FILE`, creates the trace file, owned by the invoking user under sudo.
-/// Called before anything is observed, so a bad path fails fast.
+/// With `--record FILE`, creates the trace file (as the invoking user under sudo, see
+/// [`create_file`]). Called before anything is observed, so a bad path fails fast.
 fn recorder(args: &RunArgs, creds: Option<&Credentials>) -> anyhow::Result<Option<Recorder>> {
     args.record
         .as_deref()
         .map(|path| {
-            Recorder::create(path, creds.map(|c| (c.uid, c.gid)))
-                .with_context(|| format!("creating the trace file {}", path.display()))
+            Recorder::create(path, creds).with_context(|| Creating(path.to_owned()))
         })
         .transpose()
 }
@@ -470,7 +486,7 @@ fn save(
         recorder.stacks(symbols);
     }
     if let Err(err) = recorder.finish(tasks, end) {
-        eprintln!("whytime: writing the trace file {}: {err}", path.display());
+        stderr!("whytime: writing the trace file {}: {err}", path.display());
     }
 }
 
@@ -495,19 +511,19 @@ fn meta(header: &Header, end: &End) -> Meta {
     }
 }
 
-/// Attributes the window `[exec, end)` and writes the report to stderr, plus the extras
-/// `output` asks for (the flamegraph files `flame`, from `symbols`). Returns whether every
-/// flamegraph file was written.
+/// Attributes the window `[exec, end)` and writes the report to stderr, plus the `files`
+/// `output` asks for (flamegraphs from `symbols`). Returns whether the report and every file
+/// were written.
 fn report(
     trace: &Trace,
     end: u64,
     meta: Meta,
     output: &OutputArgs,
-    flame: Outputs,
+    files: OutputFiles,
     symbols: Option<&Symbols>,
 ) -> bool {
     let mut err = io::stderr().lock();
-    let written = write_report(&mut err, trace, end, meta, output, flame, symbols);
+    let written = write_report(&mut err, trace, end, meta, output, files, symbols);
     match written.and_then(|written| err.flush().map(|()| written)) {
         Ok(written) => written,
         Err(e) => {
@@ -517,17 +533,16 @@ fn report(
     }
 }
 
-/// Attributes the window `[exec, end)`, writes the files `output` names (a failure is
-/// printed to `w` first: the report stays last; the flamegraph files `flame` are drawn
-/// from `symbols`) and the report, human or JSON, to `w`. Returns whether every
-/// flamegraph file was written.
+/// Attributes the window `[exec, end)`, writes `files` (a failure is printed to `w` first:
+/// the report stays last; flamegraphs are drawn from `symbols`) and the report, human or
+/// JSON, to `w`. Returns whether every file was written.
 fn write_report(
     w: &mut dyn io::Write,
     trace: &Trace,
     end: u64,
     meta: Meta,
     output: &OutputArgs,
-    flame: Outputs,
+    files: OutputFiles,
     symbols: Option<&Symbols>,
 ) -> io::Result<bool> {
     let (Some(root), Some(start)) = (trace.root, trace.window.start) else {
@@ -536,20 +551,21 @@ fn write_report(
             "whytime: the command's exec was not observed ({} records lost); no report",
             meta.dropped
         )?;
-        return Ok(flame.is_empty());
+        return Ok(files.is_empty());
     };
     let end = end.max(start);
     let attribution = attribute::attribute(trace, root, start, end);
-    if let Some(path) = &output.perfetto
-        && let Err(err) = create_owned(path, sudo_owner()).and_then(|file| {
-            let mut out = io::BufWriter::new(file);
-            perfetto::write(&mut out, trace, &attribution, (start, end))?;
-            out.flush()
-        })
-    {
-        writeln!(w, "whytime: writing the Perfetto trace {}: {err}", path.display())?;
+    let mut written = true;
+    if let Some((path, file)) = files.perfetto {
+        let mut out = io::BufWriter::new(file);
+        if let Err(err) = perfetto::write(&mut out, trace, &attribution, (start, end))
+            .and_then(|()| out.flush())
+        {
+            writeln!(w, "whytime: writing the Perfetto trace {}: {err}", path.display())?;
+            written = false;
+        }
     }
-    let written = flame.write(w, trace, &attribution, (start, end), &meta.command, symbols)?;
+    written &= files.flame.write(w, trace, &attribution, (start, end), &meta.command, symbols)?;
     let report = Report::new(trace, attribution, (start, end), meta, output.timeline);
     if output.json {
         report.render_json(w)?;
@@ -568,33 +584,31 @@ fn replay(path: &Path, output: &OutputArgs) -> i32 {
     let replay = match replayed {
         Ok(replay) => replay,
         Err(err) => {
-            eprintln!("whytime: {}: {err}", path.display());
+            stderr!("whytime: {}: {err}", path.display());
             return EXIT_REPLAY;
         }
     };
     let mut code = 0;
-    let mut flame = Outputs::default();
-    if output.stacks() {
-        if replay.symbols.is_none() {
-            eprintln!(
-                "whytime: {}: recorded without stack capture, so there is no flamegraph to \
-                 draw (record with --flamegraph or --folded)",
-                path.display()
-            );
-            code = EXIT_REPLAY;
-        } else {
-            match Outputs::create(output, None) {
-                Ok(outputs) => flame = outputs,
-                Err(err) => {
-                    eprintln!("whytime: {err:#}");
-                    code = EXIT_REPLAY;
-                }
-            }
-        }
+    let mut wanted = output.clone();
+    if output.stacks() && replay.symbols.is_none() {
+        stderr!(
+            "whytime: {}: recorded without stack capture, so there is no flamegraph to draw \
+             (record with --flamegraph or --folded)",
+            path.display()
+        );
+        code = EXIT_REPLAY;
+        (wanted.flamegraph, wanted.folded) = (None, None);
     }
+    let files = sudo_credentials()
+        .and_then(|creds| OutputFiles::create(&wanted, creds.as_ref()))
+        .unwrap_or_else(|err| {
+            stderr!("whytime: {err:#}");
+            code = EXIT_REPLAY;
+            OutputFiles::default()
+        });
     let meta = meta(&replay.header, &replay.end);
     let symbols = replay.symbols.as_ref();
-    if !report(&replay.trace, replay.end.end, meta, output, flame, symbols) {
+    if !report(&replay.trace, replay.end.end, meta, output, files, symbols) {
         code = EXIT_REPLAY;
     }
     code
@@ -646,7 +660,7 @@ impl Wrapped {
             }
         };
         wait().unwrap_or_else(|err| {
-            eprintln!("whytime: waiting for the command: {err}");
+            stderr!("whytime: waiting for the command: {err}");
             EXIT_SETUP
         })
     }
@@ -669,16 +683,31 @@ impl Wrapped {
 }
 
 /// Ignores SIGINT/SIGQUIT (the terminal delivers them to COMMAND, and whytime must survive
-/// to report) and routes SIGTERM/SIGHUP to a signalfd so they can be forwarded.
-fn take_signals() -> io::Result<OwnedFd> {
+/// to report) and routes SIGTERM/SIGHUP to a signalfd so they can be forwarded; one that
+/// whytime inherited ignored (`nohup`, a background job) stays ignored, by whytime and
+/// COMMAND alike. Returns the signalfd and the dispositions COMMAND gets back before exec:
+/// SIGINT/SIGQUIT as inherited, SIGPIPE default (Rust's runtime ignores it before `main`).
+fn take_signals() -> io::Result<(OwnedFd, [Disposition; 3])> {
     // SAFETY: plain signal-disposition and mask calls with valid pointers.
     unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        let inherited = |signal| match libc::signal(signal, libc::SIG_IGN) {
+            libc::SIG_IGN => libc::SIG_IGN,
+            _ => libc::SIG_DFL,
+        };
+        let dispositions = [
+            (libc::SIGINT, inherited(libc::SIGINT)),
+            (libc::SIGQUIT, inherited(libc::SIGQUIT)),
+            (libc::SIGPIPE, libc::SIG_DFL),
+        ];
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
-        libc::sigaddset(&raw mut set, libc::SIGTERM);
-        libc::sigaddset(&raw mut set, libc::SIGHUP);
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &raw mut action);
+            if action.sa_sigaction != libc::SIG_IGN {
+                libc::sigaddset(&raw mut set, signal);
+            }
+        }
         if libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut()) != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -686,7 +715,7 @@ fn take_signals() -> io::Result<OwnedFd> {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(OwnedFd::from_raw_fd(fd))
+        Ok((OwnedFd::from_raw_fd(fd), dispositions))
     }
 }
 
@@ -716,16 +745,52 @@ fn sudo_owner() -> Option<(libc::uid_t, libc::gid_t)> {
     (uid != 0).then_some((uid, gid))
 }
 
-/// Creates (truncates) an output file for the invoking user: a regular file is handed to
-/// `owner` (uid, gid), so files written under sudo belong to whoever ran sudo.
-fn create_owned(path: &Path, owner: Option<(u32, u32)>) -> io::Result<std::fs::File> {
-    let file = std::fs::File::create(path)?;
-    if let Some((uid, gid)) = owner
-        && file.metadata()?.is_file()
-    {
-        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+/// Creates (truncates) an output file. Under sudo, `user` (the invoking user) creates it
+/// ([`spawn::create_as`]): their permissions decide whether whytime may write there, never
+/// root's (no system file clobbered through a symlink or a typo), and a new file is theirs.
+fn create_file(path: &Path, user: Option<&Credentials>) -> io::Result<File> {
+    match user {
+        Some(user) => spawn::create_as(path, user),
+        None => File::create(path),
     }
-    Ok(file)
+}
+
+/// [`create_file`] for an output option: `None` when it is not given.
+fn create_output(
+    path: Option<&Path>,
+    user: Option<&Credentials>,
+) -> anyhow::Result<Option<(PathBuf, File)>> {
+    path.map(|path| {
+        create_file(path, user)
+            .map(|file| (path.to_owned(), file))
+            .with_context(|| Creating(path.to_owned()))
+    })
+    .transpose()
+}
+
+/// The files [`OutputArgs`] names: created before anything is observed, so a bad path fails
+/// fast, and written by [`write_report`] when the window ends.
+#[derive(Debug, Default)]
+struct OutputFiles {
+    /// `--perfetto`.
+    perfetto: Option<(PathBuf, File)>,
+    /// `--flamegraph` and `--folded`.
+    flame: flame::Outputs,
+}
+
+impl OutputFiles {
+    /// Creates (truncates) the files `output` names, as `user` under sudo.
+    fn create(output: &OutputArgs, user: Option<&Credentials>) -> anyhow::Result<Self> {
+        Ok(Self {
+            perfetto: create_output(output.perfetto.as_deref(), user)?,
+            flame: flame::Outputs::create(output, user)?,
+        })
+    }
+
+    /// Whether no file was asked for.
+    fn is_empty(&self) -> bool {
+        self.perfetto.is_none() && self.flame.is_empty()
+    }
 }
 
 fn group_list(user: &OsStr, gid: libc::gid_t) -> io::Result<Vec<libc::gid_t>> {

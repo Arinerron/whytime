@@ -1,6 +1,8 @@
 //! The report: JSON schema `whytime.report/1` and the human rendering.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 
@@ -368,7 +370,8 @@ impl Report {
 
     /// Writes the human breakdown: lines of at least [`MIN_SHOWN_SHARE`] (at most
     /// [`MAX_SHOWN_LINES`] of them, `other`-class lines included), then the rest folded into
-    /// one `other` line, then the timeline if there is one.
+    /// one `other` line, then the timeline if there is one. Subjects and notes go through
+    /// [`visible`].
     pub fn render_human(&self, w: &mut dyn Write) -> io::Result<()> {
         writeln!(w, "wall {}", format_duration(self.wall_ns))?;
         let Parallelism {
@@ -394,7 +397,7 @@ impl Report {
             shown += 1;
             let held_by = line.held_by.as_deref().unwrap_or_default();
             let label = line_label(line.class, &line.subject, line.ns, line.connections, held_by);
-            writeln!(w, "{:>5}  {label}", percent(line.share))?;
+            writeln!(w, "{:>5}  {}", percent(line.share), visible(&label))?;
         }
         if rest > 0 {
             #[allow(clippy::cast_precision_loss)]
@@ -412,7 +415,7 @@ impl Report {
             self.quality.dropped
         )?;
         for note in &self.notes {
-            writeln!(w, "note: {note}")?;
+            writeln!(w, "note: {}", visible(note))?;
         }
         Ok(())
     }
@@ -433,6 +436,24 @@ fn percent(share: f64) -> String {
     } else {
         format!("{:.0}%", share * 100.0)
     }
+}
+
+/// `text` with its control characters (ESC, newline, C1 controls, ...) written as `\xHH`:
+/// subjects carry comms, paths, arguments and peer names of the traced processes (or of a
+/// trace file from elsewhere), which must not reach the terminal as escape sequences.
+fn visible(text: &str) -> Cow<'_, str> {
+    if !text.contains(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// How the human report (and a flamegraph's root frames) names a line of `ns` nanoseconds
@@ -600,7 +621,7 @@ fn render_timeline(w: &mut dyn Write, slices: &[Slice], wall_ns: u64) -> io::Res
                 let name = line.class.name();
                 match line.subject.as_str() {
                     "" => format!("{name} {}", percent(share)),
-                    subject => format!("{name} {subject} {}", percent(share)),
+                    subject => format!("{name} {} {}", visible(subject), percent(share)),
                 }
             })
             .collect();
@@ -812,5 +833,29 @@ mod tests {
         assert_eq!(rows[3], "  0.00–0.10s  cpu make 100%");
         assert_eq!(rows[5], "  0.20–0.30s  cpu make 50% · child cc1 50%");
         assert_eq!(rows[12], "  0.90–1.00s  sleep make 100%");
+    }
+
+    #[test]
+    fn control_characters_in_subjects_and_notes_are_escaped() {
+        // An OSC title change in a comm, SGR in a directory name, a newline in a file name.
+        let ms = 1_000_000;
+        let mut report = report(&[
+            (Class::Sleep, "\x1b]0;PWN\x07", 600 * ms),
+            (Class::Fsync, "~/\x1b[31mdir", 300 * ms),
+            (Class::File, "a\nb\u{9b}c", 100 * ms),
+        ]);
+        let spans = [span(0, 1_000 * ms, Class::Cpu, "x\x1by")];
+        report.timeline = Some(super::slices(&spans, 0, 1_000 * ms));
+        report.notes.push("from \x1b[2J".to_owned());
+        let mut out = Vec::new();
+        report.render_human(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{text:?}");
+        assert_eq!(text.lines().count(), 2 + 3 + 11 + 1 + 1, "no line breaks from subjects");
+        assert!(text.contains("timer sleep (\\x1b]0;PWN\\x07)"));
+        assert!(text.contains("fsync on ~/\\x1b[31mdir"));
+        assert!(text.contains("file I/O on a\\x0ab\\x9bc"));
+        assert!(text.contains("cpu x\\x1by 100%"));
+        assert!(text.contains("note: from \\x1b[2J"));
     }
 }

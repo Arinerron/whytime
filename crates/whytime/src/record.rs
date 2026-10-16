@@ -68,6 +68,7 @@ use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget};
 use crate::report::{Attached, EndedBy};
+use crate::spawn::Credentials;
 use crate::stacks::{StackKey, Symbols, UserKey};
 use crate::sys::SyscallTable;
 use crate::timeline::{self, ProcSeed, Trace};
@@ -223,10 +224,10 @@ struct Sink {
 }
 
 impl Recorder {
-    /// Creates (truncates) `path` and writes the preamble. A regular file is handed to
-    /// `owner` (uid, gid), so a trace recorded under sudo belongs to the invoking user.
-    pub fn create(path: &Path, owner: Option<(u32, u32)>) -> io::Result<Self> {
-        let mut out = BufWriter::new(crate::create_owned(path, owner)?);
+    /// Creates (truncates) `path`, as `user` under sudo (see `main.rs::create_file`), and
+    /// writes the preamble.
+    pub fn create(path: &Path, user: Option<&Credentials>) -> io::Result<Self> {
+        let mut out = BufWriter::new(crate::create_file(path, user)?);
         out.write_all(&MAGIC)?;
         out.write_all(&VERSION.to_le_bytes())?;
         out.write_all(&0_u32.to_le_bytes())?;
@@ -1054,7 +1055,7 @@ mod tests {
 
         let mut json = Vec::new();
         let meta = crate::meta(&header, &end);
-        let none = crate::flame::Outputs::default();
+        let none = crate::OutputFiles::default();
         crate::write_report(&mut json, &trace, end.end, meta, &output(), none, None)
             .expect("rendering");
         let bytes = std::fs::read(&path).expect("reading the trace file back");
@@ -1079,7 +1080,7 @@ mod tests {
         let replay = replay(bytes).expect("replaying");
         let meta = crate::meta(&replay.header, &replay.end);
         let mut json = Vec::new();
-        let none = crate::flame::Outputs::default();
+        let none = crate::OutputFiles::default();
         crate::write_report(&mut json, &replay.trace, replay.end.end, meta, &output(), none, None)
             .expect("rendering");
         String::from_utf8(json).expect("UTF-8 JSON")

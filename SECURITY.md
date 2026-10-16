@@ -45,7 +45,9 @@ about the boundaries below are especially welcome.
 - **Under sudo**, whytime drops privileges before it runs COMMAND: the command runs with
   the invoking user's uid, gid and supplementary groups (from `SUDO_UID`, `SUDO_GID` and
   `SUDO_USER`), with `HOME`, `USER` and `LOGNAME` restored. If the drop fails, whytime exits
-  with status 125 instead of running the command.
+  with status 125 instead of running the command. Output files (`--record`, `--perfetto`,
+  `--flamegraph`, `--folded`) are opened by a child process running as the invoking user,
+  never by root, so whytime writes only where that user could.
 - **With file capabilities**, the capabilities apply to the whytime process only; the
   kernel drops them when it executes COMMAND (no ambient capabilities are set). Every user
   who can execute a whytime binary with file capabilities gets `CAP_BPF` and `CAP_PERFMON`
@@ -91,6 +93,6 @@ sensitive before attaching them to a public issue. They can contain:
   (function names and the names of the binaries and libraries they ran);
 - in attach mode, what whytime read from `/proc` when it attached.
 
-Under `sudo`, trace, Perfetto and flamegraph files are created by root and then handed to
-the invoking user. Review or redact what you share; a maintainer can usually work with a
+Under `sudo`, trace, Perfetto and flamegraph files are created by the invoking user and
+belong to them. Review or redact what you share; a maintainer can usually work with a
 trace of a minimal reproduction instead of a production workload.

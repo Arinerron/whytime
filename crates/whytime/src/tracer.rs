@@ -140,7 +140,6 @@ impl Tracer {
     /// attached; the optional sets report their own outcome. If anything about stack capture
     /// fails, the plain object is loaded instead and `stacks` says why.
     pub fn load(syscalls: &SyscallTable, stacks: bool) -> anyhow::Result<Loaded> {
-        raise_memlock();
         let btf = Btf::from_sys_fs().context("reading kernel BTF (/sys/kernel/btf/vmlinux)")?;
         log::debug!("wire abi {:#018x}", whytime_bpf::ABI_HASH);
         // 0 (unknown) leaves the waker of interrupt-context wakeups as the interrupted task.
@@ -536,26 +535,6 @@ fn insert_new<V: Pod>(
             Ok(false)
         }
         Err(err) => Err(err),
-    }
-}
-
-/// Raises the `RLIMIT_MEMLOCK` soft limit to the hard limit. Kernels before 5.11 charge BPF
-/// maps against it; later ones use memcg accounting and ignore it.
-fn raise_memlock() {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a valid rlimit for getrlimit/setrlimit to read and write.
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) == 0
-            && limit.rlim_cur < limit.rlim_max
-        {
-            limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_MEMLOCK, &raw const limit) != 0 {
-                log::debug!("raising RLIMIT_MEMLOCK: {}", io::Error::last_os_error());
-            }
-        }
     }
 }
 

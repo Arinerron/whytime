@@ -62,8 +62,7 @@ pub struct RunArgs {
     #[arg(
         value_name = "COMMAND",
         required_unless_present = "pid",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
+        trailing_var_arg = true
     )]
     pub command: Vec<OsString>,
 }
@@ -185,6 +184,20 @@ mod tests {
         let cli = Cli::try_parse_from(["whytime", "completions", "zsh"]).unwrap();
         assert!(matches!(cli.sub, Some(Sub::Completions { shell: Shell::Zsh })));
         assert!(Cli::try_parse_from(["whytime", "completions", "tcsh"]).is_err());
+    }
+
+    #[test]
+    fn misspelled_options_are_errors_and_dash_commands_need_the_separator() {
+        for argv in [
+            &["whytime", "--duraton", "5", "--", "true"][..],
+            &["whytime", "--recrod", "t.wt", "ls"],
+            &["whytime", "-weird", "a"],
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{argv:?}");
+        }
+        let cli = Cli::try_parse_from(["whytime", "--", "-weird", "a"]).unwrap();
+        assert_eq!(cli.run.command, ["-weird", "a"]);
     }
 
     #[test]
