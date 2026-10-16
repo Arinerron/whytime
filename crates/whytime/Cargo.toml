@@ -24,5 +24,9 @@ object.workspace = true
 rustc-demangle.workspace = true
 cpp_demangle.workspace = true
 
+[dev-dependencies]
+# `FixtureEnv` for the doctor check tests.
+bpfdoctor = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true

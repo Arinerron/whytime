@@ -365,12 +365,19 @@ impl Check for KallsymsCheck {
 
     fn run(&self, env: &dyn Env, tool: &Tool) -> Diagnostic {
         const TITLE: &str = "Kernel symbols (flamegraph kernel frames)";
-        let head = env.read_head(Path::new("/proc/kallsyms"), 64);
-        let address = head.as_ref().ok().and_then(|head| {
-            let text = String::from_utf8_lossy(head);
-            u64::from_str_radix(text.split_ascii_whitespace().next()?, 16).ok()
+        // Hidden addresses print as all zeros. Some visible ones are zero too: x86_64 kernels
+        // with zero-based per-CPU symbols (6.12, for one) list them first, from
+        // `fixed_percpu_data` at 0, so look for any nonzero address in the first lines.
+        let head = env.read_head(Path::new("/proc/kallsyms"), 4096);
+        let visible = head.as_ref().is_ok_and(|head| {
+            String::from_utf8_lossy(head).lines().any(|line| {
+                line.split_ascii_whitespace()
+                    .next()
+                    .and_then(|address| u64::from_str_radix(address, 16).ok())
+                    .is_some_and(|address| address != 0)
+            })
         });
-        if address.is_some_and(|address| address != 0) {
+        if visible {
             return Diagnostic::new(
                 self.id(),
                 TITLE,
@@ -397,5 +404,35 @@ impl Check for KallsymsCheck {
                 tool.setcap_command(&[Cap::Syslog], &tool.exe),
                 "file capabilities including cap_syslog",
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bpfdoctor::FixtureEnv;
+
+    use super::*;
+
+    fn kallsyms_status(head: &str) -> Status {
+        let env = FixtureEnv::new("/nonexistent").with_file("/proc/kallsyms", head);
+        KallsymsCheck.run(&env, &tool()).status
+    }
+
+    #[test]
+    fn kallsyms_visible_despite_zero_per_cpu_symbols_first() {
+        // x86_64 6.12 as root: per-CPU symbols from 0 come before the kernel text.
+        let head = "0000000000000000 A fixed_percpu_data\n\
+                    0000000000000000 A __per_cpu_start\n\
+                    0000000000001000 A cpu_debug_store\n\
+                    ffffffff81000000 T _stext\n";
+        assert_eq!(kallsyms_status(head), Status::Pass);
+    }
+
+    #[test]
+    fn kallsyms_all_zero_is_hidden() {
+        let head = "0000000000000000 A fixed_percpu_data\n\
+                    0000000000000000 A cpu_debug_store\n\
+                    0000000000000000 T _stext\n";
+        assert_eq!(kallsyms_status(head), Status::Warn);
     }
 }

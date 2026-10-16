@@ -913,7 +913,7 @@ memcg) plus:
 | `probe.readiness` | no | attaches `fentry/pollwake` and `fentry/ep_poll_callback`; WARN impact "poll/select/epoll waits are reported as poll"; fixes: BPF trampolines (x86-64 ≥ 5.5, arm64 ≥ 6.0) + BTF, or the verifier log; SKIP if the scheduler probe failed |
 | `probe.faults` | no | attaches `fexit` then `fentry` on `handle_mm_fault`; WARN impact "page-fault time is reported as other or as the interrupted syscall"; same fixes; SKIP if the scheduler probe failed |
 | `probe.stacks` | no | `kernel.perf_event_max_stack` ≥ 127, then loads the stack capture object (two stack maps, `on_switch` capture, `perf_event` sampler on every CPU); WARN impact "whytime refuses --flamegraph and --folded"; fixes: EPERM → caps/sudo, EINVAL → `sudo sysctl kernel.perf_event_max_stack=127`, else `CONFIG_PERF_EVENTS` + verifier log. With the flags, a failure is printed as this check and whytime exits 125 |
-| `kernel.kallsyms` | no | first `/proc/kallsyms` address non-zero; WARN impact "kernel frames collapse into one [kernel] frame"; fixes: sudo, or setcap with `cap_syslog` |
+| `kernel.kallsyms` | no | any non-zero address in the first 4 KiB of `/proc/kallsyms` (hidden ones are all zero; x86_64 6.12 lists per-CPU symbols from 0 first); WARN impact "kernel frames collapse into one [kernel] frame"; fixes: sudo, or setcap with `cap_syslog` |
 
 Wrap and attach mode run `Doctor::preflight()` first, and after a load failure re-run
 `ids_for_errno(errno)` and print the non-passing checks.
@@ -1115,7 +1115,7 @@ Flamegraph scenarios (files in `$WORK/flame`, cleared per run):
     stacks through `burn_cpu_here` = `cpu` line, through `sleep_here` = `sleep` line (± 5%
     of wall); SVG names `burn_cpu_here`; both files owned by the invoking user
 34. `flame-kernel`: `--folded -- wt-fsync DIR 50` → a kernel frame naming fsync
-    (`do_fsync_[k]`); skipped, saying so, if `/proc/kallsyms` hides addresses from root
+    (`do_fsync_[k]`); SKIP if `/proc/kallsyms` hides addresses from root (same test as doctor)
 35. `flame-replay`: `--record F --folded A --flamegraph S --perfetto P --timeline -- wt-flame
     300 200`, then unprivileged `report F --json --timeline --perfetto P' --folded B
     --flamegraph S'` → the JSON report (with its timeline), B, S' and P' equal the live ones

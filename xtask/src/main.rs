@@ -444,7 +444,9 @@ fn test_e2e() -> anyhow::Result<()> {
         ),
         (
             // The hog and the traced burner share one CPU; the burner naps every 5 ms, so
-            // its time is many scheduling stretches, each with its own CPU holder.
+            // its time is many scheduling stretches, each with its own CPU holder. The report
+            // is on stderr, where dash (/bin/sh on Debian and Ubuntu) would add "Terminated"
+            // for the killed hog.
             "held-by",
             {
                 let mut cmd = Command::new("sh");
@@ -454,7 +456,7 @@ fn test_e2e() -> anyhow::Result<()> {
                      taskset -c \"$cpu\" \"$1\" 5000 & h=$!\n\
                      sleep 0.3\n\
                      sudo -n \"$2\" --json -- taskset -c \"$cpu\" \"$3\" 1500 5; s=$?\n\
-                     kill \"$h\"; wait \"$h\"\n\
+                     kill \"$h\"; wait \"$h\" 2>/dev/null\n\
                      exit \"$s\"",
                     "sh",
                 ])
@@ -2038,17 +2040,21 @@ fn check_flame_flip(out: &Output, folded_path: &Path, need: Need) -> anyhow::Res
 }
 
 /// `--folded` on `wt-fsync`: some stack has a kernel frame (`_[k]`) naming fsync, unless the
-/// kernel hides its addresses even from root (then skipped, saying so).
+/// kernel hides its addresses even from root (then a [`Skip`]). Hidden addresses are all
+/// zeros; visible ones can start with zeros too (x86_64 per-CPU symbols from
+/// `fixed_percpu_data` at 0, as on 6.12), so any nonzero address in the head shows them.
 fn check_flame_kernel(out: &Output, folded_path: &Path) -> anyhow::Result<String> {
     exited(out, 0)?;
     report(out)?;
-    let head = run(Command::new("sudo").args(["-n", "head", "-n1", "/proc/kallsyms"]))?;
-    let address = String::from_utf8_lossy(&head.stdout)
-        .split_ascii_whitespace()
-        .next()
-        .and_then(|address| u64::from_str_radix(address, 16).ok());
-    if address.is_none_or(|address| address == 0) {
-        return Ok("skipped: /proc/kallsyms hides kernel addresses even from root".to_owned());
+    let head = run(Command::new("sudo").args(["-n", "head", "-c", "4096", "/proc/kallsyms"]))?;
+    let visible = String::from_utf8_lossy(&head.stdout).lines().any(|line| {
+        line.split_ascii_whitespace()
+            .next()
+            .and_then(|address| u64::from_str_radix(address, 16).ok())
+            .is_some_and(|address| address != 0)
+    });
+    if !visible {
+        return Err(Skip("/proc/kallsyms hides kernel addresses even from root".to_owned()).into());
     }
     let stacks = folded(folded_path)?;
     let kernel_fsync = |f: &str| f.ends_with("_[k]") && f.contains("fsync");
