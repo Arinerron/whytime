@@ -109,6 +109,11 @@ pub fn task_state(tgid: u32, now: u64, activity: &Activity) -> TaskState {
         _pad2: 0,
         pend_comm: [0; 16],
         waker_comm: [0; 16],
+        // Blocked before attach: no stack was captured.
+        user_stack: 0,
+        kernel_stack: 0,
+        stack_gen: 0,
+        _pad3: 0,
     }
 }
 

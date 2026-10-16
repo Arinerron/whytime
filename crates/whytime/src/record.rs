@@ -12,9 +12,12 @@
 //! lost resolver captures). Attach mode (`-p`) adds what it read from `/proc`
 //! before the window: the [`ProcSeed`]s it fed [`Trace::seed`], the window start, and how
 //! many blocked threads had an unreadable syscall. procctx needs nothing else: whytime only
-//! calls its event handlers and `get_key`, which never read `/proc`.
+//! calls its event handlers and `get_key`, which never read `/proc`. With stack capture
+//! (`--flamegraph`/`--folded`), the symbolized stacks the records refer to are recorded
+//! too ([`Symbols`]: the user stacks were read from the processes' memory maps and files,
+//! the kernel's from `/proc/kallsyms`), so a replay folds the identical flamegraph.
 //!
-//! # Format (version 4)
+//! # Format (version 5)
 //!
 //! Little-endian. A 24-byte preamble, then frames.
 //!
@@ -30,18 +33,24 @@
 //!
 //! | Kind | Frame | Payload |
 //! |---|---|---|
-//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 4 (syscalls, readiness, faults, dns), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
+//! | 1 | header: first, once | root pid `u32`, probes attached `u8` × 4 (syscalls, readiness, faults, dns), stack capture `u8` (0 off, 1 on), `AT_CLKTCK` `u64`, arch `bytes`, home `opt bytes`, argc `u32`, argc × arg `bytes`, attached `opt u64` (present in attach mode, where the root pid is the target: blocked threads whose syscall was unreadable) |
 //! | 2 | record | one ring buffer record, verbatim |
 //! | 3 | lookup | `/proc/<pid>/fd/<fd>`: dev `u32`, ino `u64`, found `u8`, then the link target (rest of the payload) |
 //! | 7 | mapping | `/proc/<pid>/maps`: dev `u32`, ino `u64`, found `u8`, then the mapped path (rest of the payload) |
 //! | 4 | task | tid `u32`, `task_state` (one entry of the final `tasks` sweep) |
 //! | 5 | end: last, once | window start `opt u64`, window end `u64`, ended by `u8` (0 exit, 1 duration, 2 interrupt), exit code `opt i32`, dropped `u64`, resolver captures lost `u64` |
 //! | 6 | seed: attach mode only, once, before any record | window start `u64`, count `u32`, then per process: pid `u32`, start `u64` (procctx key), ppid `u32`, seeded at `u64`, comm `bytes`, argv `bytes` (NUL-separated), thread count `u32`, threads × (tid `u32`, entry time `u64`) |
+//! | 8 | stack: with stack capture on, when the window ends, before the end frame; one per distinct symbolized stack | frame count `u32`, frames × name `bytes` (UTF-8, outermost first), key count `u32`, keys × (space `u8`: 0 user, then pid `u32`, start `u64` (procctx key), image `u32`; 1 kernel; then stack `u8`: 0 map, then generation `u32`, id `u32`; 1 copy, then tid `u32`, capture time `u64`) |
 //!
 //! Frames are written as the run goes; tasks and the end frame when the window ends, so a
 //! file without an end frame was cut short and is rejected. Bump [`VERSION`] when the
 //! framing or a payload changes. A different ABI hash means the record layouts changed: the
 //! frames still parse, but the records would be misread, so such files are rejected too.
+//!
+//! Versions: 1 the first format; 2 attach mode (seed frame 6, the header's `attached`, end
+//! reason 2); 3 the readiness and page-fault probe bytes and mapping frame 7; 4 the dns probe
+//! byte and the end frame's lost resolver captures; 5 the stack capture byte and stack
+//! frame 8.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -59,6 +68,7 @@ use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget};
 use crate::report::{Attached, EndedBy};
+use crate::stacks::{StackKey, Symbols, UserKey};
 use crate::sys::SyscallTable;
 use crate::timeline::{self, ProcSeed, Trace};
 
@@ -67,7 +77,7 @@ const MAGIC: [u8; 8] = *b"WHYTRACE";
 /// Preamble length (magic, version, zero, ABI hash): the header frame's offset.
 const PREAMBLE: usize = MAGIC.len() + 16;
 /// Format version written and read.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 /// Architecture whose syscall numbers this build classifies.
 const ARCH: &str = std::env::consts::ARCH;
 
@@ -78,6 +88,7 @@ const F_TASK: u32 = 4;
 const F_END: u32 = 5;
 const F_SEED: u32 = 6;
 const F_MAPPING: u32 = 7;
+const F_STACK: u32 = 8;
 
 /// Which optional program sets were attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +101,8 @@ pub struct Probes {
     pub faults: bool,
     /// The resolver capture (`sys_exit` copying resolver replies).
     pub dns: bool,
+    /// Stack capture (block-time stacks and the on-CPU sampler).
+    pub stacks: bool,
 }
 
 /// What the recording run knew when the window opened.
@@ -229,6 +242,7 @@ impl Recorder {
             .u8(u8::from(header.probes.readiness))
             .u8(u8::from(header.probes.faults))
             .u8(u8::from(header.probes.dns))
+            .u8(u8::from(header.probes.stacks))
             .u64(header.ticks_per_sec.get())
             .bytes(header.arch.as_bytes());
         match &header.home {
@@ -244,6 +258,39 @@ impl Recorder {
             .map(|attached| u64::try_from(attached.unreadable).unwrap_or(u64::MAX));
         p.opt(unreadable, Enc::u64);
         self.frame(F_HEADER, &[&p.0]);
+    }
+
+    /// Writes the symbolized stacks: one stack frame per distinct stack, with the keys of
+    /// every user and kernel stack that has its frames.
+    pub fn stacks(&self, symbols: &Symbols) {
+        let mut keys: Vec<Vec<(Option<&UserKey>, StackKey)>> =
+            vec![Vec::new(); symbols.stacks.len()];
+        let users = symbols.user.iter().map(|(key, &i)| (i, Some(key), key.stack));
+        let kernels = symbols.kernel.iter().map(|(&stack, &i)| (i, None, stack));
+        for (i, user, stack) in users.chain(kernels) {
+            if let Some(keys) = usize::try_from(i).ok().and_then(|i| keys.get_mut(i)) {
+                keys.push((user, stack));
+            }
+        }
+        for (frames, keys) in symbols.stacks.iter().zip(&keys) {
+            let mut p = Enc::default();
+            p.u32(u32::try_from(frames.len()).unwrap_or(u32::MAX));
+            for name in frames {
+                p.bytes(name.as_bytes());
+            }
+            p.u32(u32::try_from(keys.len()).unwrap_or(u32::MAX));
+            for &(user, stack) in keys {
+                match user {
+                    Some(key) => p.u8(0).u32(key.proc.pid).u64(key.proc.start).u32(key.image),
+                    None => p.u8(1),
+                };
+                match stack {
+                    StackKey::Map { generation, id } => p.u8(0).u32(generation).u32(id),
+                    StackKey::Inline { tid, at, .. } => p.u8(1).u32(tid).u64(at),
+                };
+            }
+            self.frame(F_STACK, &[&p.0]);
+        }
     }
 
     /// Writes attach mode's seeding: the arguments of [`Trace::seed`].
@@ -390,6 +437,8 @@ struct Recording<'a> {
     mappings: Answers,
     /// The final `tasks` sweep.
     tasks: Vec<(u32, TaskState)>,
+    /// Stack frames.
+    symbols: Symbols,
     /// End frame.
     end: End,
 }
@@ -403,6 +452,8 @@ pub struct Replay {
     pub header: Header,
     /// End frame.
     pub end: End,
+    /// The recorded stacks, when the run captured them.
+    pub symbols: Option<Symbols>,
 }
 
 /// Parses and checks a whole trace file.
@@ -435,6 +486,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
     let mut lookups = HashMap::new();
     let mut mappings = HashMap::new();
     let mut tasks = Vec::new();
+    let mut symbols = Symbols::default();
     while !file.bytes.is_empty() {
         let at = file.at;
         if end.is_some() {
@@ -469,6 +521,10 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
                 p.done()?;
                 tasks.push((tid, state));
             }
+            F_STACK if header.as_ref().is_some_and(|h| !h.probes.stacks) => {
+                return Err(malformed(at, "stack frame in a trace without stack capture"));
+            }
+            F_STACK => p.stack(&mut symbols)?,
             F_END => end = Some(p.end()?),
             _ => return Err(malformed(at, "unknown frame kind")),
         }
@@ -486,6 +542,7 @@ fn parse(bytes: &[u8]) -> Result<Recording<'_>, Error> {
         lookups,
         mappings,
         tasks,
+        symbols,
         end,
     })
 }
@@ -499,6 +556,7 @@ pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
         lookups,
         mappings,
         tasks,
+        symbols,
         end,
     } = parse(bytes)?;
     if header.arch != ARCH {
@@ -529,7 +587,13 @@ pub fn replay(bytes: &[u8]) -> Result<Replay, Error> {
             trace.window.start
         );
     }
-    Ok(Replay { trace, header, end })
+    let symbols = header.probes.stacks.then_some(symbols);
+    Ok(Replay {
+        trace,
+        header,
+        end,
+        symbols,
+    })
 }
 
 /// `bytes` copied to 8-byte aligned memory, as the ring buffer hands records out
@@ -673,6 +737,53 @@ impl<'a> Dec<'a> {
         }
     }
 
+    /// A stack frame's payload: one distinct stack and its keys, added to `symbols`.
+    fn stack(&mut self, symbols: &mut Symbols) -> Result<(), Error> {
+        // Not preallocated: counts are untrusted until every item has been read.
+        let mut frames = Vec::new();
+        for _ in 0..self.u32()? {
+            let name = String::from_utf8(self.blob()?.to_vec())
+                .map_err(|_| malformed(self.at, "frame name is not UTF-8"))?;
+            frames.push(name);
+        }
+        let mut keys = Vec::new();
+        for _ in 0..self.u32()? {
+            let user = match self.u8()? {
+                0 => Some((
+                    ProcKey {
+                        pid: self.u32()?,
+                        start: self.u64()?,
+                    },
+                    self.u32()?,
+                )),
+                1 => None,
+                _ => return Err(malformed(self.at - 1, "unknown stack space")),
+            };
+            let stack = match self.u8()? {
+                0 => StackKey::Map {
+                    generation: self.u32()?,
+                    id: self.u32()?,
+                },
+                1 => StackKey::Inline {
+                    tid: self.u32()?,
+                    at: self.u64()?,
+                    kernel: user.is_none(),
+                },
+                _ => return Err(malformed(self.at - 1, "unknown stack kind")),
+            };
+            keys.push((user, stack));
+        }
+        self.done()?;
+        let index = symbols.push(frames);
+        for (user, stack) in keys {
+            match user {
+                Some((proc, image)) => symbols.user.insert(UserKey { proc, image, stack }, index),
+                None => symbols.kernel.insert(stack, index),
+            };
+        }
+        Ok(())
+    }
+
     fn header(&mut self) -> Result<Header, Error> {
         let root_pid = self.u32()?;
         let probes = Probes {
@@ -680,6 +791,7 @@ impl<'a> Dec<'a> {
             readiness: self.flag()?,
             faults: self.flag()?,
             dns: self.flag()?,
+            stacks: self.flag()?,
         };
         let ticks_per_sec =
             NonZeroU64::new(self.u64()?).ok_or_else(|| malformed(self.at - 8, "zero AT_CLKTCK"))?;
@@ -778,11 +890,11 @@ fn malformed(at: usize, what: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use libc::{SYS_fsync, SYS_recvfrom};
-    use whytime_abi::{DNS_UDP, ST_RUNNING};
+    use whytime_abi::{DNS_UDP, ST_RUNNING, STACK_INLINE};
 
     use super::*;
     use crate::cli::OutputArgs;
-    use crate::testkit::{dns, episode, exec, seg, sys, task};
+    use crate::testkit::{dns, episode, exec, sample, seg, sys, task};
 
     const DEV: u32 = (8 << 20) | 1;
     const INO: u64 = 42;
@@ -802,8 +914,9 @@ mod tests {
     }
 
     /// Records a small run the way `whytime --record` does (with `attached`, the way
-    /// `whytime -p 100 --record` does); returns the live JSON report and the trace file.
-    fn record_run(name: &str, arch: &str, attached: bool) -> (String, Vec<u8>) {
+    /// `whytime -p 100 --record` does; else with stack capture, as with `--folded`); returns
+    /// the live JSON report, the live folded stacks (empty when attached) and the trace file.
+    fn record_run(name: &str, arch: &str, attached: bool) -> (String, String, Vec<u8>) {
         let path = std::env::temp_dir().join(format!(
             "whytime-record-test-{}-{name}.wt",
             std::process::id()
@@ -819,6 +932,7 @@ mod tests {
                 readiness: true,
                 faults: true,
                 dns: true,
+                stacks: !attached,
             },
             ticks_per_sec: NonZeroU64::new(100).expect("non-zero"),
             attached: attached.then_some(Attached {
@@ -830,24 +944,28 @@ mod tests {
         let files = Logged::new(OneFile, recorder.clone());
         let classifier = Classifier::new(SyscallTable::new(), header.home.clone(), Box::new(files));
         let mut trace = Trace::new(100, classifier, timeline::proc_table(header.ticks_per_sec));
-        let live = |trace: &mut Trace, bytes: &[u8]| crate::ingest(trace, Some(&recorder), bytes);
+        let live =
+            |trace: &mut Trace, bytes: &[u8]| crate::ingest(trace, Some(&recorder), None, bytes);
+        // Microseconds, the folded format's unit.
+        let us = |n: u64| n * 1_000;
         if attached {
             let seed = |pid, ppid, comm: &str, threads| ProcSeed {
                 key: ProcKey { pid, start: 500 },
                 ppid,
                 comm: comm.to_owned(),
                 argv: format!("{comm}\0--flag\0").into_bytes(),
-                birth: 900,
+                birth: us(900),
                 threads,
             };
             let seeds = [
-                seed(100, 1, "app", vec![(100, 910), (101, 920)]),
-                seed(200, 100, "helper", vec![(200, 930)]),
+                seed(100, 1, "app", vec![(100, us(910)), (101, us(920))]),
+                seed(200, 100, "helper", vec![(200, us(930))]),
             ];
-            recorder.seed(&seeds, 1_000);
-            trace.seed(&seeds, 1_000);
+            recorder.seed(&seeds, us(1_000));
+            trace.seed(&seeds, us(1_000));
         } else {
-            live(&mut trace, wire::as_bytes(&exec(1_000, 100, 100, "app", seg(1_000, 0, 0))));
+            let exec = exec(us(1_000), 100, 100, "app", seg(us(1_000), 0, 0));
+            live(&mut trace, wire::as_bytes(&exec));
         }
 
         let mut fsync = sys(SYS_fsync);
@@ -855,14 +973,21 @@ mod tests {
         fsync.mode = 0o100_000;
         fsync.dev = DEV;
         fsync.ino = INO;
-        let first = episode(100, 100, seg(1_000, 100, 0), fsync, [1_100, 1_900, 1_900]);
+        let times = |a, b, c| [us(a), us(b), us(c)];
+        let mut first = episode(100, 100, seg(us(1_000), us(100), 0), fsync, times(1_100, 1_900, 1_900));
+        // Blocked at user stack 0 and kernel stack 1 of generation 1; sampled on-CPU before,
+        // its user stack a copy (the map could not take it).
+        (first.user_stack, first.kernel_stack, first.stack_gen) = (1, 2, 1);
+        let copied = sample(us(1_050), 100, 100, [STACK_INLINE, -libc::EFAULT]);
+        live(&mut trace, wire::as_bytes(&copied));
         live(&mut trace, wire::as_bytes(&first));
         // Undecodable records are counted in the report, so they are recorded too.
         live(&mut trace, &[1, 2, 3]);
-        let second = episode(100, 100, seg(1_900, 100, 0), fsync, [2_000, 2_400, 2_500]);
+        let second = episode(100, 100, seg(us(1_900), us(100), 0), fsync, times(2_000, 2_400, 2_500));
         live(&mut trace, wire::as_bytes(&second));
         // A block inside a page fault on a mapped file: its path comes from the mappings.
-        let mut fault = episode(100, 100, seg(2_500, 100, 0), sys(SYS_fsync), [2_600, 2_800, 2_800]);
+        let mut fault =
+            episode(100, 100, seg(us(2_500), us(100), 0), sys(SYS_fsync), times(2_600, 2_800, 2_800));
         fault.flags = whytime_abi::EPF_FAULT;
         fault.fault.mode = 0o100_000;
         fault.fault.dev = DEV;
@@ -880,15 +1005,15 @@ mod tests {
         recv.port = 5432;
         recv.addr[..4].copy_from_slice(&[10, 0, 0, 9]);
         recv.ino = 78;
-        let net = episode(100, 100, seg(2_800, 0, 0), recv, [2_800, 2_900, 2_900]);
+        let net = episode(100, 100, seg(us(2_800), 0, 0), recv, times(2_800, 2_900, 2_900));
         live(&mut trace, wire::as_bytes(&net));
-        let mut running = task(100, ST_RUNNING, seg(2_900, 0, 0));
-        running.last_ts = 2_900;
+        let mut running = task(100, ST_RUNNING, seg(us(2_900), 0, 0));
+        running.last_ts = us(2_900);
         let tasks = [(100, running)];
-        trace.sweep(&tasks, 3_000);
+        trace.sweep(&tasks, us(3_000));
         let end = End {
             start: trace.window.start,
-            end: 3_000,
+            end: us(3_000),
             ended_by: if attached {
                 EndedBy::Interrupt
             } else {
@@ -898,14 +1023,47 @@ mod tests {
             dropped: 2,
             dns_lost: 0,
         };
+        // What symbolization made of the stacks (outermost first); a `;` in a name is kept
+        // apart from the separator.
+        let proc = ProcKey {
+            pid: 100,
+            start: 100,
+        };
+        let user = |stack| UserKey { proc, image: 0, stack };
+        let names = |frames: &[&str]| frames.iter().map(|&f| f.to_owned()).collect();
+        let mut symbols = Symbols::default();
+        let save = symbols.push(names(&["main", "save"]));
+        symbols.user.insert(user(StackKey::Map { generation: 1, id: 0 }), save);
+        // Another generation's id for the same frames shares their stack frame.
+        symbols.user.insert(user(StackKey::Map { generation: 4, id: 9 }), save);
+        let copy = StackKey::Inline { tid: 100, at: us(1_050), kernel: false };
+        let fast = symbols.push(names(&["main", "compute;fast"]));
+        symbols.user.insert(user(copy), fast);
+        let do_fsync = symbols.push(names(&["entry_SYSCALL_64", "do_fsync"]));
+        symbols.kernel.insert(StackKey::Map { generation: 1, id: 1 }, do_fsync);
+        let mut folded = Vec::new();
+        if !attached {
+            recorder.stacks(&symbols);
+            let (root, start) = (trace.root.expect("root"), trace.window.start.expect("start"));
+            let attribution = crate::attribute::attribute(&trace, root, start, end.end);
+            crate::flame::fold(&trace, &attribution, &symbols)
+                .write_folded(&mut folded)
+                .expect("folding");
+        }
         recorder.finish(&tasks, &end).expect("writing the trace file");
 
         let mut json = Vec::new();
         let meta = crate::meta(&header, &end);
-        crate::write_report(&mut json, &trace, end.end, meta, &output()).expect("rendering");
+        let none = crate::flame::Outputs::default();
+        crate::write_report(&mut json, &trace, end.end, meta, &output(), none, None)
+            .expect("rendering");
         let bytes = std::fs::read(&path).expect("reading the trace file back");
         std::fs::remove_file(&path).expect("removing the trace file");
-        (String::from_utf8(json).expect("UTF-8 JSON"), bytes)
+        (
+            String::from_utf8(json).expect("UTF-8 JSON"),
+            String::from_utf8(folded).expect("UTF-8 folded stacks"),
+            bytes,
+        )
     }
 
     /// `--json --timeline`.
@@ -921,7 +1079,8 @@ mod tests {
         let replay = replay(bytes).expect("replaying");
         let meta = crate::meta(&replay.header, &replay.end);
         let mut json = Vec::new();
-        crate::write_report(&mut json, &replay.trace, replay.end.end, meta, &output())
+        let none = crate::flame::Outputs::default();
+        crate::write_report(&mut json, &replay.trace, replay.end.end, meta, &output(), none, None)
             .expect("rendering");
         String::from_utf8(json).expect("UTF-8 JSON")
     }
@@ -934,7 +1093,7 @@ mod tests {
 
     #[test]
     fn a_recorded_run_replays_to_the_identical_report() {
-        let (live, bytes) = record_run("identical", ARCH, false);
+        let (live, _, bytes) = record_run("identical", ARCH, false);
         let replayed = replayed_json(&bytes);
         assert_eq!(replayed, live);
         // The path came from the recorded lookup and the recorded home, not this machine.
@@ -944,12 +1103,50 @@ mod tests {
         // The peer's name came from the recorded resolver answer.
         assert!(replayed.contains("\"subject\": \"db.internal:5432\""), "{replayed}");
         assert!(replayed.contains("\"addr\": \"10.0.0.9:5432\""), "{replayed}");
-        assert!(replayed.contains("\"events\": 7"), "{replayed}");
+        assert!(replayed.contains("\"events\": 8"), "{replayed}");
+    }
+
+    #[test]
+    fn recorded_stacks_replay_to_the_identical_flamegraph() {
+        let (_, live, bytes) = record_run("stacks", ARCH, false);
+        let replay = replay(&bytes).expect("replaying");
+        let symbols = replay.symbols.expect("recorded stacks");
+        // One stack frame per distinct stack: two user keys share `main;save`.
+        let mut at = PREAMBLE;
+        let mut stack_frames = 0;
+        while at < bytes.len() {
+            let kind = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+            stack_frames += usize::from(kind == F_STACK);
+            at = next_frame(&bytes, at);
+        }
+        assert_eq!((stack_frames, symbols.stacks.len(), symbols.user.len()), (3, 3, 3));
+        let (root, start) = (replay.trace.root.unwrap(), replay.trace.window.start.unwrap());
+        let attribution = crate::attribute::attribute(&replay.trace, root, start, replay.end.end);
+        let mut replayed = Vec::new();
+        crate::flame::fold(&replay.trace, &attribution, &symbols)
+            .write_folded(&mut replayed)
+            .expect("folding");
+        assert_eq!(String::from_utf8(replayed).unwrap(), live);
+        // The fsync block shows where it blocked, user then kernel frames; on-CPU time, the
+        // sampled stack (also standing for the later on-CPU stretches near it); the second
+        // fsync captured no stack.
+        let lines: Vec<&str> = live.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "blocked on network: db.internal:5432 (1 connection);app;[no stack] 100",
+                "fsync on ~/proj;app;[no stack] 400",
+                "fsync on ~/proj;app;main;save;entry_SYSCALL_64_[k];do_fsync_[k] 800",
+                "on-CPU (app);app;main;compute:fast 400",
+                "page faults on ~/maps;app;[no stack] 200",
+                "waiting for a CPU (app);app;[runqueue] 100",
+            ]
+        );
     }
 
     #[test]
     fn an_attached_run_replays_its_seeded_tree_to_the_identical_report() {
-        let (live, bytes) = record_run("attached", ARCH, true);
+        let (live, _, bytes) = record_run("attached", ARCH, true);
         let replayed = replayed_json(&bytes);
         assert_eq!(replayed, live);
         assert!(replayed.contains("\"attached_pid\": 100"), "{replayed}");
@@ -962,7 +1159,7 @@ mod tests {
 
     #[test]
     fn a_trace_from_another_record_layout_names_both_hashes() {
-        let (_, mut bytes) = record_run("abi", ARCH, false);
+        let (_, _, mut bytes) = record_run("abi", ARCH, false);
         bytes[16] ^= 0xff;
         let err = replay(&bytes).expect_err("an ABI mismatch");
         let Error::Abi { file, ours } = err else {
@@ -977,14 +1174,14 @@ mod tests {
 
     #[test]
     fn a_trace_from_another_architecture_is_refused() {
-        let (_, bytes) = record_run("arch", "riscv64", false);
+        let (_, _, bytes) = record_run("arch", "riscv64", false);
         assert!(matches!(replay(&bytes), Err(Error::Arch(arch)) if arch == "riscv64"));
     }
 
     #[test]
     fn cut_short_files_are_truncated_and_damaged_ones_malformed() {
-        let (_, bytes) = record_run("damaged", ARCH, false);
-        let (_, attached) = record_run("damaged-attached", ARCH, true);
+        let (_, _, bytes) = record_run("damaged", ARCH, false);
+        let (_, _, attached) = record_run("damaged-attached", ARCH, true);
         for bytes in [&bytes, &attached] {
             for len in 0..bytes.len() {
                 assert!(

@@ -35,6 +35,11 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Flamegraphs: ELF symbol tables of mapped files, symbol demangling (the SVG is drawn by
+# `svg.rs`, no dependency).
+object = { version = "0.39", default-features = false, features = ["read_core", "elf", "std"] }
+rustc-demangle = "0.1"
+cpp_demangle = "0.5"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -52,3 +57,9 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# e2e workloads (`cargo xtask test-e2e`): symbols kept so flamegraph checks find their
+# functions; xtask adds frame pointers through RUSTFLAGS in a separate target directory.
+[profile.e2e]
+inherits = "release"
+strip = "none"

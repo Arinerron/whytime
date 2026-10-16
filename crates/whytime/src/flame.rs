@@ -1,0 +1,534 @@
+//! Wall-clock flamegraphs of the critical path (`--flamegraph FILE`, `--folded FILE`).
+//!
+//! The attribution's spans tile the window, so folding every span into stacks makes the
+//! graph's total width the window: each attributed nanosecond is in exactly one stack. A
+//! stack is, outermost first: the report line (`on-CPU (xz)`, `fsync on ~/.cache`), the
+//! process's comm (and the thread's own name when it differs), then where that thread was:
+//!
+//! - on-CPU (a `cpu` or `child` span over a mixed segment): the span's time is split evenly
+//!   across the thread's samples in the stretch of the segment the span stands for (on-CPU
+//!   and preempted time interleave in a segment, so that stretch is the span's share of it);
+//!   with none there, the nearest sample of the thread within one sampling period carries it
+//!   all, else `[no sample]`;
+//! - blocked: the user, then kernel stack captured when the thread blocked (`[no stack]`
+//!   when none was: a thread blocked since before an attach);
+//! - waiting for a CPU: `[runqueue]`;
+//! - `other (untraced)`: nothing below the line.
+//!
+//! User frames come from [`Symbols`]; kernel frames get the `_[k]` suffix of the FlameGraph
+//! convention. A stack lost in kernel (neither the stack map nor the ring buffer had room) is
+//! `[stack lost]`. Folded output is Brendan Gregg's format (`frame;frame;... count`, one
+//! line per distinct stack, sorted) with counts in microseconds (rounded; stacks under
+//! 0.5 µs are left out), so the counts sum to the wall time; the SVG ([`svg`]) draws the same
+//! counts, root frames colored by class.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
+
+use anyhow::Context as _;
+use procctx::ProcKey;
+use whytime_abi::SAMPLE_HZ;
+
+use crate::attribute::{Attribution, Span};
+use crate::classify::Class;
+use crate::cli::OutputArgs;
+use crate::report::{format_duration, line_label};
+use crate::stacks::{StackKey, Symbols, UserKey};
+use crate::svg;
+use crate::timeline::{Sample, Seg, SegKind, StackIds, Thread, Trace};
+
+/// Farthest a sample may be from an on-CPU stretch that has none and still stand for it:
+/// one sampling period.
+const NEAREST_NS: u64 = 1_000_000_000 / SAMPLE_HZ as u64;
+
+/// The files `--flamegraph` and `--folded` name: created before the run, so a bad path fails
+/// fast (and under sudo they belong to the invoking user), written when the window ends.
+#[derive(Debug, Default)]
+pub struct Outputs {
+    svg: Option<(PathBuf, File)>,
+    folded: Option<(PathBuf, File)>,
+}
+
+impl Outputs {
+    /// Creates (truncates) the files `output` names, handing regular files to `owner`.
+    pub fn create(output: &OutputArgs, owner: Option<(u32, u32)>) -> anyhow::Result<Self> {
+        let create = |path: &Option<PathBuf>| {
+            path.as_ref()
+                .map(|path| {
+                    crate::create_owned(path, owner)
+                        .map(|file| (path.clone(), file))
+                        .with_context(|| format!("creating {}", path.display()))
+                })
+                .transpose()
+        };
+        Ok(Self {
+            svg: create(&output.flamegraph)?,
+            folded: create(&output.folded)?,
+        })
+    }
+
+    /// Whether no file was asked for.
+    pub fn is_empty(&self) -> bool {
+        self.svg.is_none() && self.folded.is_none()
+    }
+
+    /// Folds the attributed window `[start, end)` of `trace` (the stacks from `symbols`;
+    /// `None`: stack capture was unavailable) and writes the files, the SVG titled after
+    /// `command`. Problems are printed to `w`, before the report, which stays last. Returns
+    /// whether every file was written.
+    pub fn write(
+        self,
+        w: &mut dyn Write,
+        trace: &Trace,
+        attribution: &Attribution,
+        (start, end): (u64, u64),
+        command: &[String],
+        symbols: Option<&Symbols>,
+    ) -> io::Result<bool> {
+        if self.is_empty() {
+            return Ok(true);
+        }
+        let Some(symbols) = symbols else {
+            writeln!(w, "whytime: no flamegraph: stack capture was unavailable (see whytime doctor)")?;
+            return Ok(false);
+        };
+        let folded = fold(trace, attribution, symbols);
+        let mut written = true;
+        let mut write = |(path, file): (PathBuf, File),
+                         what: &dyn Fn(&mut dyn Write) -> io::Result<()>|
+         -> io::Result<()> {
+            if let Err(err) = what(&mut BufWriter::new(file)) {
+                writeln!(w, "whytime: writing {}: {err}", path.display())?;
+                written = false;
+            }
+            Ok(())
+        };
+        if let Some(folded_file) = self.folded {
+            write(folded_file, &|w| folded.write_folded(w))?;
+        }
+        if let Some(svg) = self.svg {
+            let title = format!("whytime: {}", command.join(" "));
+            let subtitle = format!(
+                "wall {}: the critical path, width = wall-clock time",
+                format_duration(end - start)
+            );
+            write(svg, &|w| folded.write_svg(w, &title, &subtitle))?;
+        }
+        Ok(written)
+    }
+}
+
+/// The critical path as weighted stacks.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Folded {
+    /// Nanoseconds per stack (frames joined by `;`, outermost first).
+    stacks: BTreeMap<String, u64>,
+    /// The class of each root frame (report line).
+    roots: BTreeMap<String, Class>,
+}
+
+/// Folds the attributed window of `trace` into stacks.
+pub fn fold(trace: &Trace, attribution: &Attribution, symbols: &Symbols) -> Folded {
+    // Root frames read like the report's lines.
+    let roots: HashMap<(Class, &str), String> = attribution
+        .lines
+        .iter()
+        .map(|line| {
+            let label =
+                line_label(line.class, &line.subject, line.ns, line.connections, &line.held_by);
+            ((line.class, line.subject.as_str()), frame(&label))
+        })
+        .collect();
+    let mut folder = Folder {
+        trace,
+        symbols,
+        leaves: HashMap::new(),
+        folded: Folded::default(),
+    };
+    for span in &attribution.spans {
+        let root = roots[&(span.class, span.subject.as_str())].clone();
+        folder.folded.roots.insert(root.clone(), span.class);
+        folder.span(span, root);
+    }
+    folder.folded
+}
+
+impl Folded {
+    /// The folded stacks with their rounded microseconds, sorted by stack; empty ones left
+    /// out.
+    fn counts(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.stacks.iter().filter_map(|(stack, ns)| {
+            let us = ns.saturating_add(500) / 1000;
+            (us > 0).then_some((stack.as_str(), us))
+        })
+    }
+
+    /// Writes the folded format.
+    pub fn write_folded(&self, w: &mut dyn Write) -> io::Result<()> {
+        for (stack, us) in self.counts() {
+            writeln!(w, "{stack} {us}")?;
+        }
+        w.flush()
+    }
+
+    /// Writes the SVG flamegraph of the folded counts, titled `title`, with `subtitle` under
+    /// it.
+    pub fn write_svg(&self, w: &mut dyn Write, title: &str, subtitle: &str) -> io::Result<()> {
+        let stacks: Vec<(String, u64)> = self
+            .counts()
+            .map(|(stack, us)| (stack.to_owned(), us))
+            .collect();
+        let root_colors = self
+            .roots
+            .iter()
+            .map(|(root, &class)| (root.clone(), class_color(class)))
+            .collect();
+        let chart = svg::Chart {
+            title,
+            subtitle,
+            stacks: &stacks,
+            root_colors: &root_colors,
+        };
+        svg::write(w, &chart)
+    }
+}
+
+/// Root frame colors: on-CPU warm, waiting for a CPU yellow, sleeping grey, storage blue,
+/// network green, waits on other tasks (locks, IPC, poll, signals, terminals) purple.
+fn class_color(class: Class) -> (u8, u8, u8) {
+    match class {
+        Class::Cpu | Class::Child => (229, 96, 48),
+        Class::Runqueue => (230, 196, 64),
+        Class::Sleep => (168, 168, 168),
+        Class::Fsync | Class::File | Class::Aio | Class::Fault => (86, 136, 220),
+        Class::Net => (64, 170, 96),
+        Class::Ipc | Class::Futex | Class::Lock | Class::Poll | Class::Signal | Class::Tty => {
+            (164, 112, 212)
+        }
+        Class::Other => (204, 204, 204),
+    }
+}
+
+/// A frame name safe in the folded format: `;` separates frames and a line holds one stack.
+fn frame(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            ';' => ':',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+struct Folder<'a> {
+    trace: &'a Trace,
+    symbols: &'a Symbols,
+    /// Rendered frames below the thread, by process, thread and stack references.
+    leaves: HashMap<(ProcKey, u32, StackIds), String>,
+    folded: Folded,
+}
+
+impl Folder<'_> {
+    /// Adds `span`, whose report line is the frame `root`.
+    fn span(&mut self, span: &Span, root: String) {
+        let len = span.end - span.start;
+        if span.class == Class::Other && span.subject == "untraced" {
+            self.add(&root, "", len);
+            return;
+        }
+        let trace = self.trace;
+        let thread = &trace.threads[span.thread];
+        let proc = &trace.procs[span.proc];
+        let comm = proc.comm_at(span.start);
+        let mut prefix = format!("{root};{}", frame(comm));
+        if let Some(name) = thread.name_at(span.start)
+            && name != comm
+        {
+            prefix.push(';');
+            prefix.push_str(&frame(name));
+        }
+        let mut cursor = span.start;
+        let first = thread.segs.partition_point(|seg| seg.end <= span.start);
+        for seg in &thread.segs[first..] {
+            if seg.start >= span.end {
+                break;
+            }
+            let (from, to) = (seg.start.max(span.start), seg.end.min(span.end));
+            if from >= to {
+                continue;
+            }
+            // Spans never cover time without a segment (that is `untraced`); kept whole.
+            self.add(&prefix, "", from - cursor);
+            match &seg.kind {
+                SegKind::Blocked(block) => {
+                    let leaf = self.leaf(proc.key, thread.tid, block.stacks);
+                    self.add(&prefix, &leaf, to - from);
+                }
+                SegKind::Mixed { run, rq, .. } if span.class != Class::Runqueue => {
+                    self.on_cpu(&prefix, proc.key, thread, seg, (from, to), (*run, *rq));
+                }
+                SegKind::Mixed { .. } | SegKind::Runq(_) => {
+                    self.add(&prefix, "[runqueue]", to - from);
+                }
+            }
+            cursor = to;
+        }
+        self.add(&prefix, "", span.end - cursor);
+    }
+
+    /// Adds on-CPU time `[from, to)` of `thread`'s mixed segment `seg` (`run`, `rq` its
+    /// on-CPU and preempted nanoseconds) under `prefix`.
+    fn on_cpu(
+        &mut self,
+        prefix: &str,
+        proc: ProcKey,
+        thread: &Thread,
+        seg: &Seg,
+        (from, to): (u64, u64),
+        (run, rq): (u64, u64),
+    ) {
+        let ns = to - from;
+        // The span took `run / (run + rq)` of a stretch of the segment starting at `from`.
+        let end = if run == 0 || rq == 0 {
+            to
+        } else {
+            let stretch = u128::from(ns) * u128::from(run + rq) / u128::from(run);
+            from.saturating_add(u64::try_from(stretch).unwrap_or(u64::MAX))
+                .min(seg.end)
+                .max(to)
+        };
+        let samples = &thread.samples;
+        let lo = samples.partition_point(|s| s.ts < from);
+        let hi = samples.partition_point(|s| s.ts < end);
+        if lo == hi {
+            let leaf = match nearest(samples, lo, from, end) {
+                Some(sample) => self.leaf(proc, thread.tid, sample.stacks),
+                None => "[no sample]".to_owned(),
+            };
+            self.add(prefix, &leaf, ns);
+            return;
+        }
+        let count = u64::try_from(hi - lo).unwrap_or(u64::MAX);
+        for (i, sample) in (0..).zip(&samples[lo..hi]) {
+            // Even shares; the remainder goes one nanosecond each to the first samples.
+            let share = ns / count + u64::from(i < ns % count);
+            let leaf = self.leaf(proc, thread.tid, sample.stacks);
+            self.add(prefix, &leaf, share);
+        }
+    }
+
+    /// The frames below thread `tid` for its stacks `ids` in process `proc`.
+    fn leaf(&mut self, proc: ProcKey, tid: u32, ids: StackIds) -> String {
+        if let Some(leaf) = self.leaves.get(&(proc, tid, ids)) {
+            return leaf.clone();
+        }
+        let mut frames: Vec<String> = Vec::new();
+        match ids.user {
+            0 if ids.kernel == 0 => frames.push("[no stack]".to_owned()),
+            0 => {}
+            user if user == -libc::EFAULT => {}
+            _ => match UserKey::of(proc, tid, ids).and_then(|key| self.symbols.user(&key)) {
+                Some(user) => frames.extend(user.iter().map(|name| frame(name))),
+                None => frames.push("[stack lost]".to_owned()),
+            },
+        }
+        match ids.kernel {
+            0 => {}
+            kernel if kernel == -libc::EFAULT => {}
+            _ => match StackKey::kernel(tid, ids).and_then(|key| self.symbols.kernel(&key)) {
+                Some(kernel) => frames.extend(kernel.iter().map(|name| frame(name) + "_[k]")),
+                None => frames.push("[stack lost]_[k]".to_owned()),
+            },
+        }
+        let leaf = frames.join(";");
+        self.leaves.insert((proc, tid, ids), leaf.clone());
+        leaf
+    }
+
+    /// Adds `ns` to the stack `prefix;leaf` (`prefix` alone when `leaf` is empty).
+    fn add(&mut self, prefix: &str, leaf: &str, ns: u64) {
+        if ns == 0 {
+            return;
+        }
+        let stack = if leaf.is_empty() {
+            prefix.to_owned()
+        } else {
+            format!("{prefix};{leaf}")
+        };
+        *self.folded.stacks.entry(stack).or_default() += ns;
+    }
+}
+
+/// The sample nearest to `[from, end)` (which holds none; `at` is where one would be
+/// inserted) within [`NEAREST_NS`].
+fn nearest(samples: &[Sample], at: usize, from: u64, end: u64) -> Option<Sample> {
+    let before = at
+        .checked_sub(1)
+        .map(|i| samples[i])
+        .map(|s| (from - s.ts, s));
+    let after = samples.get(at).map(|&s| (s.ts - end, s));
+    [before, after]
+        .into_iter()
+        .flatten()
+        .filter(|&(distance, _)| distance <= NEAREST_NS)
+        .min_by_key(|&(distance, _)| distance)
+        .map(|(_, sample)| sample)
+}
+
+#[cfg(test)]
+mod tests {
+    use libc::SYS_nanosleep;
+    use whytime_abi::STACK_INLINE;
+
+    use super::*;
+    use crate::attribute;
+    use crate::testkit::{episode, exec, exit, feed, sample, seg, sys, trace};
+
+    /// Process 100 as testkit's exec keys it (procctx start 100).
+    const PROC: ProcKey = ProcKey {
+        pid: 100,
+        start: 100,
+    };
+
+    /// Frames from names.
+    fn names(frames: &[&str]) -> Vec<String> {
+        frames.iter().map(|&f| f.to_owned()).collect()
+    }
+
+    /// Symbols for process 100: user stacks `(key, frames)`, kernel stacks `(key, frames)`.
+    fn symbols(user: &[(StackKey, &[&str])], kernel: &[(StackKey, &[&str])]) -> Symbols {
+        let mut symbols = Symbols::default();
+        for &(stack, frames) in user {
+            let index = symbols.push(names(frames));
+            symbols.user.insert(UserKey { proc: PROC, image: 0, stack }, index);
+        }
+        for &(stack, frames) in kernel {
+            let index = symbols.push(names(frames));
+            symbols.kernel.insert(stack, index);
+        }
+        symbols
+    }
+
+    /// Stack `id` of generation 0's map.
+    fn map(id: u32) -> StackKey {
+        StackKey::Map { generation: 0, id }
+    }
+
+    /// Folds `[0, end)` of `trace` (root process 100).
+    fn folded(trace: &Trace, end: u64, symbols: &Symbols) -> Vec<(String, u64)> {
+        let attribution = attribute::attribute(trace, trace.root.expect("root"), 0, end);
+        let folded = fold(trace, &attribution, symbols);
+        assert_eq!(folded.stacks.values().sum::<u64>(), end, "the stacks tile the window");
+        folded.stacks.into_iter().collect()
+    }
+
+    #[test]
+    fn on_cpu_time_is_split_across_the_samples_of_the_segment_it_stands_for() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(0, 100, 100, "app", seg(0, 0, 0)));
+        // On-CPU 600 and preempted 400 in [0, 1000): the on-CPU span is [0, 600), but the
+        // samples spread over the whole segment, all three on-CPU.
+        feed(&mut t, &sample(100, 100, 100, [1, 0]));
+        feed(&mut t, &sample(300, 100, 100, [1, 0]));
+        feed(&mut t, &sample(700, 100, 100, [2, 0]));
+        let mut nap = episode(100, 100, seg(0, 600, 400), sys(SYS_nanosleep), [1_000, 1_900, 2_000]);
+        (nap.user_stack, nap.kernel_stack) = (3, 4);
+        feed(&mut t, &nap);
+        // No sample in the last stretch: the nearest one (700) stands for it.
+        feed(&mut t, &exit(2_500, 100, 100, seg(2_000, 500, 0), 0, true));
+        let symbols = symbols(
+            &[
+                (map(0), &["main", "hot"]),
+                (map(1), &["main", "warm"]),
+                (map(2), &["main", "nap"]),
+            ],
+            &[(map(3), &["do_nanosleep"])],
+        );
+        assert_eq!(
+            folded(&t, 2_500, &symbols),
+            [
+                ("on-CPU (app);app;main;hot".to_owned(), 400),
+                ("on-CPU (app);app;main;warm".to_owned(), 200 + 500),
+                ("timer sleep (app);app;main;nap;do_nanosleep_[k]".to_owned(), 900),
+                ("waiting for a CPU (app);app;[runqueue]".to_owned(), 400 + 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_samples_lost_stacks_and_untraced_time_are_named() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(0, 100, 100, "app", seg(0, 0, 0)));
+        // The thread names itself "worker"; both its stacks were lost in kernel.
+        let mut lost = sample(100, 100, 100, [-libc::EEXIST, -libc::ENOMEM]);
+        lost.comm[..6].copy_from_slice(b"worker");
+        feed(&mut t, &lost);
+        let nap = episode(100, 100, seg(0, 1_000, 0), sys(SYS_nanosleep), [1_000, 10_000_000, 10_000_000]);
+        feed(&mut t, &nap);
+        // 10 ms on-CPU, farther than a sampling period from any sample.
+        feed(&mut t, &exit(20_000_000, 100, 100, seg(10_000_000, 10_000_000, 0), 0, true));
+        assert_eq!(
+            folded(&t, 20_000_500, &Symbols::default()),
+            [
+                ("on-CPU (app);app;worker;[no sample]".to_owned(), 10_000_000),
+                ("on-CPU (app);app;worker;[stack lost];[stack lost]_[k]".to_owned(), 1_000),
+                ("other (untraced)".to_owned(), 500),
+                ("timer sleep (app);app;worker;[no stack]".to_owned(), 9_999_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn stacks_are_found_by_generation_and_copies_by_thread_and_capture_time() {
+        let mut t = trace(100);
+        feed(&mut t, &exec(0, 100, 100, "app", seg(0, 0, 0)));
+        // Id 1 names different stacks in generations 0 and 1; the third sample's user stack
+        // is a copy, as is the kernel stack of the block that follows.
+        feed(&mut t, &sample(100, 100, 100, [2, 0]));
+        let mut later = sample(300, 100, 100, [2, 0]);
+        later.stack_gen = 1;
+        feed(&mut t, &later);
+        feed(&mut t, &sample(500, 100, 100, [STACK_INLINE, 0]));
+        let mut nap = episode(100, 100, seg(0, 600, 0), sys(SYS_nanosleep), [600, 1_000, 1_000]);
+        (nap.user_stack, nap.kernel_stack) = (-libc::EFAULT, STACK_INLINE);
+        feed(&mut t, &nap);
+        // A copy that never arrived is lost, like a stack the kernel could not store.
+        let mut gone = sample(1_100, 100, 100, [STACK_INLINE, 0]);
+        gone.stack_gen = 1;
+        feed(&mut t, &gone);
+        feed(&mut t, &exit(1_200, 100, 100, seg(1_000, 200, 0), 0, true));
+        let copy = |at, kernel| StackKey::Inline { tid: 100, at, kernel };
+        let symbols = symbols(
+            &[
+                (map(1), &["main", "old"]),
+                (StackKey::Map { generation: 1, id: 1 }, &["main", "new"]),
+                (copy(500, false), &["main", "copied"]),
+            ],
+            &[(copy(600, true), &["do_nanosleep"])],
+        );
+        assert_eq!(
+            folded(&t, 1_200, &symbols),
+            [
+                ("on-CPU (app);app;[stack lost]".to_owned(), 200),
+                ("on-CPU (app);app;main;copied".to_owned(), 200),
+                ("on-CPU (app);app;main;new".to_owned(), 200),
+                ("on-CPU (app);app;main;old".to_owned(), 200),
+                ("timer sleep (app);app;do_nanosleep_[k]".to_owned(), 400),
+            ]
+        );
+    }
+
+    #[test]
+    fn folded_counts_are_rounded_microseconds_without_empty_lines() {
+        let mut folded = Folded::default();
+        for (stack, ns) in [("a;b", 1_499), ("a;c", 1_500), ("a;d", 499)] {
+            folded.stacks.insert(stack.to_owned(), ns);
+        }
+        let mut out = Vec::new();
+        folded.write_folded(&mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a;b 1\na;c 2\n");
+        assert_eq!(frame("f;g\nh"), "f:g h");
+    }
+}

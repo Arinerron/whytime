@@ -42,6 +42,8 @@ $ whytime --record ci.wt -- make   # also save a trace file...
 $ whytime report ci.wt [--json]    # ...and print the same report from it later, offline
 $ whytime --timeline -- make       # add the window in 10 slices, each with its top lines
 $ whytime --perfetto t.json -- make    # also write every thread's timeline for ui.perfetto.dev
+$ whytime --flamegraph out.svg -- make    # wall-clock flamegraph of the critical path
+$ whytime --folded out.folded -p 4242     # same stacks, folded format (µs), for other tools
 ```
 
 `--json`, `--timeline` and `--perfetto FILE` work alike in wrap mode, with `-p PID` and with
@@ -111,6 +113,16 @@ Event file (open it in [ui.perfetto.dev](https://ui.perfetto.dev) or chrome://tr
 track per traced thread with its on-CPU, runqueue and blocked stretches (named by class and
 subject; syscall, waker and CPU holder in the arguments), fork/exec/exit markers, and a
 `critical path` track with the stretches the report adds up.
+
+## Flamegraphs
+
+`--flamegraph FILE` (SVG) and `--folded FILE` draw the critical path with call stacks: the
+width is the wall time, the root frames are the report lines (`on-CPU (xz)`, `fsync on
+~/.cache`), then the process, then user frames and kernel frames (`_[k]`). On-CPU time comes
+from a 199 Hz sampler, blocked time from the stack where the thread blocked. They also work
+with `-p` and with `whytime report` on a trace recorded with either flag. User stacks
+unwind by frame pointers; stripped binaries show only exported symbols (`[libfoo.so]`
+otherwise); kernel frames need root (or `cap_syslog`). See [AGENTS.md](AGENTS.md#flamegraphs---flamegraph-file---folded-file).
 
 ## Attaching to a running process
 
@@ -195,10 +207,12 @@ MIT, see [LICENSE](LICENSE). The BPF object declares `Dual MIT/GPL` at load time
 kernel only grants GPL-only helpers to programs with a GPL-compatible license string (MIT
 code may be distributed under the GPL). The vendored libbpf headers in
 `crates/whytime-bpf/bpf/include/bpf/` keep their own license, `LGPL-2.1 OR BSD-2-Clause`.
+The SVG flamegraph is drawn by whytime itself (`svg.rs`); every Rust dependency is MIT,
+Apache-2.0, Zlib or Unicode-3.0 licensed (or dual-licensed with one of them).
 
 ## Status: MVP
 
 Wrap and attach mode with off-CPU/on-CPU attribution across the process tree, hostnames for
 network peers, trace files for both (`--record`, `whytime report`), timeline and Perfetto
-export. Not yet: flamegraphs. The attribution model, its limits, and the developer guide are
-in [AGENTS.md](AGENTS.md).
+export, and wall-clock flamegraphs. The attribution model, its limits, and the developer
+guide are in [AGENTS.md](AGENTS.md).

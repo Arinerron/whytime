@@ -392,7 +392,9 @@ impl Report {
                 continue;
             }
             shown += 1;
-            writeln!(w, "{:>5}  {}", percent(line.share), label(line))?;
+            let held_by = line.held_by.as_deref().unwrap_or_default();
+            let label = line_label(line.class, &line.subject, line.ns, line.connections, held_by);
+            writeln!(w, "{:>5}  {label}", percent(line.share))?;
         }
         if rest > 0 {
             #[allow(clippy::cast_precision_loss)]
@@ -433,8 +435,15 @@ fn percent(share: f64) -> String {
     }
 }
 
-fn label(line: &ReportLine) -> String {
-    let subject = line.subject.as_str();
+/// How the human report (and a flamegraph's root frames) names a line of `ns` nanoseconds
+/// (`connections` and `held_by` as in [`ReportLine`]).
+pub fn line_label(
+    class: Class,
+    subject: &str,
+    ns: u64,
+    connections: Option<usize>,
+    held_by: &[Held],
+) -> String {
     // Subjects naming a syscall ("in openat") read as a phrase, not a location.
     let at = |verb: &str| {
         if subject.starts_with("in ") {
@@ -443,14 +452,14 @@ fn label(line: &ReportLine) -> String {
             format!("{verb} on {subject}")
         }
     };
-    match line.class {
+    match class {
         Class::Cpu => format!("on-CPU ({subject})"),
         Class::Child => format!("waiting on child: {subject}"),
-        Class::Runqueue => match line.held_by.as_deref() {
+        Class::Runqueue => match held_by {
             // One holder took at least half of it.
-            Some([top, ..]) if top.ns.saturating_mul(2) >= line.ns => {
+            [top, ..] if top.ns.saturating_mul(2) >= ns => {
                 #[allow(clippy::cast_precision_loss)]
-                let share = top.ns as f64 / line.ns.max(1) as f64;
+                let share = top.ns as f64 / ns.max(1) as f64;
                 format!(
                     "waiting for a CPU ({subject}) — mostly {} {}",
                     top.comm,
@@ -463,7 +472,7 @@ fn label(line: &ReportLine) -> String {
         Class::Fsync => at("fsync"),
         Class::File => at("file I/O"),
         Class::Aio => format!("async I/O completion ({subject})"),
-        Class::Net => match line.connections {
+        Class::Net => match connections {
             Some(n) => format!(
                 "blocked on network: {subject} ({n} connection{})",
                 if n == 1 { "" } else { "s" }
@@ -483,7 +492,7 @@ fn label(line: &ReportLine) -> String {
 
 /// `41.2s`, `1.03s`, `512ms`, `830µs`.
 #[allow(clippy::cast_precision_loss)]
-fn format_duration(ns: u64) -> String {
+pub fn format_duration(ns: u64) -> String {
     let secs = ns as f64 / 1e9;
     if secs >= 100.0 {
         format!("{secs:.0}s")

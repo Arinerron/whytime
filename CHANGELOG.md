@@ -21,7 +21,8 @@ First release.
   attach until it exits, `--duration` elapses or Ctrl-C, without signalling it. The state
   of each pre-existing thread at attach time is read from `/proc`.
 - Trace files: `--record FILE` saves a run (wrap or attach mode), and `whytime report FILE`
-  replays it offline, without privileges, into the identical report.
+  replays it offline, without privileges, into the identical report, with any of the report
+  options below.
 - Follow-the-waker attribution: when the critical path waits on another thread or process
   (futexes, pipes and other IPC, poll, `wait` on a child, `vfork`), the time is explained by
   what that task was doing.
@@ -38,16 +39,17 @@ First release.
   traffic (DNS wire format over UDP and TCP on port 53, and systemd-resolved varlink as used
   by glibc's `getaddrinfo`); the numeric address stays available in the JSON report.
 - Runqueue time reports the process that held the CPU.
-- Flamegraphs of the critical path, as SVG and as folded stacks.
-- Export to the Chrome Trace Event format for Perfetto (`ui.perfetto.dev`) and
-  `chrome://tracing`, with every traced thread and the critical path.
-- A time-bucketed timeline of the report, and a parallelism summary.
+- Flamegraphs of the critical path: `--flamegraph FILE` (SVG) and `--folded FILE` (folded
+  stacks in microseconds), with on-CPU samples and the stacks where threads blocked.
+- `--perfetto FILE`: export to the Chrome Trace Event format for Perfetto
+  (`ui.perfetto.dev`) and `chrome://tracing`, with every traced thread and the critical path.
+- `--timeline`: a time-bucketed timeline of the report; a parallelism summary.
 - JSON output, `--json`, with schema `whytime.report/1`.
 - `whytime doctor`: checks whether whytime can run on this system and prints the exact fix
   for each problem.
 - Under `sudo`, COMMAND runs as the invoking user (uid, groups and `HOME`); alternatively,
   file capabilities (`setcap cap_bpf,cap_perfmon+ep`) let whytime run without `sudo`.
-- Shell completions (bash, zsh, fish, elvish, PowerShell) and man pages.
+- `whytime completions SHELL` (bash, zsh, fish, elvish, PowerShell) and man pages.
 - Static musl binaries for x86_64 and aarch64, published as release tarballs with
   completions and man pages.
 

@@ -30,9 +30,11 @@ use procctx::{ProcFs, ProcKey, ProcSource as _, StartClock, StatLine};
 
 use crate::classify::Classifier;
 use crate::cli::RunArgs;
+use crate::flame::Outputs;
 use crate::record::{self, Header, Recorder};
 use crate::report::{self, Attached, EndedBy};
 use crate::snapshot::{self, Snapshot};
+use crate::stacks::Collector;
 use crate::sys::SyscallTable;
 use crate::timeline::{ProcSeed, Trace, proc_table};
 use crate::tracer::Tracer;
@@ -242,6 +244,10 @@ struct Session {
     signals: OwnedFd,
     trace: Trace,
     recorder: Option<Recorder>,
+    /// Stack capture, when on.
+    stacks: Option<Collector>,
+    /// `--flamegraph`/`--folded` files.
+    outputs: Outputs,
 }
 
 /// How the observation ended.
@@ -261,9 +267,13 @@ impl Session {
         let creds = crate::sudo_credentials()?;
         let home = crate::home_dir(creds.as_ref().map(|creds| creds.uid));
         let syscalls = SyscallTable::new();
-        let (mut tracer, probes) = crate::load(&syscalls)?;
+        let (mut tracer, probes) = crate::load(&syscalls, args.output.stacks())?;
         let ticks_per_sec = crate::ticks_per_sec()?;
         let recorder = crate::recorder(args, creds.as_ref())?;
+        let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
+        let stacks = tracer
+            .take_stacks()
+            .map(|maps| Collector::new(maps, monotonic_ns()));
         // From here on, Ctrl-C ends the observation instead of killing whytime.
         let signals = take_signals().context("setting up signal handling")?;
 
@@ -305,6 +315,8 @@ impl Session {
             signals,
             trace,
             recorder,
+            stacks,
+            outputs,
         }))
     }
 
@@ -322,9 +334,11 @@ impl Session {
             header,
             mut trace,
             recorder,
+            mut stacks,
+            outputs,
             ..
         } = self;
-        let maps = crate::collect(tracer, &mut trace, recorder.as_ref());
+        let maps = crate::collect(tracer, &mut trace, recorder.as_ref(), stacks.as_mut());
         let (end, ended_by) = match (end, trace.window.exit) {
             // The target exited first; its record was still in flight.
             (End::Deadline(at) | End::Interrupt(at), Some(exit)) if exit <= at => {
@@ -336,6 +350,7 @@ impl Session {
         };
         let tasks = maps.tasks();
         trace.sweep(&tasks, end);
+        let symbols = crate::symbolize(stacks, &trace, &maps);
         let exit_code = trace
             .root
             .filter(|_| ended_by == EndedBy::Exit)
@@ -351,8 +366,9 @@ impl Session {
             dns_lost: maps.dns_lost(),
         };
         drop(maps);
-        crate::save(recorder.as_ref(), args, &tasks, &end);
-        crate::report(&trace, end.end, crate::meta(&header, &end), &args.output);
+        crate::save(recorder.as_ref(), args, &tasks, symbols.as_ref(), &end);
+        let meta = crate::meta(&header, &end);
+        crate::report(&trace, end.end, meta, &args.output, outputs, symbols.as_ref());
         0
     }
 
@@ -372,7 +388,10 @@ impl Session {
         loop {
             let trace = &mut self.trace;
             let recorder = self.recorder.as_ref();
-            self.tracer.drain(|record| crate::ingest(trace, recorder, record));
+            let stacks = &mut self.stacks;
+            self.tracer
+                .drain(|record| crate::ingest(trace, recorder, stacks.as_mut(), record));
+            crate::flip_stacks(&mut self.tracer, trace, recorder, stacks.as_mut());
             let now = monotonic_ns();
             if trace.window.exit.is_some() {
                 return Ok(End::Exit(now));
@@ -382,7 +401,10 @@ impl Session {
             {
                 return Ok(End::Deadline(deadline));
             }
-            for token in epoll.wait(crate::wait_timeout(deadline, now))? {
+            // Flips also come due while the ring is quiet (threads blocked across them).
+            let next_flip = stacks.as_ref().map(Collector::next_flip);
+            let wake = deadline.into_iter().chain(next_flip).min();
+            for token in epoll.wait(crate::wait_timeout(wake, now))? {
                 match token {
                     TARGET => return Ok(End::Exit(monotonic_ns())),
                     SIGNALS => return Ok(End::Interrupt(monotonic_ns())),

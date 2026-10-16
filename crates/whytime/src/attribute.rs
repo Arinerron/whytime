@@ -792,7 +792,7 @@ mod tests {
     use super::*;
     use crate::classify::Blocked;
     use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
-    use crate::timeline::{Image, Proc, Thread};
+    use crate::timeline::{Image, Proc, StackIds, Thread};
 
     /// A program `comm` with arguments `argv` (space-separated; none when empty), exec'd at
     /// `from`.
@@ -841,6 +841,8 @@ mod tests {
             birth: segs[0].start,
             death: segs.last().map(|s| s.end),
             segs,
+            samples: Vec::new(),
+            names: Vec::new(),
         });
         t.procs[proc].threads.push(id);
         id
@@ -872,6 +874,7 @@ mod tests {
             waker_tgid: waker.1,
             waker_comm: None,
             syscall: None,
+            stacks: StackIds::default(),
         };
         let kind = SegKind::Blocked(Box::new(block));
         Seg { start, end, kind }

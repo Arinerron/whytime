@@ -5,8 +5,9 @@
 //! exits (or `--duration` elapses). Attach mode (`-p PID`, [`attach`]) seeds the same state
 //! for a running process tree from `/proc` instead. The timelines are then attributed along
 //! the critical path and reported on stderr. In either mode `--record FILE` also saves every
-//! input of the report to a trace file, which `whytime report FILE` replays ([`record`]).
-//! See `AGENTS.md` for the model and its limits.
+//! input of the report to a trace file, which `whytime report FILE` replays ([`record`]), and
+//! `--flamegraph`/`--folded` turn on stack capture ([`stacks`]) and draw the critical path
+//! as a wall-clock flamegraph ([`flame`]). See `AGENTS.md` for the model and its limits.
 
 mod attach;
 mod attribute;
@@ -14,6 +15,7 @@ mod classify;
 mod cli;
 mod dns;
 mod doctor;
+mod flame;
 mod logger;
 mod percpu;
 mod perfetto;
@@ -21,6 +23,8 @@ mod record;
 mod report;
 mod snapshot;
 mod spawn;
+mod stacks;
+mod svg;
 mod sys;
 #[cfg(test)]
 mod testkit;
@@ -43,9 +47,11 @@ use whytime_abi::TaskState;
 
 use crate::classify::{Classifier, FdTarget, ProcFd};
 use crate::cli::{Cli, OutputArgs, RunArgs, Sub};
+use crate::flame::Outputs;
 use crate::record::{End, Header, Logged, Probes, Recorder};
 use crate::report::{EndedBy, Meta, Report};
 use crate::spawn::{Child, Credentials, StartError};
+use crate::stacks::{Collector, Symbols};
 use crate::sys::SyscallTable;
 use crate::timeline::{Trace, proc_table};
 use crate::tracer::Tracer;
@@ -108,11 +114,17 @@ fn preflight(tool: &bpfdoctor::Tool) -> bool {
     true
 }
 
-/// Reports a failure to start tracing, with the doctor checks its errno points at; returns
-/// [`EXIT_SETUP`].
+/// Reports a failure to start tracing, with the doctor checks it points at (by errno, or
+/// `probe.stacks` when stack capture is what failed); returns [`EXIT_SETUP`].
 fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
-    eprintln!("whytime: {}", doctor::describe(err));
-    let ids = tracer::errno(err).map_or(&[][..], ids_for_errno);
+    let ids = if err.downcast_ref::<StacksUnavailable>().is_some() {
+        // The whole chain: the sysctl or errno that made it unavailable.
+        eprintln!("whytime: {err:#}");
+        &["probe.stacks"][..]
+    } else {
+        eprintln!("whytime: {}", doctor::describe(err));
+        tracer::errno(err).map_or(&[][..], ids_for_errno)
+    };
     if !ids.is_empty() {
         let report = doctor::full().run_ids(&RealEnv, tool, ids);
         if report
@@ -126,10 +138,24 @@ fn start_failed(err: &anyhow::Error, tool: &bpfdoctor::Tool) -> i32 {
     EXIT_SETUP
 }
 
-/// Loads and attaches the programs; says which optional program sets are attached, warning
-/// about the others.
-fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, Probes)> {
-    let loaded = Tracer::load(syscalls)?;
+/// `--flamegraph`/`--folded` asked for stack capture and it cannot work: whytime stops before
+/// running anything rather than run without the flamegraph.
+#[derive(Debug)]
+struct StacksUnavailable;
+
+impl std::fmt::Display for StacksUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stack capture for --flamegraph/--folded is unavailable")
+    }
+}
+
+/// Loads and attaches the programs, with stack capture when `stacks` (which must then work);
+/// says which optional program sets are attached, warning about the others.
+fn load(syscalls: &SyscallTable, stacks: bool) -> anyhow::Result<(Tracer, Probes)> {
+    let loaded = Tracer::load(syscalls, stacks)?;
+    if let Some(Err(err)) = loaded.stacks {
+        return Err(err.context(StacksUnavailable));
+    }
     if let Err(err) = &loaded.syscalls {
         log::warn!("syscall tracepoints unavailable ({err:#}); blocked time will not be classified");
     }
@@ -155,6 +181,7 @@ fn load(syscalls: &SyscallTable) -> anyhow::Result<(Tracer, Probes)> {
         readiness: loaded.readiness.is_ok(),
         faults: loaded.faults.is_ok(),
         dns: loaded.dns.is_ok(),
+        stacks,
     };
     Ok((loaded.tracer, probes))
 }
@@ -176,6 +203,10 @@ struct Session {
     command: Wrapped,
     trace: Trace,
     recorder: Option<Recorder>,
+    /// Stack capture, when on.
+    stacks: Option<Collector>,
+    /// `--flamegraph`/`--folded` files.
+    outputs: Outputs,
 }
 
 /// The running COMMAND and the signals whytime forwards to it.
@@ -206,9 +237,13 @@ impl Session {
             restore_user_env(home.as_deref());
         }
         let syscalls = SyscallTable::new();
-        let (mut tracer, probes) = load(&syscalls)?;
+        let (mut tracer, probes) = load(&syscalls, args.output.stacks())?;
         let ticks_per_sec = ticks_per_sec()?;
         let recorder = recorder(args, creds.as_ref())?;
+        let outputs = Outputs::create(&args.output, creds.as_ref().map(|c| (c.uid, c.gid)))?;
+        let stacks = tracer
+            .take_stacks()
+            .map(|maps| Collector::new(maps, monotonic_ns()));
 
         let signals = take_signals().context("setting up signal handling")?;
         let mut child = Child::spawn(&args.command, creds.as_ref()).context("forking")?;
@@ -250,6 +285,8 @@ impl Session {
             command: Wrapped { child, signals },
             trace,
             recorder,
+            stacks,
+            outputs,
         })))
     }
 
@@ -278,10 +315,13 @@ impl Session {
             command,
             mut trace,
             recorder,
+            mut stacks,
+            outputs,
         } = self;
-        let maps = collect(tracer, &mut trace, recorder.as_ref());
+        let maps = collect(tracer, &mut trace, recorder.as_ref(), stacks.as_mut());
         let tasks = maps.tasks();
         trace.sweep(&tasks, end);
+        let symbols = symbolize(stacks, &trace, &maps);
         let end = End {
             start: trace.window.start,
             end,
@@ -291,9 +331,9 @@ impl Session {
             dns_lost: maps.dns_lost(),
         };
         drop(maps);
-        save(recorder.as_ref(), args, &tasks, &end);
-
-        report(&trace, end.end, meta(&header, &end), &args.output);
+        save(recorder.as_ref(), args, &tasks, symbols.as_ref(), &end);
+        let meta = meta(&header, &end);
+        report(&trace, end.end, meta, &args.output, outputs, symbols.as_ref());
         match outcome {
             Outcome::Exited(code) => code,
             Outcome::Deadline(_) => command.wait_forwarding(),
@@ -314,7 +354,10 @@ impl Session {
         loop {
             let trace = &mut self.trace;
             let recorder = self.recorder.as_ref();
-            self.tracer.drain(|record| ingest(trace, recorder, record));
+            let stacks = &mut self.stacks;
+            self.tracer
+                .drain(|record| ingest(trace, recorder, stacks.as_mut(), record));
+            flip_stacks(&mut self.tracer, trace, recorder, stacks.as_mut());
             let deadline = duration_ns
                 .zip(trace.window.start)
                 .map(|(d, start)| start.saturating_add(d));
@@ -324,7 +367,9 @@ impl Session {
             {
                 return Ok(Outcome::Deadline(deadline));
             }
-            let timeout = wait_timeout(deadline, now);
+            // Flips also come due while the ring is quiet (threads blocked across them).
+            let next_flip = stacks.as_ref().map(Collector::next_flip);
+            let timeout = wait_timeout(deadline.into_iter().chain(next_flip).min(), now);
             for token in epoll.wait(timeout)? {
                 match token {
                     CHILD => return self.command.child.wait().map(Outcome::Exited),
@@ -356,20 +401,75 @@ fn files(recorder: Option<&Recorder>) -> Box<dyn FdTarget> {
     }
 }
 
-/// Applies one ring buffer record, recording it first when `--record` is on.
-fn ingest(trace: &mut Trace, recorder: Option<&Recorder>, record: &[u8]) {
+/// Applies one ring buffer record, recording it first when `--record` is on, and following
+/// it with stack capture on.
+fn ingest(
+    trace: &mut Trace,
+    recorder: Option<&Recorder>,
+    stacks: Option<&mut Collector>,
+    record: &[u8],
+) {
     if let Some(recorder) = recorder {
         recorder.record(record);
     }
     trace.ingest(record);
+    if let Some(stacks) = stacks {
+        stacks.observe(trace, record);
+    }
 }
 
-/// With `--record`, writes the final sweep and the end frame. A write error is printed now,
-/// before the report, which must stay last on stderr.
-fn save(recorder: Option<&Recorder>, args: &RunArgs, tasks: &[(u32, TaskState)], end: &End) {
-    if let (Some(recorder), Some(path)) = (recorder, &args.record)
-        && let Err(err) = recorder.finish(tasks, end)
-    {
+/// With stack capture, flips the stack generation when one is due: the programs move to the
+/// other map, the old generation's stacks still referred to are read (blocked threads', and
+/// the records in flight, drained into `trace`), then the old map is emptied.
+fn flip_stacks(
+    tracer: &mut Tracer,
+    trace: &mut Trace,
+    recorder: Option<&Recorder>,
+    stacks: Option<&mut Collector>,
+) {
+    let Some(stacks) = stacks else {
+        return;
+    };
+    let now = monotonic_ns();
+    if !stacks.flip_due(now) || !stacks.advance(now) {
+        return;
+    }
+    stacks.keep(&tracer.tasks());
+    tracer.drain(|record| ingest(trace, recorder, Some(&mut *stacks), record));
+    stacks.retire(monotonic_ns());
+}
+
+/// With stack capture on, the symbolized stacks of the swept trace; warns about stacks the
+/// kernel lost.
+fn symbolize(stacks: Option<Collector>, trace: &Trace, maps: &tracer::Maps) -> Option<Symbols> {
+    let stacks = stacks?;
+    let lost = maps.lost_stacks();
+    if lost > 0 {
+        log::warn!(
+            "{lost} stacks lost: neither the stack map nor the ring buffer had room (shown as \
+             [stack lost])"
+        );
+    }
+    log::debug!("{} stacks copied into STACK records", maps.inline_stacks());
+    Some(stacks.finish(trace))
+}
+
+/// With `--record`, writes the stacks, the final sweep and the end frame. A write error is
+/// printed now, before the report, which must stay last on stderr.
+fn save(
+    recorder: Option<&Recorder>,
+    args: &RunArgs,
+    tasks: &[(u32, TaskState)],
+    symbols: Option<&Symbols>,
+    end: &End,
+) {
+    let (Some(recorder), Some(path)) = (recorder, &args.record) else {
+        return;
+    };
+    if let Some(symbols) = symbols {
+        recorder.stacks(symbols);
+    }
+    if let Err(err) = recorder.finish(tasks, end) {
         eprintln!("whytime: writing the trace file {}: {err}", path.display());
     }
 }
@@ -396,29 +496,47 @@ fn meta(header: &Header, end: &End) -> Meta {
 }
 
 /// Attributes the window `[exec, end)` and writes the report to stderr, plus the extras
-/// `output` asks for.
-fn report(trace: &Trace, end: u64, meta: Meta, output: &OutputArgs) {
+/// `output` asks for (the flamegraph files `flame`, from `symbols`). Returns whether every
+/// flamegraph file was written.
+fn report(
+    trace: &Trace,
+    end: u64,
+    meta: Meta,
+    output: &OutputArgs,
+    flame: Outputs,
+    symbols: Option<&Symbols>,
+) -> bool {
     let mut err = io::stderr().lock();
-    if let Err(e) = write_report(&mut err, trace, end, meta, output).and_then(|()| err.flush()) {
-        log::error!("writing the report: {e}");
+    let written = write_report(&mut err, trace, end, meta, output, flame, symbols);
+    match written.and_then(|written| err.flush().map(|()| written)) {
+        Ok(written) => written,
+        Err(e) => {
+            log::error!("writing the report: {e}");
+            false
+        }
     }
 }
 
 /// Attributes the window `[exec, end)`, writes the files `output` names (a failure is
-/// printed to `w` first: the report stays last) and the report, human or JSON, to `w`.
+/// printed to `w` first: the report stays last; the flamegraph files `flame` are drawn
+/// from `symbols`) and the report, human or JSON, to `w`. Returns whether every
+/// flamegraph file was written.
 fn write_report(
     w: &mut dyn io::Write,
     trace: &Trace,
     end: u64,
     meta: Meta,
     output: &OutputArgs,
-) -> io::Result<()> {
+    flame: Outputs,
+    symbols: Option<&Symbols>,
+) -> io::Result<bool> {
     let (Some(root), Some(start)) = (trace.root, trace.window.start) else {
-        return writeln!(
+        writeln!(
             w,
             "whytime: the command's exec was not observed ({} records lost); no report",
             meta.dropped
-        );
+        )?;
+        return Ok(flame.is_empty());
     };
     let end = end.max(start);
     let attribution = attribute::attribute(trace, root, start, end);
@@ -431,39 +549,74 @@ fn write_report(
     {
         writeln!(w, "whytime: writing the Perfetto trace {}: {err}", path.display())?;
     }
+    let written = flame.write(w, trace, &attribution, (start, end), &meta.command, symbols)?;
     let report = Report::new(trace, attribution, (start, end), meta, output.timeline);
     if output.json {
-        report.render_json(w)
+        report.render_json(w)?;
     } else {
-        report.render_human(w)
+        report.render_human(w)?;
     }
+    Ok(written)
 }
 
-/// `whytime report FILE`: replays a trace file and prints its report; returns the exit code.
+/// `whytime report FILE`: replays a trace file and prints its report, writing the files
+/// `output` names (flamegraphs from the recorded stacks); returns the exit code.
 fn replay(path: &Path, output: &OutputArgs) -> i32 {
     let replayed = std::fs::read(path)
         .map_err(|err| err.to_string())
         .and_then(|bytes| record::replay(&bytes).map_err(|err| err.to_string()));
-    match replayed {
-        Ok(replay) => {
-            let meta = meta(&replay.header, &replay.end);
-            report(&replay.trace, replay.end.end, meta, output);
-            0
-        }
+    let replay = match replayed {
+        Ok(replay) => replay,
         Err(err) => {
             eprintln!("whytime: {}: {err}", path.display());
-            EXIT_REPLAY
+            return EXIT_REPLAY;
+        }
+    };
+    let mut code = 0;
+    let mut flame = Outputs::default();
+    if output.stacks() {
+        if replay.symbols.is_none() {
+            eprintln!(
+                "whytime: {}: recorded without stack capture, so there is no flamegraph to \
+                 draw (record with --flamegraph or --folded)",
+                path.display()
+            );
+            code = EXIT_REPLAY;
+        } else {
+            match Outputs::create(output, None) {
+                Ok(outputs) => flame = outputs,
+                Err(err) => {
+                    eprintln!("whytime: {err:#}");
+                    code = EXIT_REPLAY;
+                }
+            }
         }
     }
+    let meta = meta(&replay.header, &replay.end);
+    let symbols = replay.symbols.as_ref();
+    if !report(&replay.trace, replay.end.end, meta, output, flame, symbols) {
+        code = EXIT_REPLAY;
+    }
+    code
 }
 
 /// Detaches every program (the task states stop changing), then feeds the records still in
-/// flight to `trace` (and the trace file); the returned maps hold what the final sweep needs.
-fn collect(tracer: Tracer, trace: &mut Trace, recorder: Option<&Recorder>) -> tracer::Maps {
+/// flight to `trace` (and the trace file, and stack capture); the returned maps hold what
+/// the final sweep needs.
+fn collect(
+    tracer: Tracer,
+    trace: &mut Trace,
+    recorder: Option<&Recorder>,
+    mut stacks: Option<&mut Collector>,
+) -> tracer::Maps {
+    if let Some(stacks) = stacks.as_deref_mut() {
+        // While whytime's programs are loaded, so their frames in kernel stacks are named.
+        stacks.read_kallsyms();
+    }
     let mut maps = tracer.detach();
     // Programs still running on other CPUs commit within microseconds.
     std::thread::sleep(Duration::from_millis(2));
-    maps.drain(|record| ingest(trace, recorder, record));
+    maps.drain(|record| ingest(trace, recorder, stacks.as_deref_mut(), record));
     maps
 }
 

@@ -1,17 +1,19 @@
 //! `whytime doctor` and the start-up diagnostics: the shared bpfdoctor checks plus whytime's
 //! own probes (`probe.sched`, `probe.syscalls`, `probe.dns`, `probe.readiness`,
-//! `probe.faults`), which load and attach the real programs.
+//! `probe.faults`, `probe.stacks`), which load and attach the real programs, and
+//! `kernel.kallsyms` (whether flamegraphs can name kernel frames).
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use bpfdoctor::{
     Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name,
 };
+use whytime_abi::STACK_DEPTH;
 
 use crate::sys::SyscallTable;
-use crate::tracer::{self, DNS, FAULTS, READINESS, SCHED, SYSCALLS, Tracer};
+use crate::tracer::{self, DNS, FAULTS, READINESS, SAMPLER, SCHED, SYSCALLS, Tracer};
 
 /// whytime as bpfdoctor sees it.
 pub fn tool() -> Tool {
@@ -41,6 +43,7 @@ pub fn full() -> Doctor {
             index,
         }));
     }
+    doctor.add(Box::new(KallsymsCheck));
     doctor
 }
 
@@ -79,13 +82,13 @@ struct Outcome {
     sched: Result<String, anyhow::Error>,
     /// The optional program sets, in [`OPTIONAL`] order; `None` when the scheduler probe
     /// failed and nothing else was tried.
-    optional: Option<[Result<String, anyhow::Error>; 4]>,
+    optional: Option<[Result<String, anyhow::Error>; 5]>,
 }
 
 impl Probe {
     fn get(&self) -> &Outcome {
         self.outcome
-            .get_or_init(|| match Tracer::load(&SyscallTable::new()) {
+            .get_or_init(|| match Tracer::load(&SyscallTable::new(), true) {
                 Ok(loaded) => {
                     let sizes = loaded.tracer.program_sizes();
                     let attached = |what: &str, set: &[(&str, &str)]| {
@@ -110,6 +113,16 @@ impl Probe {
                         loaded
                             .faults
                             .map(|()| attached("fentry and fexit/handle_mm_fault", &FAULTS)),
+                        loaded
+                            .stacks
+                            .unwrap_or_else(|| Err(anyhow::anyhow!("stack capture not tried")))
+                            .map(|()| {
+                                attached(
+                                    "perf_event cpu-clock sampler on every CPU and stack \
+                                     capture at sched_switch",
+                                    &[(SAMPLER, "cpu-clock")],
+                                )
+                            }),
                     ];
                     Outcome {
                         sched: Ok(sched),
@@ -170,6 +183,30 @@ fn fentry_fixes(err: &anyhow::Error, tool: &Tool, functions: &str) -> Vec<Fix> {
     }
 }
 
+/// Fixes for a failed stack-capture set (stack maps, perf_event sampler).
+fn stack_fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
+    match tracer::errno(err) {
+        Some(libc::EPERM | libc::EACCES) => fixes(err, tool),
+        Some(libc::EINVAL) => vec![
+            Fix::new(
+                format!("sudo sysctl kernel.perf_event_max_stack={STACK_DEPTH}"),
+                format!(
+                    "the stack maps hold {STACK_DEPTH} frames per stack, which the sysctl must \
+                     allow (runs without --flamegraph/--folded do not need it)"
+                ),
+            ),
+            debug_fix(tool),
+        ],
+        _ => vec![
+            Fix::new(
+                "Linux built with CONFIG_PERF_EVENTS (the software cpu-clock event)",
+                "on-CPU stacks come from a perf_event BPF program on every CPU",
+            ),
+            debug_fix(tool),
+        ],
+    }
+}
+
 fn debug_fix(tool: &Tool) -> Fix {
     Fix::new(
         format!("WHYTIME_LOG=debug {} doctor", tool.exe.display()),
@@ -206,18 +243,27 @@ impl Check for SchedCheck {
     }
 }
 
+/// How an optional set attaches, which decides the fixes for a failure.
+enum Attach {
+    /// `tp_btf` tracepoints.
+    Tracepoints,
+    /// fentry/fexit on these kernel functions.
+    Fentry(&'static str),
+    /// Stack capture: a stack map and perf_event programs.
+    Stacks,
+}
+
 /// An optional program set: whytime runs without it, with less detail.
 struct OptionalSpec {
     id: &'static str,
     title: &'static str,
     impact: &'static str,
     explain: &'static str,
-    /// Kernel functions an fentry/fexit set hooks; `None` for tracepoints.
-    functions: Option<&'static str>,
+    attach: Attach,
 }
 
 /// Optional program sets, in the order of [`Outcome::optional`].
-static OPTIONAL: [OptionalSpec; 4] = [
+static OPTIONAL: [OptionalSpec; 5] = [
     OptionalSpec {
         id: "probe.syscalls",
         title: "Syscall tracepoints",
@@ -225,7 +271,7 @@ static OPTIONAL: [OptionalSpec; 4] = [
                  peer, futex, ...)",
         explain: "the syscall in flight when a thread blocks says what it waited for; \
                   tp_btf/sys_enter and sys_exit record it",
-        functions: None,
+        attach: Attach::Tracepoints,
     },
     OptionalSpec {
         id: "probe.dns",
@@ -235,7 +281,7 @@ static OPTIONAL: [OptionalSpec; 4] = [
         explain: "a tp_btf/sys_exit variant copies what traced threads receive from DNS servers \
                   (port 53) and systemd-resolved's varlink socket, so peers can be named; \
                   without it the plain sys_exit program is attached",
-        functions: None,
+        attach: Attach::Tracepoints,
     },
     OptionalSpec {
         id: "probe.readiness",
@@ -244,7 +290,7 @@ static OPTIONAL: [OptionalSpec; 4] = [
                  that became ready (network peer, pipe, terminal)",
         explain: "fentry on pollwake and ep_poll_callback records which file woke a thread \
                   blocked in poll, select or epoll_wait",
-        functions: Some("pollwake and ep_poll_callback"),
+        attach: Attach::Fentry("pollwake and ep_poll_callback"),
     },
     OptionalSpec {
         id: "probe.faults",
@@ -253,7 +299,16 @@ static OPTIONAL: [OptionalSpec; 4] = [
                  \"other\" or as the syscall it interrupted instead of \"fault\"",
         explain: "fentry/fexit on handle_mm_fault mark threads inside a page fault, so a block \
                   there is attributed to the mapped file",
-        functions: Some("handle_mm_fault"),
+        attach: Attach::Fentry("handle_mm_fault"),
+    },
+    OptionalSpec {
+        id: "probe.stacks",
+        title: "Stack capture (flamegraphs)",
+        impact: "whytime refuses --flamegraph and --folded (runs without them are unaffected)",
+        explain: "a perf_event program on every CPU samples on-CPU stacks, and sched_switch \
+                  records where threads block, into BPF stack maps; only with --flamegraph \
+                  or --folded, which load a separate BPF object with them",
+        attach: Attach::Stacks,
     },
 ];
 
@@ -286,9 +341,10 @@ impl Check for OptionalCheck {
                     Diagnostic::new(spec.id, spec.title, false, Status::Warn, describe(err))
                         .with_impact(spec.impact)
                         .with_explain(spec.explain);
-                let fixes = match spec.functions {
-                    Some(functions) => fentry_fixes(err, tool, functions),
-                    None => fixes(err, tool),
+                let fixes = match spec.attach {
+                    Attach::Fentry(functions) => fentry_fixes(err, tool, functions),
+                    Attach::Tracepoints => fixes(err, tool),
+                    Attach::Stacks => stack_fixes(err, tool),
                 };
                 for fix in fixes {
                     diag = diag.with_fix(fix);
@@ -296,5 +352,50 @@ impl Check for OptionalCheck {
                 diag
             }
         }
+    }
+}
+
+/// Whether `/proc/kallsyms` shows addresses, so flamegraphs can name kernel frames.
+struct KallsymsCheck;
+
+impl Check for KallsymsCheck {
+    fn id(&self) -> &'static str {
+        "kernel.kallsyms"
+    }
+
+    fn run(&self, env: &dyn Env, tool: &Tool) -> Diagnostic {
+        const TITLE: &str = "Kernel symbols (flamegraph kernel frames)";
+        let head = env.read_head(Path::new("/proc/kallsyms"), 64);
+        let address = head.as_ref().ok().and_then(|head| {
+            let text = String::from_utf8_lossy(head);
+            u64::from_str_radix(text.split_ascii_whitespace().next()?, 16).ok()
+        });
+        if address.is_some_and(|address| address != 0) {
+            return Diagnostic::new(
+                self.id(),
+                TITLE,
+                false,
+                Status::Pass,
+                "/proc/kallsyms shows addresses: kernel frames are symbolized",
+            );
+        }
+        let observed = match head {
+            Ok(_) => "/proc/kallsyms hides addresses (all zero)".to_owned(),
+            Err(err) => format!("/proc/kallsyms unreadable: {err}"),
+        };
+        Diagnostic::new(self.id(), TITLE, false, Status::Warn, observed)
+            .with_impact("flamegraph kernel frames collapse into one [kernel] frame")
+            .with_explain(
+                "kernel addresses show only to CAP_SYSLOG, or to everyone with \
+                 kernel.kptr_restrict=0 and kernel.perf_event_paranoid <= 1",
+            )
+            .with_fix(Fix::new(
+                format!("sudo {}", tool.exe.display()),
+                "root has CAP_SYSLOG",
+            ))
+            .with_fix(Fix::new(
+                tool.setcap_command(&[Cap::Syslog], &tool.exe),
+                "file capabilities including cap_syslog",
+            ))
     }
 }

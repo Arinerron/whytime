@@ -107,10 +107,28 @@ pub struct OutputArgs {
     #[arg(long, value_name = "FILE")]
     pub perfetto: Option<PathBuf>,
 
+    /// Write a wall-clock flamegraph of the critical path to FILE (SVG): its width is the
+    /// window, each stack a report line, process and call stack. Samples stacks while
+    /// tracing; `report` draws one only from a trace recorded with it (or --folded).
+    #[arg(long, value_name = "FILE")]
+    pub flamegraph: Option<PathBuf>,
+
+    /// Write the flamegraph's stacks to FILE in folded format (`frame;frame;... count`,
+    /// counts in microseconds), for inferno, flamegraph.pl or speedscope.
+    #[arg(long, value_name = "FILE")]
+    pub folded: Option<PathBuf>,
+
     /// Add a timeline to the report: the window in equal slices, each with its largest
     /// lines.
     #[arg(long)]
     pub timeline: bool,
+}
+
+impl OutputArgs {
+    /// Whether stacks are needed (`--flamegraph` or `--folded`).
+    pub fn stacks(&self) -> bool {
+        self.flamegraph.is_some() || self.folded.is_some()
+    }
 }
 
 /// Parses `500ms`, `30s`, `1.5s`, `2m`, `1h`; a bare number is seconds.

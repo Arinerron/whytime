@@ -14,8 +14,8 @@ use std::sync::Arc;
 use procctx::{Config, ExecEvent, ExitEvent, ForkEvent, ProcFs, ProcKey, ProcTable, StartClock};
 use whytime_abi::{
     CpuSegment, DnsRecord, EPF_FAULT, EPF_READY, EV_DNS, EV_EPISODE, EV_EXEC, EV_EXIT, EV_FORK,
-    EpisodeRecord, EvHeader, ExecRecord, ExitRecord, ForkRecord, ST_BLOCKED, ST_RUNNABLE,
-    ST_RUNNING, ST_WOKEN, TaskState,
+    EV_SAMPLE, EV_STACK, EpisodeRecord, EvHeader, ExecRecord, ExitRecord, ForkRecord,
+    ST_BLOCKED, ST_RUNNABLE, ST_RUNNING, ST_WOKEN, SampleRecord, StackRecord, TaskState,
 };
 
 use crate::classify::{BlockInfo, Blocked, Classifier};
@@ -73,6 +73,35 @@ pub struct Block {
     pub waker_comm: Option<Arc<str>>,
     /// Name of the syscall it blocked in, when it was in one whytime knows.
     pub syscall: Option<&'static str>,
+    /// Where the thread blocked (stack capture on).
+    pub stacks: StackIds,
+}
+
+/// The stacks of one moment of a thread, as the kernel referred to them (encoded like
+/// `TaskState::user_stack`: 0 none, > 0 id + 1 in `generation`'s stack map,
+/// `STACK_INLINE` a copy in a STACK record, other < 0 `-errno`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StackIds {
+    /// User stack.
+    pub user: i32,
+    /// Kernel stack.
+    pub kernel: i32,
+    /// Stack generation of the ids.
+    pub generation: u32,
+    /// The process image the user stack's addresses belong to: the index into
+    /// [`Proc::images`] current when it was taken (each exec adds an entry).
+    pub image: u32,
+    /// Capture time (block or sample time): with the thread, it names STACK record copies.
+    pub at: u64,
+}
+
+/// An on-CPU stack sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// Sample time.
+    pub ts: u64,
+    /// The stacks.
+    pub stacks: StackIds,
 }
 
 /// A task that held a CPU while a tracked thread waited for it, as the kernel saw it.
@@ -112,6 +141,18 @@ pub struct Thread {
     pub death: Option<u64>,
     /// Segments in time order, non-overlapping.
     pub segs: Vec<Seg>,
+    /// On-CPU stack samples in arrival (time) order; empty without stack capture.
+    pub samples: Vec<Sample>,
+    /// Thread name (`comm`) history from episodes and samples: each holds from its time on.
+    pub names: Vec<(u64, Arc<str>)>,
+}
+
+impl Thread {
+    /// The thread's own name at `ts` (the earliest one known if none was seen by then).
+    pub fn name_at(&self, ts: u64) -> Option<&Arc<str>> {
+        let i = self.names.partition_point(|(from, _)| *from <= ts);
+        self.names.get(i.saturating_sub(1)).map(|(_, name)| name)
+    }
 }
 
 /// One program a process ran: inherited at its fork, started by an exec, or found by attach.
@@ -307,11 +348,20 @@ impl Trace {
             EV_EXIT => wire::from_bytes::<ExitRecord>(bytes).map(|r| self.on_exit(r)),
             // Resolver traffic: names for the peers of later blocks.
             EV_DNS => wire::from_bytes::<DnsRecord>(bytes).map(|r| self.classifier.resolved(r)),
+            EV_SAMPLE => wire::from_bytes::<SampleRecord>(bytes).map(|r| self.on_sample(r)),
+            // Stack copies are for stack capture (`stacks.rs`), not the timeline.
+            EV_STACK => wire::from_bytes::<StackRecord>(bytes).map(drop),
             _ => None,
         });
         if applied.is_none() {
             self.malformed += 1;
         }
+    }
+
+    /// The live process `tgid`'s identity and current image (see [`StackIds::image`]).
+    pub fn current_image(&self, tgid: u32) -> Option<(ProcKey, u32)> {
+        let proc = &self.procs[*self.live_procs.get(&tgid)?];
+        Some((proc.key, u32::try_from(proc.images.len() - 1).unwrap_or(u32::MAX)))
     }
 
     fn on_fork(&mut self, r: &ForkRecord) {
@@ -444,10 +494,65 @@ impl Trace {
             waker_tgid: r.waker_tgid,
             waker_comm,
             syscall: self.classifier.syscall_name(r.sys.nr),
+            // The raw block time: the key of STACK record copies.
+            stacks: self.stack_ids(proc, r.user_stack, r.kernel_stack, r.stack_gen, r.block_ts),
         };
+        self.name(thread, block_ts, &r.comm);
         self.push_block(thread, block_ts, wake_ts, block);
         let holder = self.intern_holder(r.run_holder_tgid, &r.run_holder_comm);
         self.push(thread, wake_ts, run_ts, SegKind::Runq(holder));
+    }
+
+    /// An on-CPU sample of a known thread (one whose records were seen: samples never
+    /// create threads, so stack capture cannot change the report).
+    fn on_sample(&mut self, r: &SampleRecord) {
+        let Some(&thread) = self.live_threads.get(&r.hdr.tid) else {
+            return;
+        };
+        let proc = self.threads[thread].proc;
+        let stacks = self.stack_ids(proc, r.user_stack, r.kernel_stack, r.stack_gen, r.hdr.ts);
+        self.name(thread, r.hdr.ts, &r.comm);
+        let samples = &mut self.threads[thread].samples;
+        // Arrival order is time order; a straggler is put in its place.
+        let at = samples.partition_point(|s| s.ts <= r.hdr.ts);
+        samples.insert(
+            at,
+            Sample {
+                ts: r.hdr.ts,
+                stacks,
+            },
+        );
+    }
+
+    /// Stack references of `generation`, captured at `at`, taken now in process `proc`, in
+    /// its current image.
+    fn stack_ids(
+        &self,
+        proc: ProcId,
+        user: i32,
+        kernel: i32,
+        generation: u32,
+        at: u64,
+    ) -> StackIds {
+        StackIds {
+            user,
+            kernel,
+            generation,
+            image: u32::try_from(self.procs[proc].images.len() - 1).unwrap_or(u32::MAX),
+            at,
+        }
+    }
+
+    /// Notes that `thread` was named `raw` (a kernel `comm`) at `ts`.
+    fn name(&mut self, thread: ThreadId, ts: u64, raw: &[u8; 16]) {
+        let Some(name) = self.intern_comm(raw) else {
+            return;
+        };
+        let names = &mut self.threads[thread].names;
+        match names.last() {
+            Some((from, last)) if *from > ts || *last == name => {}
+            _ => names.push((ts, name)),
+        }
     }
 
     fn on_exit(&mut self, r: &ExitRecord) {
@@ -526,6 +631,13 @@ impl Trace {
                         waker_tgid: state.waker_tgid,
                         waker_comm,
                         syscall: self.classifier.syscall_name(state.sys.nr),
+                        stacks: self.stack_ids(
+                            proc,
+                            state.user_stack,
+                            state.kernel_stack,
+                            state.stack_gen,
+                            state.block_ts,
+                        ),
                     };
                     self.push_block(thread, state.block_ts, wake, block);
                     // Woken but not yet run: who holds the CPU is not known.
@@ -567,6 +679,8 @@ impl Trace {
             proc,
             birth,
             death: None,
+            samples: Vec::new(),
+            names: Vec::new(),
             segs: Vec::new(),
         });
         self.procs[proc].threads.push(id);
