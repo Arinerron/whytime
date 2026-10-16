@@ -7,6 +7,52 @@ All notable changes to whytime are recorded here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-16
+
+### Added
+
+- Published on crates.io: `cargo install --locked whytime` (needs clang with the BPF target
+  and Rust 1.94 or newer). The internal crates `whytime-abi` and `whytime-bpf` are
+  published alongside it, pinned to the same version.
+
+### Security
+
+- Under `sudo`, output files (`--record`, `--perfetto`, `--flamegraph`, `--folded`) are
+  created with the invoking user's permissions. They were previously opened as root,
+  following symlinks and truncating whatever file was there, then handed to the user.
+
+### Fixed
+
+- whytime builds on glibc targets (x86_64 and aarch64 `*-linux-gnu`), not only musl.
+- whytime no longer aborts (exit 134) when stderr is a closed pipe, as in
+  `whytime -- make 2>&1 | head`.
+- Control characters in process names, arguments and paths are escaped in the text report,
+  and no longer make flamegraph SVGs invalid.
+- Signals inherited as ignored (`nohup`, background jobs of non-interactive shells) stay
+  ignored for COMMAND.
+- The `--perfetto` path is checked before COMMAND runs, like the other output files,
+  instead of failing after the run.
+- Attach mode holds the target before checking its owner, so a PID reused in between can no
+  longer be traced in its place.
+- Misspelled options (`--duraton 5`) are rejected instead of being run as COMMAND.
+- COMMAND no longer inherits a raised `RLIMIT_MEMLOCK`.
+- The exit of a process whose last thread to exit is an io_uring SQPOLL or vhost worker is
+  no longer missed.
+- 32-bit (compat) syscalls of 32-bit programs are no longer misclassified as the 64-bit
+  syscall with the same number.
+- `whytime doctor` points to the verifier log (`WHYTIME_LOG=debug`) when the verifier
+  rejects a program, instead of suggesting `setcap` or `sudo`.
+- whytime loads on kernels built without IPv6.
+- Host names are recovered from DNS over TCP as musl's resolver does it.
+- Report time no longer grows quadratically or cubically with chains of threads handing
+  work over to each other.
+- Waits ended by a process outside the traced tree are no longer chained as timeouts.
+- The waker of a wait is found after a non-leader thread calls `exec`.
+- `sync()` and `msync()` no longer read a file descriptor from an unrelated register, which
+  attributed them to an unrelated file.
+- Crafted trace files whose traced process has no threads are rejected instead of aborting
+  `whytime report`.
+
 ## [0.1.0] - 2026-10-16
 
 First release.
@@ -66,5 +112,6 @@ First release.
   completions, man pages, the license texts of the code compiled into them
   (`THIRD_PARTY_LICENSES.md`) and SHA-256 checksums.
 
-[Unreleased]: https://github.com/Arinerron/whytime/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Arinerron/whytime/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Arinerron/whytime/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Arinerron/whytime/releases/tag/v0.1.0
