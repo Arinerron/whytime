@@ -448,21 +448,27 @@ sum to 1 (the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rou
 `critical` in JSON is "some span came from this process". The walk:
 
 - Follows COMMAND's **main thread**: the original leader while it lives, then whichever
-  live thread outlives the rest (covers `pthread_exit` from main and multithreaded exec).
+  live thread outlives the rest (covers `pthread_exit` from main and multithreaded exec);
+  `main_line` sweeps the threads by birth with a heap by death, O(T log T), so a long chain
+  of hand-offs (each thread starting its successor, then exiting) stays linear-ish. A root
+  process with no thread at all (every record of it lost, or a damaged trace file) gives one
+  `other untraced` line for the window and no spans.
 - Mixed segments split proportionally into on-CPU and `runqueue` (preempted, or woken and
   not yet running); in spans the on-CPU part comes first. On-CPU of COMMAND's own process
   (any thread) is `cpu` ("on-CPU (comm)"); on-CPU of a descendant process is `child`
   ("waiting on child: comm", subject = the descendant that was computing).
 - Blocked time goes to its class from the in-flight syscall and descriptor:
-  `fsync` (fsync/fdatasync/sync_file_range/syncfs/msync and writes to `O_DSYNC`/`O_SYNC`
-  files; subject = directory, `~`-abbreviated), `file` (other regular-file/blockdev I/O and
-  path syscalls), `lock` (`flock`, `fcntl` with `F_SETLKW`/`F_OFD_SETLKW`; subject = the
-  file's directory), `aio` (`io_uring_enter`, `io_getevents`, `io_pgetevents`), `net` (inet
-  sockets; subject = peer from `connect`'s sockaddr or the socket's `daddr:dport`, as
-  `host:port` when the traced tree resolved the address (`dns.rs` parses the resolver
-  records; see the hostname limit below), else `ip:port`; distinct socket inodes =
-  "connections"), `ipc` (pipes, FIFOs, unix sockets, eventfds, SysV
-  semaphores/message queues, POSIX message queues), `tty` (character devices), `futex`,
+  `fsync` (fsync/fdatasync/sync_file_range/syncfs and writes to `O_DSYNC`/`O_SYNC` files;
+  subject = directory, `~`-abbreviated; `sync` and `msync` have no descriptor argument:
+  `Kind::FsyncNoFd`, not described in kernel, subject = the syscall), `file` (other
+  regular-file/blockdev I/O and path syscalls), `lock` (`flock`, `fcntl` with
+  `F_SETLKW`/`F_OFD_SETLKW`; subject = the file's directory), `aio` (`io_uring_enter`,
+  `io_getevents`, `io_pgetevents`; `libc` names the last for musl only, so `sys.rs` carries
+  its number per arch), `net` (inet sockets; subject = peer from `connect`'s sockaddr or
+  the socket's `daddr:dport`, as `host:port` when the traced tree resolved the address
+  (`dns.rs` parses the resolver records; see the hostname limit below), else `ip:port`;
+  distinct socket inodes = "connections"), `ipc` (pipes, FIFOs, unix sockets, eventfds,
+  SysV semaphores/message queues, POSIX message queues), `tty` (character devices), `futex`,
   `sleep` (nanosleep/clock_nanosleep, timerfd reads), `poll` (poll/select/epoll; inotify and
   fanotify reads with subject `inotify`/`fanotify`), `signal` (incl. signalfd reads), `other`
   (unknown syscall, off-CPU outside syscalls, stopped, or `untraced` gaps from lost records),
@@ -485,12 +491,14 @@ sum to 1 (the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rou
     tracked thread → that **thread** (any tracked process, including other threads of the
     same one: joined workers, lock holders, pipe writers/readers, a child whose exit
     signal ended a `pselect`);
-  - **retried waits**: a `futex`/`poll` block without a tracked waker (a timeout, usually)
-    takes the waker of the same thread's next block of that class if only `Mixed`/`Runq`
-    segments with less than 1/8 of the block's length on-CPU lie between (it re-checked
-    and waited again), chaining through further such blocks; memoized per segment.
-    Needed in practice: xz's main thread waits in 300 ms timed condvar waits, CPython's
-    GIL in 5 ms ones, so most of their waits end by timeout, not by the worker's wake;
+  - **retried waits**: a `futex`/`poll` block that no task ended (waker 0: a timeout,
+    usually) takes the waker of the same thread's next block of that class if only
+    `Mixed`/`Runq` segments with less than 1/8 of the block's length on-CPU lie between (it
+    re-checked and waited again), chaining through further such blocks; memoized per
+    segment. Needed in practice: xz's main thread waits in 300 ms timed condvar waits,
+    CPython's GIL in 5 ms ones, so most of their waits end by timeout, not by the worker's
+    wake. A block woken by a task outside the tree (`woken by <comm>`) is no timeout: it is
+    never retried, and a chain that reaches it ends there unexplained;
   - `wait4`/`waitid` → the child **process** that ended it (the waker if it is a child;
     else the child that exited last inside the block; else the youngest child alive at its
     end), along its main line;
@@ -498,10 +506,12 @@ sum to 1 (the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rou
     → that child until its exec/exit; its pre-exec CPU is `child` with the parent's comm.
   Waker 0 (unknown, or interrupt context, contract with the kernel side) is never
   followed. Lookups take the latest task with that tid/tgid born by the wake, dead or alive
-  (exit-time wakeups may follow the exit record). Parts of the interval outside the
-  followed task's lifetime keep the waiting block's line (for waits: `child`, subject the
-  child). A task already on the walk stack (mutual waits, A↔B) and anything at
-  `MAX_DEPTH` (64) is not followed; the block keeps its own class.
+  (exit-time wakeups may follow the exit record); a thread is found under each tid it had
+  (`Thread.former_tids`: a non-leader thread that execs holds its own tid until the exec
+  record, the leader's from then on). Parts of the interval outside the followed task's
+  lifetime keep the waiting block's line (for waits: `child`, subject the child). A task
+  already on the walk stack (mutual waits, A↔B) and anything at `MAX_DEPTH` (64) is not
+  followed; the block keeps its own class.
 - **Process names** (`names`/`tell_apart`): a subject that names a process (cpu, child,
   runqueue, and blocks whose subject is the process, e.g. `sleep`) is formed after the walk
   from the process **image** it refers to (`Proc.images`: comm and argv per fork/exec/seed;
@@ -859,10 +869,13 @@ truncation and single-byte corruption of them to the parsers (no panic; complete
 kept). `timeline.rs` checks that `net` lines take the resolved name (per socket, with `addr`
 and per-socket connection counts) and that holders reach segments (idle CPUs merged, the
 sweep's pending holder). `attribute.rs` also tests process naming (`tell_apart`: suffix
-length, elision, cut and unknown arguments, the variant cap) and runqueue `held_by` from
-records carrying holders; `report.rs` the timeline slicing and rendering and the `mostly
-HOLDER` threshold; `perfetto.rs` writes a testkit trace and checks the JSON (disjoint slices
-per track, the critical path summing to the window, names, instants, holders).
+length, elision, cut and unknown arguments, the variant cap), runqueue `held_by` from
+records carrying holders, retried waits beside waits woken from outside the tree, wakers
+found under the tid they had before a non-leader exec, a root without threads, and a
+20 000-thread hand-off chain (it does not finish if `main_line` turns quadratic again);
+`report.rs` the timeline slicing and rendering and the `mostly HOLDER` threshold;
+`perfetto.rs` writes a testkit trace and checks the JSON (disjoint slices per track, the
+critical path summing to the window, names, instants, holders).
 
 **Replay fixtures** (`crates/whytime/tests/fixtures.rs`, run by `cargo test --workspace`, so
 by CI; no root, x86_64 only: the traces carry x86_64 syscall numbers): real traces of the
