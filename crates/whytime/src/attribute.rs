@@ -145,7 +145,26 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
         }
     }
     for (id, thread) in trace.threads.iter().enumerate() {
-        walker.by_tid.entry(thread.tid).or_default().push(id);
+        // Earlier tids first: a non-leader thread that execs takes over the leader's.
+        let mut from = thread.birth;
+        for &(tid, until) in &thread.former_tids {
+            let tenure = Tenure {
+                thread: id,
+                from,
+                until: Some(until),
+            };
+            walker.by_tid.entry(tid).or_default().push(tenure);
+            from = until;
+        }
+        let tenure = Tenure {
+            thread: id,
+            from,
+            until: None,
+        };
+        walker.by_tid.entry(thread.tid).or_default().push(tenure);
+    }
+    for tenures in walker.by_tid.values_mut() {
+        tenures.sort_by_key(|tenure| tenure.from);
     }
     walker.walk_proc(root, start, end, 0);
     let pieces = std::mem::take(&mut walker.pieces);
@@ -393,14 +412,23 @@ enum Target {
     Proc(ProcId),
 }
 
+/// A thread holding a tid over `[from, until)`; `until` is `None` from its last tid on, dead
+/// or alive (an exiting thread still wakes its joiner).
+#[derive(Clone, Copy)]
+struct Tenure {
+    thread: ThreadId,
+    from: u64,
+    until: Option<u64>,
+}
+
 struct Walker<'a> {
     trace: &'a Trace,
     /// The wrapped command: on-CPU time is `cpu` in it, `child` anywhere else.
     root: ProcId,
     /// Every process lifetime that had a given tgid.
     by_tgid: HashMap<u32, Vec<ProcId>>,
-    /// Every thread that had a given tid.
-    by_tid: HashMap<u32, Vec<ThreadId>>,
+    /// Every thread that had a given tid, by the start of its tenure.
+    by_tid: HashMap<u32, Vec<Tenure>>,
     /// Parent of each process, when it was traced.
     parents: Vec<Option<ProcId>>,
     pieces: Vec<Piece>,
@@ -725,21 +753,23 @@ impl Walker<'_> {
             .find(|&id| procs[id].birth <= ts)
     }
 
-    /// The latest thread `tid` of process `tgid` born by `ts`, dead or alive (an exiting
-    /// thread wakes its joiner).
+    /// The thread with tid `tid` in process `tgid` at `ts`: the latest to take that tid by
+    /// then, dead or alive (an exiting thread wakes its joiner), unless it gave the tid up
+    /// before `ts` (a non-leader thread's exec moves it onto the leader's).
     fn thread_at(&self, tid: u32, tgid: u32, ts: u64) -> Option<ThreadId> {
         if tid == 0 {
             return None;
         }
-        let threads = &self.trace.threads;
-        let thread = self
+        let tenure = self
             .by_tid
             .get(&tid)?
             .iter()
-            .copied()
             .rev()
-            .find(|&t| threads[t].birth <= ts)?;
-        (self.trace.procs[threads[thread].proc].key.pid == tgid).then_some(thread)
+            .find(|tenure| tenure.from <= ts)?;
+        let thread = tenure.thread;
+        let held = tenure.until.is_none_or(|until| ts < until);
+        let proc = self.trace.threads[thread].proc;
+        (held && self.trace.procs[proc].key.pid == tgid).then_some(thread)
     }
 
     /// The waker of a retried wait. A `futex` or `poll` wait that no task ended (a timeout,
@@ -795,7 +825,7 @@ fn spawns(subject: &Subject) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use libc::{SYS_nanosleep, SYS_wait4};
+    use libc::{SYS_futex, SYS_nanosleep, SYS_wait4};
     use procctx::ProcKey;
 
     use super::*;
@@ -846,6 +876,7 @@ mod tests {
         let id = t.threads.len();
         t.threads.push(Thread {
             tid,
+            former_tids: Vec::new(),
             proc,
             birth: segs[0].start,
             death: segs.last().map(|s| s.end),
@@ -1046,6 +1077,45 @@ mod tests {
                 (Class::Poll, "app", 40),
                 (Class::Poll, "woken by dbus-daemon", 19),
             ]
+        );
+    }
+
+    #[test]
+    fn a_thread_that_execs_is_found_under_the_tid_it_had_at_the_wake() {
+        // The leader waits for thread 101, then exits; 101 execs and takes over tid 100.
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 101, 100));
+        let mut wait = episode(100, 100, seg(1_000, 200, 0), sys(SYS_futex), [1_200, 1_800, 1_800]);
+        (wait.waker_tid, wait.waker_tgid) = (101, 100);
+        feed(&mut t, &wait);
+        feed(&mut t, &exit(1_900, 100, 100, seg(1_800, 100, 0), 0, false));
+        feed(&mut t, &exec(2_000, 101, 100, "tool", seg(1_100, 900, 0)));
+        feed(&mut t, &exit(3_000, 100, 100, seg(2_000, 1_000, 0), 0, true));
+
+        let a = attribute(&t, 0, 1_000, 3_000);
+        let lines = tiled(&a, 1_000, 3_000);
+        assert_eq!(lines, [(Class::Cpu, "app", 1_000), (Class::Cpu, "tool", 1_000)]);
+    }
+
+    #[test]
+    fn the_leader_tid_names_the_old_leader_until_a_non_leader_exec_takes_it() {
+        // sh reads a pipe that thread 61 of app fills; 61 first waits for the leader, 60,
+        // and at 70 execs, which moves it onto tid 60.
+        let mut t = trace(1);
+        let sh = proc(&mut t, 50, "sh", (0, 100), None);
+        let app = proc(&mut t, 60, "app", (0, 100), Some(sh));
+        let pipe = block(0, 60, Class::Ipc, Subject::Process, (61, 60));
+        thread(&mut t, sh, 50, vec![pipe, run(60, 100)]);
+        thread(&mut t, app, 60, vec![run(0, 50)]);
+        let execer = thread(&mut t, app, 60, vec![futex(5, 40, (60, 60)), run(40, 100)]);
+        t.threads[execer].former_tids.push((61, 70));
+
+        let a = attribute(&t, sh, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [(Class::Cpu, "sh", 40), (Class::Child, "app", 55), (Class::Ipc, "sh", 5)]
         );
     }
 
