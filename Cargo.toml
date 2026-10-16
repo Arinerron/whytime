@@ -13,7 +13,7 @@ default-members = ["crates/whytime"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 whytime-abi = { path = "crates/whytime-abi" }
@@ -26,6 +26,8 @@ bpfdoctor = { path = "../tracekit/crates/bpfdoctor" }
 aya = { version = "0.14.0", default-features = false }
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
 libc = "0.2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

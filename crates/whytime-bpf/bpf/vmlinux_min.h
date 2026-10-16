@@ -6,7 +6,8 @@
  * (minus any ___flavor suffix) and field name; anonymous unions and structs in the kernel type
  * (sock_common's address and port pairs, mm_struct's argument range) are looked through.
  *
- * __VMLINUX_H__ tells bpf_tracing.h to use kernel pt_regs register names (di, si, dx, r10, ...).
+ * __VMLINUX_H__ tells bpf_tracing.h to use kernel pt_regs register names (x86: di, si, dx, ...;
+ * arm64: orig_x0, regs[]). Everything else here is arch-neutral.
  */
 #ifndef __VMLINUX_H__
 #define __VMLINUX_H__
@@ -58,6 +59,10 @@ typedef struct {
 	int counter;
 } atomic_t;
 
+/* Syscall argument registers read by PT_REGS_PARM*_CORE_SYSCALL. arm64 reads arg 1 from
+ * pt_regs.orig_x0 (bpf_tracing.h's pt_regs___arm64 flavor) and the rest from user_pt_regs.regs[],
+ * which the kernel's pt_regs embeds. */
+#if defined(__TARGET_ARCH_x86)
 struct pt_regs {
 	unsigned long r10;
 	unsigned long r9;
@@ -66,6 +71,15 @@ struct pt_regs {
 	unsigned long si;
 	unsigned long di;
 };
+#elif defined(__TARGET_ARCH_arm64)
+struct user_pt_regs {
+	__u64 regs[31];
+};
+
+struct pt_regs;
+#else
+#error "vmlinux_min.h declares pt_regs for x86 and arm64 only"
+#endif
 
 struct super_block {
 	dev_t s_dev;
