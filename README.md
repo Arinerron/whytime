@@ -14,8 +14,11 @@ critical path: 3 processes · 0 events lost
 
 whytime runs a command, traces it and every process it starts with eBPF, and splits the
 wall-clock time along the command's critical path: on-CPU, waiting on a child that was
-computing, timer sleeps, fsync (per directory), file I/O, network peers (`ip:port`), pipes,
-locks, polling, waiting for a CPU. Shares always add up to 100% of the wall time.
+computing, timer sleeps, fsync (per directory), file I/O, file locks (`flock`/`fcntl`),
+async I/O completions (io_uring, AIO), network peers (`ip:port`), pipes and other IPC,
+futexes, polling, waiting for a CPU. Shares always add up to 100% of the wall time. File
+subjects are captured in the kernel when the process blocks, so they name the directory even
+for processes that are gone by the time whytime reports.
 
 ```
 $ whytime -- ./build.sh            # report on stderr; the command's output passes through

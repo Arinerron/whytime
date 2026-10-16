@@ -42,6 +42,10 @@ wire::wire! {
     }
 
     /// The syscall a thread is in, with what the kernel knows about its file descriptor.
+    ///
+    /// `nr` is set at `sys_enter`; the other fields only describe this syscall when the
+    /// accompanying [`SysDetail::flags`] has `SYSD_DESCRIBED` (the description is taken when
+    /// the syscall first blocks).
     pub struct SysInfo {
         /// Syscall number, or `NR_NONE` outside syscalls.
         pub nr: i32,
@@ -61,6 +65,24 @@ wire::wire! {
         pub port: u16,
         /// Peer address: 4 bytes for IPv4, 16 for IPv6, network order.
         pub addr: [u8; 16],
+    }
+
+    /// Raw arguments of the syscall in flight and what its first block revealed beyond
+    /// [`SysInfo`]: the file's filesystem and its path, captured in kernel.
+    pub struct SysDetail {
+        /// Arguments 0..3, saved at `sys_enter`.
+        pub args: [u64; 3],
+        /// `i_sb->s_magic` (low 32 bits) of the descriptor's file; 0 when not described.
+        pub magic: u32,
+        /// `SYSD_*` bits.
+        pub flags: u32,
+        /// Bytes of `path` in use.
+        pub path_len: u32,
+        /// Zero.
+        pub _pad: u32,
+        /// Name components of the file, leaf first, each NUL-terminated (`lock\0dir\0home\0`
+        /// is `/home/dir/lock`). Only whole components are kept.
+        pub path: [u8; PATH_BYTES as usize],
     }
 
     /// A tracked task forked a process or thread (`sched_process_fork`).
@@ -117,6 +139,8 @@ wire::wire! {
         pub block_state: u32,
         /// Zero.
         pub _pad: u32,
+        /// Syscall arguments, filesystem and path of the file the thread blocked on.
+        pub detail: SysDetail,
     }
 
     /// A tracked thread exited (`sched_process_exit`).
@@ -157,6 +181,8 @@ wire::wire! {
         pub waker_tgid: u32,
         /// Zero.
         pub _pad: u32,
+        /// Arguments of the syscall in flight and its block-time description.
+        pub detail: SysDetail,
     }
 }
 
@@ -191,6 +217,21 @@ wire::wire_consts! {
     /// Entries of the `sys_flags` array (syscall numbers above are ignored).
     pub const SYS_TABLE_LEN: u32 = 512;
 
+    /// [`SysDetail::flags`]: the syscall's descriptor was described at its first block, so
+    /// [`SysInfo`] (beyond `nr`), `magic` and `path` refer to this syscall.
+    pub const SYSD_DESCRIBED: u32 = 1;
+    /// [`SysDetail::flags`]: the path walk reached the root of the mount namespace, so
+    /// `path` is the whole absolute path.
+    pub const SYSD_PATH_ROOTED: u32 = 2;
+    /// [`SysDetail::flags`]: the walk stopped early (buffer full, depth limit, unreadable
+    /// name); `path` holds only the trailing components. Without either path flag the walk
+    /// ended at a pseudo-filesystem root (anonymous inode, pipe, memfd) and `path` is the name.
+    pub const SYSD_PATH_TRUNCATED: u32 = 4;
+    /// Size of [`SysDetail::path`].
+    pub const PATH_BYTES: u32 = 256;
+    /// `s_magic` of anonymous inodes (eventfd, timerfd, signalfd, inotify, ...).
+    pub const ANON_INODE_FS_MAGIC: u32 = 0x0904_1934;
+
     /// `stats` slot: ring buffer reservations that failed (records lost).
     pub const STAT_RING_FULL: u32 = 0;
     /// `stats` slot: threads that could not be added to the `tasks` map.
@@ -216,6 +257,7 @@ pub fn header() -> wire::HeaderBuilder {
         .structs::<EvHeader>()
         .structs::<CpuSegment>()
         .structs::<SysInfo>()
+        .structs::<SysDetail>()
         .structs::<ForkRecord>()
         .structs::<ExecRecord>()
         .structs::<EpisodeRecord>()

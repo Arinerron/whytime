@@ -1,5 +1,5 @@
 //! The syscalls whytime understands: what blocking in each one means, and which ones the BPF
-//! program should describe the file descriptor (or `connect` target) of.
+//! program should describe the file descriptor (or `connect` target) of when they block.
 //!
 //! Numbers come from `libc`, so the table follows the build target's syscall ABI; the kernel
 //! side only sees the `SYSF_*` bits user space writes into its `sys_flags` array.
@@ -20,6 +20,15 @@ pub enum Kind {
     Connect,
     /// Explicit durability barrier (`fsync`, `fdatasync`, `sync_file_range`, ...).
     Fsync,
+    /// Whole-file lock on argument 0 (`flock`).
+    Lock,
+    /// `fcntl`: a record-lock wait when argument 1 is `F_SETLKW`/`F_OFD_SETLKW`, otherwise
+    /// I/O on argument 0.
+    Fcntl,
+    /// Waiting for asynchronous I/O completions (`io_uring_enter`, `io_getevents`).
+    Aio,
+    /// SysV semaphores and message queues, POSIX message queues.
+    Ipc,
     /// Path-based filesystem work (`openat`, `statx`, `unlinkat`, ...).
     PathFs,
     /// Timer sleep.
@@ -40,9 +49,11 @@ impl Kind {
     /// `sys_flags` bits for the BPF program.
     fn bpf_flags(self) -> u32 {
         match self {
-            Self::FdIo { .. } | Self::Fsync => SYSF_FD0,
+            Self::FdIo { .. } | Self::Fsync | Self::Lock | Self::Fcntl => SYSF_FD0,
             Self::Connect => SYSF_FD0 | SYSF_SOCKADDR,
-            Self::PathFs
+            Self::Aio
+            | Self::Ipc
+            | Self::PathFs
             | Self::Sleep
             | Self::Futex
             | Self::Wait
@@ -70,8 +81,6 @@ const COMMON: &[(c_long, &str, Kind)] = &[
     (libc::SYS_accept4, "accept4", READ),
     (libc::SYS_getdents64, "getdents64", READ),
     (libc::SYS_splice, "splice", READ),
-    (libc::SYS_flock, "flock", READ),
-    (libc::SYS_fcntl, "fcntl", READ),
     (libc::SYS_ioctl, "ioctl", READ),
     (libc::SYS_write, "write", WRITE),
     (libc::SYS_writev, "writev", WRITE),
@@ -92,6 +101,17 @@ const COMMON: &[(c_long, &str, Kind)] = &[
     (libc::SYS_syncfs, "syncfs", Kind::Fsync),
     (libc::SYS_sync, "sync", Kind::Fsync),
     (libc::SYS_msync, "msync", Kind::Fsync),
+    (libc::SYS_flock, "flock", Kind::Lock),
+    (libc::SYS_fcntl, "fcntl", Kind::Fcntl),
+    (libc::SYS_io_uring_enter, "io_uring_enter", Kind::Aio),
+    (libc::SYS_io_getevents, "io_getevents", Kind::Aio),
+    (libc::SYS_io_pgetevents, "io_pgetevents", Kind::Aio),
+    (libc::SYS_semop, "semop", Kind::Ipc),
+    (libc::SYS_semtimedop, "semtimedop", Kind::Ipc),
+    (libc::SYS_msgrcv, "msgrcv", Kind::Ipc),
+    (libc::SYS_msgsnd, "msgsnd", Kind::Ipc),
+    (libc::SYS_mq_timedreceive, "mq_timedreceive", Kind::Ipc),
+    (libc::SYS_mq_timedsend, "mq_timedsend", Kind::Ipc),
     (libc::SYS_openat, "openat", Kind::PathFs),
     (libc::SYS_openat2, "openat2", Kind::PathFs),
     (libc::SYS_newfstatat, "newfstatat", Kind::PathFs),
@@ -125,8 +145,6 @@ const COMMON: &[(c_long, &str, Kind)] = &[
     (libc::SYS_mprotect, "mprotect", Kind::Other),
     (libc::SYS_madvise, "madvise", Kind::Other),
     (libc::SYS_exit_group, "exit_group", Kind::Other),
-    (libc::SYS_io_uring_enter, "io_uring_enter", Kind::Other),
-    (libc::SYS_io_getevents, "io_getevents", Kind::Other),
 ];
 
 /// Legacy syscalls that only some architectures (x86-64 among them) still have.
@@ -206,8 +224,11 @@ mod tests {
         assert_eq!(flags[&nr(libc::SYS_read)], SYSF_FD0);
         assert_eq!(flags[&nr(libc::SYS_fdatasync)], SYSF_FD0);
         assert_eq!(flags[&nr(libc::SYS_connect)], SYSF_FD0 | SYSF_SOCKADDR);
+        assert_eq!(flags[&nr(libc::SYS_flock)], SYSF_FD0);
+        assert_eq!(flags[&nr(libc::SYS_fcntl)], SYSF_FD0);
         assert!(!flags.contains_key(&nr(libc::SYS_futex)));
         assert!(!flags.contains_key(&nr(libc::SYS_openat)));
+        assert!(!flags.contains_key(&nr(libc::SYS_io_uring_enter)));
     }
 
     #[test]

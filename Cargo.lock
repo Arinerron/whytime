@@ -425,6 +425,9 @@ dependencies = [
 [[package]]
 name = "whytime-testbins"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "windows-link"
@@ -450,6 +453,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "serde_json",
 ]
 

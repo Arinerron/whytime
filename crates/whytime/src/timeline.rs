@@ -249,7 +249,7 @@ impl Trace {
             run_ts
         };
         self.push_mixed(thread, &r.seg, block_ts);
-        let what = self.classifier.classify(hdr.tgid, &r.sys, r.block_state);
+        let what = self.classifier.classify(hdr.tgid, &r.sys, &r.detail, r.block_state);
         self.push_block(thread, block_ts, wake_ts, what, r.waker_tgid);
         self.push(thread, wake_ts, run_ts, SegKind::Runq);
     }
@@ -301,7 +301,7 @@ impl Trace {
                     let tgid = self.procs[proc].key.pid;
                     let what = self
                         .classifier
-                        .classify(tgid, &state.sys, state.block_state);
+                        .classify(tgid, &state.sys, &state.detail, state.block_state);
                     let wake = if state.state == ST_WOKEN {
                         state.wake_ts.clamp(state.block_ts, end.max(state.block_ts))
                     } else {

@@ -31,5 +31,16 @@ path = "src/bin/wt-futex.rs"
 name = "wt-tcp"
 path = "src/bin/wt-tcp.rs"
 
+[[bin]]
+name = "wt-syscalls"
+path = "src/bin/wt-syscalls.rs"
+
+[[bin]]
+name = "wt-flock"
+path = "src/bin/wt-flock.rs"
+
+[dependencies]
+libc = { workspace = true }
+
 [lints]
 workspace = true

@@ -276,6 +276,7 @@ fn label(line: &ReportLine) -> String {
         Class::Sleep => format!("timer sleep ({subject})"),
         Class::Fsync => at("fsync"),
         Class::File => at("file I/O"),
+        Class::Aio => format!("async I/O completion ({subject})"),
         Class::Net => match line.connections {
             Some(n) => format!(
                 "blocked on network: {subject} ({n} connection{})",
@@ -283,8 +284,9 @@ fn label(line: &ReportLine) -> String {
             ),
             None => format!("blocked on network: {subject}"),
         },
-        Class::Ipc => format!("pipe/socket wait ({subject})"),
+        Class::Ipc => format!("IPC wait ({subject})"),
         Class::Futex => format!("lock/futex wait ({subject})"),
+        Class::Lock => at("file lock wait"),
         Class::Poll => format!("poll/epoll wait ({subject})"),
         Class::Signal => format!("waiting for a signal ({subject})"),
         Class::Tty => format!("terminal/device I/O ({subject})"),
