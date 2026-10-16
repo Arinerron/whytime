@@ -9,7 +9,8 @@ from the attach until PID exits, `--duration` elapses or Ctrl-C.
 **Name.** The crate and binary are `whytime` (https://github.com/Arinerron/whytime): the
 `why` crate name is taken on crates.io. Use `whytime` everywhere in code, docs and output.
 
-**Status: v0.1.0, the first release.** Wrap mode and attach mode (`-p PID`), plus trace
+**Status: v0.1.1, a bug-fix release, the first on crates.io** (`whytime`, with its internal
+crates `whytime-abi` and `whytime-bpf`). Wrap mode and attach mode (`-p PID`), plus trace
 files for both: `--record FILE` saves a run and `whytime report FILE` replays it offline into
 the identical report. Network peers are named after the host the traced tree resolved
 (`example.com:443`). Every mode also takes the report options `--json`, `--timeline` (the
@@ -39,6 +40,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | Replay fixtures | `cargo xtask record-fixtures` (needs `sudo -n`) re-records the trace files and expected outputs in `crates/whytime/tests/fixtures/`; `WHYTIME_BLESS=1 cargo test -p whytime --test fixtures` rewrites the expected files from the existing traces |
 | End-to-end suite | `cargo xtask test-e2e` (needs passwordless `sudo -n`) |
 | aarch64 | `cargo check --target aarch64-unknown-linux-musl --workspace`; `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (static, linked by `rust-lld`; smoke with `qemu-aarch64 …/whytime --version`) |
+| glibc (`cargo install`) | `cargo check -p whytime --target x86_64-unknown-linux-gnu` (and `aarch64-unknown-linux-gnu`); `cargo package --locked -p whytime-abi -p whytime-bpf -p whytime --target x86_64-unknown-linux-gnu` (builds the three crates from their tarballs against a temporary local registry; not `--workspace`, which also packages xtask, whose `#[path]` cli.rs does not resolve from a tarball) |
 | Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` (stdout) |
 | Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`) |
 | Third-party notices | `cargo xtask licenses [FILE]` (default `$CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md`): the license texts of every crate in the binary's graph (both release targets) and of the vendored libbpf headers; fails if a dependency ships no license file |
@@ -67,17 +69,48 @@ first-party build dependencies (the BPF header generation), proc macros included
 license files found in each package's source directory, identical texts printed once.
 
 CI (`.github/workflows/ci.yml`): x86_64 build + unit tests + completions/man smoke +
-`cargo xtask licenses`, aarch64 check/build/qemu smoke, and `cargo xtask test-e2e` inside a
-virtme-ng VM. `release.yml`: a `v*` tag publishes
+`cargo xtask licenses` + glibc checks (x86_64 and aarch64 gnu: `cargo install` builds for
+the host target, and `.cargo/config.toml` is not in the package) + `cargo package` of the
+three published crates for x86_64 gnu, aarch64 check/build/qemu smoke, and
+`cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: a `v*` tag publishes
 `whytime-vX.Y.Z-{x86_64,aarch64}-linux-musl.tar.gz` (binary, `LICENSE`,
 `THIRD_PARTY_LICENSES.md`, `README.md`, `completions/`, `man/`) with a `.sha256` each; the
 README's install snippet depends on these names. Both check out with
 `submodules: recursive`; `.github/actions/setup` installs clang and the toolchain.
 
-Releasing: date the `CHANGELOG.md` section, push to main and wait for green CI, then
-`git tag -a vX.Y.Z -m 'whytime X.Y.Z' && git push origin vX.Y.Z`. Once `release.yml` has
-published, replace its generated notes with the CHANGELOG section plus an install snippet
-pinned to the tag: `gh release edit vX.Y.Z --title 'whytime X.Y.Z' --notes-file NOTES.md`.
+crates.io: `whytime-abi`, `whytime-bpf` and `whytime` are published; `whytime-testbins`
+and `xtask` are `publish = false`. The three move in lockstep: `whytime` and `whytime-bpf`
+pin the internal crates with `=X.Y.Z` in `[workspace.dependencies]`, so a newer
+`whytime-abi` never pairs with an older decoder. The tracekit entries carry both the
+submodule `path` (local builds) and the crates.io `version` (published manifests). Each
+published crate has a `LICENSE` symlink to the root one (cargo packs its contents);
+`whytime`'s readme is the root `README.md`, the two internal crates have their own short
+one. `whytime/tests/fixtures` (~230 KB) ships so that `cargo test` works from the package.
+
+Releasing:
+
+1. Bump `[workspace.package] version` and the `=X.Y.Z` pins of `whytime-abi` and
+   `whytime-bpf` in `[workspace.dependencies]` together, run `cargo update -w`, and commit
+   `Cargo.lock` with them (CI's `cargo xtask licenses` uses `cargo metadata --locked`, and
+   `cargo publish` refuses a dirty tree). Also bump the `bug_report.yml` version placeholder.
+2. Date the `CHANGELOG.md` section and update its link refs, push to main and wait for
+   green CI.
+3. `git tag -a vX.Y.Z -m 'whytime X.Y.Z' && git push origin vX.Y.Z`. Once `release.yml` has
+   published, replace its generated notes with the CHANGELOG section plus an install
+   snippet pinned to the tag: `gh release edit vX.Y.Z --title 'whytime X.Y.Z' --notes-file
+   NOTES.md`.
+4. From a clean checkout of the tag with the submodule initialized
+   (`git clone --recursive --branch vX.Y.Z …`): `cargo publish --workspace --locked --target
+   x86_64-unknown-linux-gnu --dry-run`, then the same without `--dry-run`. `--target` makes
+   the verify build use glibc (what `cargo install` users get) instead of the musl default.
+   Cargo publishes whytime-abi, whytime-bpf, whytime in order, waits for the index between
+   them, and skips the `publish = false` crates.
+
+Publishing is manual (a local crates.io token). A future `release.yml` job could do step 4
+with crates.io Trusted Publishing (`rust-lang/crates-io-auth-action`, `id-token: write`)
+once all three crates exist on crates.io and each has the repository and workflow
+configured as a trusted publisher.
+
 In the e2e VM (Ubuntu runner rootfs, no systemd), `dns-varlink` is a SKIP: there is no
 systemd-resolved.
 
@@ -90,8 +123,8 @@ tracekit block (`clippy::all` + `pedantic`) in the root `Cargo.toml`.
 ## Layout
 
 ```
-Cargo.toml                 workspace (excludes tracekit/), shared deps, lint block, release
-                           profile (lto, strip, abort)
+Cargo.toml                 workspace (excludes tracekit/), version + lockstep `=` pins, shared
+                           deps, lint block, release profile (lto, strip, abort)
 .cargo/config.toml         default target x86_64 musl, aarch64 linker rust-lld, `xtask` alias
 rust-toolchain.toml        stable + both musl targets
 crates/whytime-abi/        src/lib.rs: wire! records + wire_consts! shared with C; feature
@@ -174,6 +207,11 @@ build and commit the new gitlink.
    panic, as `vmlinux_min.h` declares `pt_regs` for x86 (`di`, `si`, `dx`) and arm64
    (`pt_regs.orig_x0` via libbpf's `pt_regs___arm64`, then `user_pt_regs.regs[]`) only;
 3. `src/lib.rs` embeds both with `aya::include_bytes_aligned!` (`OBJECT`, `STACKS_OBJECT`).
+
+Under docs.rs (`DOCS_RS` set) step 2 is skipped: build.rs writes empty placeholder objects
+(the objects are embedded, not documented), so docs build without clang and on any arch.
+`[package.metadata.docs.rs]` limits both library crates to `x86_64-unknown-linux-gnu`
+(whytime-abi with `std`, so `header()` is documented).
 
 To change a record: edit `crates/whytime-abi/src/lib.rs` only; the C side picks the new
 layout up through the generated header (a mismatch is a clang error), then update the C code

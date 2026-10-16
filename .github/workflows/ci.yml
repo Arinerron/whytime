@@ -42,7 +42,9 @@ jobs:
           cargo check --locked -p whytime --target aarch64-unknown-linux-gnu
       - name: Package the crates.io crates and build them from the tarballs
         # Verifies against a temporary local registry holding the workspace's own crates.
-        run: cargo package --locked --workspace --target x86_64-unknown-linux-gnu
+        # Not --workspace: that also packages the publish = false crates, and xtask's
+        # #[path] include of cli.rs does not resolve from its tarball.
+        run: cargo package --locked -p whytime-abi -p whytime-bpf -p whytime --target x86_64-unknown-linux-gnu
 
   aarch64:
     name: aarch64 check, build and qemu smoke

@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Arinerron/whytime/actions/workflows/ci.yml/badge.svg)](https://github.com/Arinerron/whytime/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Arinerron/whytime?sort=semver)](https://github.com/Arinerron/whytime/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/whytime)](https://crates.io/crates/whytime)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 `time` tells you how long a command took; whytime tells you where that wall-clock time went.
@@ -76,7 +77,7 @@ it), `README.md`, `completions/` and `man/`:
 
 ```sh
 tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/Arinerron/whytime/releases/latest)
-tag=${tag##*/}                                   # e.g. v0.1.0
+tag=${tag##*/}                                   # e.g. v0.1.1
 name=whytime-$tag-$(uname -m)-linux-musl         # x86_64 or aarch64
 curl -fsSLO "https://github.com/Arinerron/whytime/releases/download/$tag/$name.tar.gz"
 curl -fsSLO "https://github.com/Arinerron/whytime/releases/download/$tag/$name.tar.gz.sha256"
@@ -84,6 +85,21 @@ sha256sum -c "$name.tar.gz.sha256"
 tar -xzf "$name.tar.gz"
 sudo install -m 755 "$name/whytime" /usr/local/bin/whytime
 ```
+
+### From crates.io
+
+```sh
+cargo install --locked whytime
+```
+
+This compiles whytime and its BPF objects on your machine, so it needs clang with the BPF
+target (`clang -print-targets | grep bpf`; override with `CLANG=`) and Rust 1.94 or newer.
+`--locked` uses the dependency versions whytime was released with. The result is a
+dynamically linked glibc binary in `~/.cargo/bin` (the release tarballs are static musl).
+`sudo whytime` usually reports "command not found", because sudo's `secure_path` does not
+include `~/.cargo/bin`: run `sudo "$(command -v whytime)" -- COMMAND`, or grant the
+capabilities to the binary instead (`sudo setcap cap_bpf,cap_perfmon+ep ~/.cargo/bin/whytime`,
+see below).
 
 ### Privileges
 
@@ -541,7 +557,8 @@ sudo install target/x86_64-unknown-linux-musl/release/whytime /usr/local/bin/
 cargo xtask man target/man          # whytime.1, whytime-report.1, whytime-doctor.1, ...
 ```
 
-The binary is static (musl). For aarch64:
+A build from the repository is static (musl, like the release tarballs): `.cargo/config.toml`
+makes x86_64 musl the default target. For aarch64:
 `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (linked with the
 toolchain's `rust-lld`; no cross compiler). Cloned without `--recursive`? Run
 `git submodule update --init`: the shared [tracekit](https://github.com/Arinerron/tracekit)

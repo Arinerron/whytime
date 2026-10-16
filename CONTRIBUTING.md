@@ -25,7 +25,10 @@ issues go through the private process in [SECURITY.md](SECURITY.md), not public 
 - Rust stable through [rustup](https://rustup.rs). `rust-toolchain.toml` pins the channel
   and installs the `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` targets
   automatically; no nightly and no `bpf-linker` are needed. The minimum supported Rust
-  version is in the root `Cargo.toml` (`rust-version`).
+  version is 1.94 (`rust-version` in the root `Cargo.toml`; the tracekit crates require it
+  too): `cargo install whytime` refuses older toolchains, so do not use newer language or
+  library features without raising it. clang is needed at build time in every case,
+  including `cargo install` from crates.io.
 - Passwordless `sudo` (`sudo -n true` succeeds) to run the end-to-end suite, which loads
   BPF programs and sets file capabilities.
 
@@ -56,6 +59,7 @@ is static and lands under `target/x86_64-unknown-linux-musl/`.
 | Re-record the replay fixtures | `cargo xtask record-fixtures` (needs `sudo -n`) |
 | End-to-end suite | `cargo xtask test-e2e` |
 | aarch64 | `cargo build --release -p whytime --target aarch64-unknown-linux-musl` |
+| glibc targets (what `cargo install` builds) | `cargo check -p whytime --target x86_64-unknown-linux-gnu` (and `aarch64-unknown-linux-gnu`); `cargo package -p whytime-abi -p whytime-bpf -p whytime --target x86_64-unknown-linux-gnu` builds the crates.io tarballs |
 | Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`, or `target/man`) |
 | Third-party notices | `cargo xtask licenses [FILE]` (default `$CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md`, or `target/...`; shipped in release tarballs) |
 | Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` |

@@ -40,7 +40,7 @@ body:
     attributes:
       label: whytime version
       description: Output of `whytime --version`.
-      placeholder: whytime 0.1.0
+      placeholder: whytime 0.1.1
     validations:
       required: true
   - type: input
