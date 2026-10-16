@@ -52,10 +52,12 @@ is static and lands under `target/x86_64-unknown-linux-musl/`.
 |---|---|
 | Debug build | `cargo build` |
 | Release binary | `cargo build --release -p whytime` |
-| Unit tests | `cargo test --workspace` |
+| Unit tests (no root; includes the replay fixtures) | `cargo test --workspace` |
+| Re-record the replay fixtures | `cargo xtask record-fixtures` (needs `sudo -n`) |
 | End-to-end suite | `cargo xtask test-e2e` |
 | aarch64 | `cargo build --release -p whytime --target aarch64-unknown-linux-musl` |
-| Man pages | `cargo xtask man [DIR]` |
+| Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`, or `target/man`) |
+| Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` |
 | Debug logging | `WHYTIME_LOG=debug whytime ...` (includes the verifier log on load failures) |
 
 If your `/tmp` is small or a tmpfs with a quota, point cargo's scratch and target
@@ -98,10 +100,11 @@ before sharing one publicly. Also include the full `whytime doctor` output, your
 - **Documentation.** Every item (functions, types, fields, constants, modules) gets a doc
   comment that says what it is for and any invariant the caller must know. Comments explain
   why, not what.
-- **Lints.** The root `Cargo.toml` has the workspace lint block (`clippy::all` and
-  `clippy::pedantic` as warnings, with a few documented allowances). New code should be
-  clean under `cargo clippy --workspace --all-targets`; do not add blanket `allow`s.
-  Format with `cargo fmt`.
+- **Lints and formatting.** The root `Cargo.toml` has the workspace lint block
+  (`clippy::all` and `clippy::pedantic` as warnings, with a few documented allowances); do
+  not add blanket `allow`s. The tree is not formatted with `rustfmt`: do not run `cargo fmt`
+  over it, match the style of the surrounding code, and keep reformatting of unrelated code
+  out of your change.
 - **Record ABI.** Records shared by the BPF programs and user space are declared once in
   `crates/whytime-abi`. Change a record only there: the C header is generated from it at
   build time, so a mismatch between the Rust and C sides is a compile error. Append new
@@ -120,9 +123,10 @@ before sharing one publicly. Also include the full `whytime doctor` output, your
 ## Adding an end-to-end scenario
 
 1. If no existing workload fits, add a small program to `crates/whytime-testbins/src/bin/`
-   (named `wt-<something>`) and a matching `[[bin]]` entry in its `Cargo.toml`. Workloads
-   must be deterministic, take their durations as arguments, and must not print JSON to
-   stderr (the harness finds the report by its schema prefix there).
+   (named `wt-<something>`), a matching `[[bin]]` entry in its `Cargo.toml`, and its name
+   to the list of binaries xtask expects after the build. Workloads must be deterministic,
+   take their durations as arguments, and must not print JSON to stderr (the harness finds
+   the report by its schema prefix there).
 2. Add a `(name, command, check)` entry to the scenario list in `xtask/src/main.rs`, using
    the existing helpers to run whytime under `sudo -n` and a `check_*` function that parses
    the report and asserts on class shares and subjects. Prefer thresholds with margin over

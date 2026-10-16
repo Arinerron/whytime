@@ -9,12 +9,15 @@ from the attach until PID exits, `--duration` elapses or Ctrl-C.
 **Name.** The crate and binary are `whytime` (https://github.com/Arinerron/whytime): the
 `why` crate name is taken on crates.io. Use `whytime` everywhere in code, docs and output.
 
-**Status: MVP.** Wrap mode and attach mode (`-p PID`), plus trace files for both:
-`--record FILE` saves a run and `whytime report FILE` replays it offline into the identical
-report. Network peers are named after the host the traced tree resolved (`example.com:443`).
-Every mode also takes the report options `--json`, `--timeline` (the window in slices),
-`--perfetto FILE` (a Chrome Trace Event file of every thread and the critical path) and
-`--flamegraph FILE` / `--folded FILE` (the critical path as a wall-clock flamegraph).
+**Status: v0.1.0, the first release.** Wrap mode and attach mode (`-p PID`), plus trace
+files for both: `--record FILE` saves a run and `whytime report FILE` replays it offline into
+the identical report. Network peers are named after the host the traced tree resolved
+(`example.com:443`). Every mode also takes the report options `--json`, `--timeline` (the
+window in slices), `--perfetto FILE` (a Chrome Trace Event file of every thread and the
+critical path) and `--flamegraph FILE` / `--folded FILE` (the critical path as a wall-clock
+flamegraph). `whytime doctor` checks the system; `whytime completions SHELL` prints
+completion scripts. User-facing docs: `README.md`; release notes: `CHANGELOG.md` (Keep a
+Changelog; add user-visible changes under `[Unreleased]`).
 
 ## Commands
 
@@ -32,7 +35,8 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 |---|---|
 | Build (debug) | `cargo build` (default member: `whytime`) |
 | Release binary | `cargo build --release -p whytime` → `$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime` (static) |
-| Unit tests | `cargo test --workspace` |
+| Unit tests | `cargo test --workspace` (no root; includes the replay fixtures, see Unit tests) |
+| Replay fixtures | `cargo xtask record-fixtures` (needs `sudo -n`) re-records the trace files and expected outputs in `crates/whytime/tests/fixtures/`; `WHYTIME_BLESS=1 cargo test -p whytime --test fixtures` rewrites the expected files from the existing traces |
 | End-to-end suite | `cargo xtask test-e2e` (needs passwordless `sudo -n`) |
 | aarch64 | `cargo check --target aarch64-unknown-linux-musl --workspace`; `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (static, linked by `rust-lld`; smoke with `qemu-aarch64 …/whytime --version`) |
 | Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` (stdout) |
@@ -56,9 +60,11 @@ License: MIT (`LICENSE`). The BPF object's `SEC("license")` string stays `Dual M
 verifier only lets GPL-compatible programs call GPL-only helpers (`bpf_probe_read_kernel`,
 `bpf_get_current_task_btf`, ...). Vendored libbpf headers are `LGPL-2.1 OR BSD-2-Clause`.
 
-CI (`.github/workflows/ci.yml`): x86_64 build + unit tests, aarch64 check/build/qemu smoke,
-and `cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: `v*` tags publish static
-x86_64/aarch64 tarballs with completions and man pages. Both check out with
+CI (`.github/workflows/ci.yml`): x86_64 build + unit tests + completions/man smoke, aarch64
+check/build/qemu smoke, and `cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: a
+`v*` tag publishes `whytime-vX.Y.Z-{x86_64,aarch64}-linux-musl.tar.gz` (binary, `LICENSE`,
+`README.md`, `completions/`, `man/`) with a `.sha256` each and generated release notes; the
+README's install snippet depends on these names. Both check out with
 `submodules: recursive`; `.github/actions/setup` installs clang and the toolchain.
 
 `crates/whytime/src/cli.rs` is also compiled into xtask (`#[path]`, for `cargo xtask man`):
@@ -72,9 +78,12 @@ tracekit block (`clippy::all` + `pedantic`) in the root `Cargo.toml`.
 ```
 Cargo.toml                 workspace (excludes tracekit/), shared deps, lint block, release
                            profile (lto, strip, abort)
-crates/whytime-abi/        wire! records + wire_consts! shared with C; feature std → header(),
-                           feature user → aya::Pod impls
-crates/whytime-bpf/        build.rs + bpf/ ; exports OBJECT, STACKS_OBJECT (the two .o) and ABI_HASH
+.cargo/config.toml         default target x86_64 musl, aarch64 linker rust-lld, `xtask` alias
+rust-toolchain.toml        stable + both musl targets
+crates/whytime-abi/        src/lib.rs: wire! records + wire_consts! shared with C; feature
+                           std → header(), feature user → aya::Pod impls
+crates/whytime-bpf/        build.rs + bpf/ ; src/lib.rs exports OBJECT, STACKS_OBJECT (the two
+                           .o) and ABI_HASH
   bpf/whytime.bpf.c        the BPF programs (C CO-RE)
   bpf/vmlinux_min.h        hand-curated preserve_access_index subset of vmlinux.h (pt_regs per arch)
   bpf/include/bpf/         vendored libbpf v1.8.0 headers
@@ -108,13 +117,21 @@ crates/whytime/            the binary
   src/doctor.rs            bpfdoctor Tool, probe.sched / syscalls / dns / readiness / faults /
                            stacks, kernel.kallsyms checks
   src/logger.rs            tiny stderr logger (WHYTIME_LOG)
-crates/whytime-testbins/   e2e workloads: wt-sleep, wt-burn, wt-fsync, wt-child, wt-futex, wt-tcp,
-                           wt-attach, wt-threads, wt-vfork, wt-flock, wt-syscalls, wt-poll,
-                           wt-fault, wt-fifo, wt-dns (DNS client and the suite's DNS server),
-                           wt-flame
-xtask/                     cargo xtask test-e2e | man [DIR]
-.github/                   workflows ci.yml, release.yml; actions/setup (clang, rustup)
+  tests/fixtures.rs        replay fixtures: each recorded trace must still replay to its
+                           expected report (and folded / Perfetto output)
+  tests/fixtures/          NAME.wt + NAME.report.json [+ NAME.folded, NAME.perfetto.json]
+crates/whytime-testbins/   e2e workloads (src/bin/): wt-sleep, wt-burn, wt-fsync, wt-child,
+                           wt-futex, wt-tcp, wt-attach, wt-threads, wt-vfork, wt-flock,
+                           wt-syscalls, wt-poll, wt-fault, wt-fifo, wt-dns (DNS client and the
+                           suite's DNS server), wt-flame; src/lib.rs: argument and timing helpers
+xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR]
+.github/                   workflows ci.yml, release.yml; actions/setup (clang, rustup);
+                           ISSUE_TEMPLATE (bug, feature forms), pull_request_template.md,
+                           dependabot.yml
 tracekit/                  git submodule, Arinerron/tracekit pinned at a release tag (v0.1.0)
+README.md                  user documentation (install, usage, report, limits)
+CHANGELOG.md               release notes (Keep a Changelog)
+CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md   contributor and security policy
 LICENSE                    MIT
 ```
 
@@ -138,8 +155,8 @@ build and commit the new gitlink.
    with `-DWHYTIME_STACKS`, `whytime_stacks.bpf.o` (stack capture: the stack maps, stacks
    at blocks in `on_switch`, the `on_sample` sampler; ~172 KB against ~153 KB). Plain runs
    create no stack map and attach no sampler, so nothing about stack capture can keep them
-   from loading (`kernel.perf_event_max_stack` below 127 made the old single object fail
-   with EINVAL even without the flags). Arch from `CARGO_CFG_TARGET_ARCH`; other arches
+   from loading (a STACK_TRACE map deeper than `kernel.perf_event_max_stack` fails to create
+   with EINVAL, flags or not). Arch from `CARGO_CFG_TARGET_ARCH`; other arches
    panic, as `vmlinux_min.h` declares `pt_regs` for x86 (`di`, `si`, `dx`) and arm64
    (`pt_regs.orig_x0` via libbpf's `pt_regs___arm64`, then `user_pt_regs.regs[]`) only;
 3. `src/lib.rs` embeds both with `aya::include_bytes_aligned!` (`OBJECT`, `STACKS_OBJECT`).
@@ -173,7 +190,7 @@ flowchart LR
   TS -- final sweep --> TL
   TL --> AT[attribute.rs: critical path] --> RP[report.rs → stderr]
   AT & TL --> PF[perfetto.rs → --perfetto FILE]
-  SM -. stacks.rs: flip generations, normalize, symbolize .-> FL[flame.rs → folded / svg.rs]
+  SM -.->|"stacks.rs: flip generations, normalize, symbolize"| FL[flame.rs → folded / svg.rs]
   AT -. spans .-> FL
 ```
 
@@ -878,11 +895,11 @@ Measured (7.2.6, x86-64, other agents' load around 10 on 22 cores; CPU and wall 
 |---|---|---|
 | untraced | 1.42 s | — |
 | traced, describing at every `sys_enter` (before lazy description) | 2.84 s | ~238 ns |
-| traced, lazy description at block time (now) | 1.99 s | ~95 ns |
+| traced, lazy description at block time | 1.99 s | ~95 ns |
 | traced, `sys_enter`/`sys_exit` programs that only `return 0` (floor) | 1.70 s | ~46 ns |
-| traced, `on_sys_exit_dns` (feat/dns, now; best of 3 and of 5 at load 13–19) | 2.04–2.09 s (untraced 1.45–1.55 s) | ~82–107 ns |
+| traced, `on_sys_exit_dns` (the shipped `sys_exit`; best of 3 and of 5 at load 13–19) | 2.04–2.09 s (untraced 1.45–1.55 s) | ~82–107 ns |
 
-So the syscall programs themselves now cost ~50 ns per syscall (two hash lookups, three
+So the syscall programs themselves cost ~50 ns per syscall (two hash lookups, three
 argument loads, a few stores); the rest is the `raw_syscalls` tracepoint machinery, which
 puts every task on the system on the syscall slow path while whytime runs. The `overhead`
 e2e scenario guards this (`wt-syscalls`: 1.4–1.8× on-CPU time traced vs untraced, limit
@@ -894,7 +911,7 @@ socket open): within the noise above, and the `overhead` scenario measured 1.77 
 
 Flamegraphs (wall of the whole run, best of 3 interleaved, load ~17–21 on 22 cores; whytime's
 load, verification, kallsyms read and symbolization included, so the ratios are higher than
-the `overhead` scenario's command-only CPU; `a64ea64` = the release before flamegraphs):
+the `overhead` scenario's command-only CPU; `a64ea64` = the commit before flamegraphs):
 
 | Workload | untraced | `a64ea64` traced | traced | traced `--folded` |
 |---|---|---|---|---|
@@ -925,9 +942,10 @@ Targets (not benchmarked unless noted):
 - `pollwake`/`ep_poll_callback`: a few probe reads and one `tasks` lookup per wakeup callback
   system-wide (they fire for every poll/epoll wakeup, tracked or not).
 - `handle_mm_fault` entry/exit: one `tasks` lookup per page fault system-wide.
-- Ring traffic: one 592-byte record per block cycle of a tracked thread; CPU-bound threads
-  emit nothing (on-CPU accumulates in kernel). Measured with 424-byte records (before
-  feat/wake): a pipe ping-pong (~200 k episodes in 1.8 s) loses none with the 4 MiB ring.
+- Ring traffic: one 624-byte EPISODE record per block cycle of a tracked thread; CPU-bound
+  threads emit nothing (on-CPU accumulates in kernel). Measured with 424-byte records (an
+  earlier layout): a pipe ping-pong (~200 k episodes in 1.8 s) loses none with the 4 MiB
+  ring.
 - After the window (user space, once): naming, holders, parallelism and the timeline are
   linear in segments and spans. Measured on a 24 MB trace (`dd bs=4k count=3000000 | cat`,
   8.7 s, ~110 k segments), best of 3: `whytime report` 0.29 s, with `--timeline` 0.29 s,
@@ -1108,8 +1126,6 @@ Flamegraph scenarios (files in `$WORK/flame`, cleared per run):
   entries with `new_task()` (copies the `task_zero` template), move them map-to-map.
 - x86-64 runs interrupts taken in user mode, and the softirqs at their exit, on the task's own
   stack: stack-pointer tests cannot tell interrupt context; read preempt_count.
-- Anonymous inodes (eventfd, timerfd, signalfd, inotify, epoll, pidfd) have
-  `i_mode & S_IFMT == 0` on 7.2.
 - `/tmp` is `nosuid` here: file capabilities on a binary there are ignored.
 - Under sudo, `sh -c '... of=~/x'` does not expand `~` after `of=` (POSIX `sh`); use `$HOME`.
 - `dash` (CI's `/bin/sh`) prints `Terminated` on stderr when `wait` reaps a killed job;
