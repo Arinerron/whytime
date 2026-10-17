@@ -2,234 +2,265 @@
   "schema": "whytime.report/1",
   "command": [
     "/var/tmp/whytime-fixtures/bin/wt-poll",
-    "127.0.0.1:33593",
+    "127.0.0.1:37041",
     "4"
   ],
-  "wall_ns": 1202759428,
+  "wall_ns": 1204013110,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 1525705,
+    "cpu_ns": 1686365,
     "processes": 1,
-    "factor": 0.0012685038790649994
+    "factor": 0.0014006201311213297
   },
   "lines": [
     {
       "class": "net",
-      "share": 0.9986093985538063,
-      "ns": 1201086869,
-      "subject": "127.0.0.1:33593",
+      "share": 0.9978953518205462,
+      "ns": 1201479086,
+      "subject": "127.0.0.1:37041",
       "connections": 4
     },
     {
       "class": "cpu",
-      "share": 0.0012685038790649994,
-      "ns": 1525705,
+      "share": 0.0014006201311213297,
+      "ns": 1686365,
       "subject": "wt-poll"
     },
     {
       "class": "runqueue",
-      "share": 0.00012209756712877747,
-      "ns": 146854,
+      "share": 0.00043663893327540264,
+      "ns": 525719,
       "subject": "wt-poll",
       "held_by": [
         {
-          "comm": "sway",
-          "tgid": 15353,
-          "ns": 94059
+          "comm": "xtask",
+          "tgid": 4051864,
+          "ns": 219382
+        },
+        {
+          "comm": "gunicorn",
+          "tgid": 3575107,
+          "ns": 199024
+        },
+        {
+          "comm": "migration/10",
+          "tgid": 50,
+          "ns": 32545
         },
         {
           "comm": "idle",
           "tgid": 0,
-          "ns": 52795
+          "ns": 30884
+        },
+        {
+          "comm": "HeapHelper",
+          "tgid": 1144108,
+          "ns": 22761
+        },
+        {
+          "comm": "HeapHelper",
+          "tgid": 2908906,
+          "ns": 21123
         }
       ]
+    },
+    {
+      "class": "fault",
+      "share": 0.00026738911505706114,
+      "ns": 321940,
+      "subject": "/var/tmp/whytime-fixtures/bin"
     }
   ],
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 120275942,
+      "end_ns": 120401311,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120005311
+          "subject": "127.0.0.1:37041",
+          "ns": 119280492
         },
         {
           "class": "cpu",
           "subject": "wt-poll",
-          "ns": 270631
-        }
-      ]
-    },
-    {
-      "start_ns": 120275942,
-      "end_ns": 240551885,
-      "lines": [
-        {
-          "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120275943
-        }
-      ]
-    },
-    {
-      "start_ns": 240551885,
-      "end_ns": 360827828,
-      "lines": [
-        {
-          "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 119928902
+          "ns": 614651
         },
         {
-          "class": "cpu",
-          "subject": "wt-poll",
-          "ns": 337259
+          "class": "fault",
+          "subject": "/var/tmp/whytime-fixtures/bin",
+          "ns": 253476
         },
         {
           "class": "runqueue",
           "subject": "wt-poll",
-          "ns": 9782
+          "ns": 252692
         }
       ]
     },
     {
-      "start_ns": 360827828,
-      "end_ns": 481103771,
+      "start_ns": 120401311,
+      "end_ns": 240802622,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120275943
+          "subject": "127.0.0.1:37041",
+          "ns": 120401311
         }
       ]
     },
     {
-      "start_ns": 481103771,
-      "end_ns": 601379714,
+      "start_ns": 240802622,
+      "end_ns": 361203933,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120092325
+          "subject": "127.0.0.1:37041",
+          "ns": 119938455
         },
         {
           "class": "cpu",
           "subject": "wt-poll",
-          "ns": 166956
+          "ns": 269156
         },
         {
           "class": "runqueue",
           "subject": "wt-poll",
-          "ns": 16662
+          "ns": 193700
         }
       ]
     },
     {
-      "start_ns": 601379714,
-      "end_ns": 721655656,
+      "start_ns": 361203933,
+      "end_ns": 481605244,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 119953052
+          "subject": "127.0.0.1:37041",
+          "ns": 120401311
+        }
+      ]
+    },
+    {
+      "start_ns": 481605244,
+      "end_ns": 602006555,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:37041",
+          "ns": 120401311
+        }
+      ]
+    },
+    {
+      "start_ns": 602006555,
+      "end_ns": 722407866,
+      "lines": [
+        {
+          "class": "net",
+          "subject": "127.0.0.1:37041",
+          "ns": 120113033
         },
         {
           "class": "cpu",
           "subject": "wt-poll",
-          "ns": 228831
+          "ns": 274027
         },
         {
           "class": "runqueue",
           "subject": "wt-poll",
-          "ns": 94059
+          "ns": 14251
         }
       ]
     },
     {
-      "start_ns": 721655656,
-      "end_ns": 841931599,
+      "start_ns": 722407866,
+      "end_ns": 842809177,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120275943
+          "subject": "127.0.0.1:37041",
+          "ns": 120401311
         }
       ]
     },
     {
-      "start_ns": 841931599,
-      "end_ns": 962207542,
+      "start_ns": 842809177,
+      "end_ns": 963210488,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 119930734
+          "subject": "127.0.0.1:37041",
+          "ns": 120177710
         },
         {
           "class": "cpu",
           "subject": "wt-poll",
-          "ns": 331986
+          "ns": 215184
         },
         {
           "class": "runqueue",
           "subject": "wt-poll",
-          "ns": 13223
+          "ns": 8417
         }
       ]
     },
     {
-      "start_ns": 962207542,
-      "end_ns": 1082483485,
+      "start_ns": 963210488,
+      "end_ns": 1083611799,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120275943
+          "subject": "127.0.0.1:37041",
+          "ns": 120401311
         }
       ]
     },
     {
-      "start_ns": 1082483485,
-      "end_ns": 1202759428,
+      "start_ns": 1083611799,
+      "end_ns": 1204013110,
       "lines": [
         {
           "class": "net",
-          "subject": "127.0.0.1:33593",
-          "ns": 120072773
+          "subject": "127.0.0.1:37041",
+          "ns": 119962841
         },
         {
           "class": "cpu",
           "subject": "wt-poll",
-          "ns": 190042
+          "ns": 313347
+        },
+        {
+          "class": "fault",
+          "subject": "/var/tmp/whytime-fixtures/bin",
+          "ns": 68464
         },
         {
           "class": "runqueue",
           "subject": "wt-poll",
-          "ns": 13128
+          "ns": 56659
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 3979346,
-      "ppid": 3979329,
+      "pid": 4061368,
+      "ppid": 4061327,
       "comm": "wt-poll",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-poll",
-        "127.0.0.1:33593",
+        "127.0.0.1:37041",
         "4"
       ],
-      "cpu_ns": 1525705,
+      "cpu_ns": 1686365,
       "exit_code": 0,
       "critical": true
     }
   ],
   "quality": {
-    "events": 7,
+    "events": 12,
     "dropped": 0,
     "syscalls": true,
     "readiness": true,

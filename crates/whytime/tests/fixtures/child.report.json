@@ -4,224 +4,245 @@
     "/var/tmp/whytime-fixtures/bin/wt-child",
     "1000"
   ],
-  "wall_ns": 1001025030,
+  "wall_ns": 1002313083,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 998068466,
+    "cpu_ns": 930362291,
     "processes": 2,
-    "factor": 0.997046463463556
+    "factor": 0.9282152520800728
   },
   "lines": [
     {
       "class": "child",
-      "share": 0.9966371300425925,
-      "ns": 997658713,
+      "share": 0.92623233473248,
+      "ns": 928374787,
       "subject": "wt-burn"
     },
     {
       "class": "runqueue",
-      "share": 0.0027500890761942287,
-      "ns": 2752908,
+      "share": 0.07049154919591127,
+      "ns": 70654602,
       "subject": "wt-burn",
       "held_by": [
         {
-          "comm": "sway",
-          "tgid": 15353,
-          "ns": 2752908
+          "comm": "gunicorn",
+          "tgid": 3575094,
+          "ns": 70654602
         }
       ]
     },
     {
+      "class": "runqueue",
+      "share": 0.0014368963395043303,
+      "ns": 1440220,
+      "subject": "wt-child",
+      "held_by": [
+        {
+          "comm": "whytime",
+          "tgid": 4060722,
+          "ns": 1399250
+        },
+        {
+          "comm": "ctrl-c",
+          "tgid": 4060676,
+          "ns": 22229
+        },
+        {
+          "comm": "wt-child",
+          "tgid": 4060838,
+          "ns": 18741
+        }
+      ]
+    },
+    {
+      "class": "other",
+      "share": 0.001067802085149476,
+      "ns": 1070272,
+      "subject": "untraced"
+    },
+    {
       "class": "cpu",
-      "share": 0.0005277480424240741,
-      "ns": 528289,
+      "share": 0.0006671468339997713,
+      "ns": 668690,
       "subject": "wt-child"
     },
     {
       "class": "child",
-      "share": 0.00005021652655378657,
-      "ns": 50268,
+      "share": 0.00010427081295515724,
+      "ns": 104512,
       "subject": "wt-child"
-    },
-    {
-      "class": "runqueue",
-      "share": 0.00003481631223546928,
-      "ns": 34852,
-      "subject": "wt-child",
-      "held_by": [
-        {
-          "comm": "idle",
-          "tgid": 0,
-          "ns": 34852
-        }
-      ]
     }
   ],
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 100102503,
+      "end_ns": 100231308,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 99599047
+          "ns": 98150532
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-child",
+          "ns": 1417991
         },
         {
           "class": "cpu",
           "subject": "wt-child",
-          "ns": 431778
+          "ns": 558273
         },
         {
           "class": "child",
           "subject": "wt-child",
-          "ns": 50268
-        },
-        {
-          "class": "runqueue",
-          "subject": "wt-child",
-          "ns": 21410
+          "ns": 104512
         }
       ]
     },
     {
-      "start_ns": 100102503,
-      "end_ns": 200205006,
+      "start_ns": 100231308,
+      "end_ns": 200462616,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231308
         }
       ]
     },
     {
-      "start_ns": 200205006,
-      "end_ns": 300307509,
+      "start_ns": 200462616,
+      "end_ns": 300693924,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231308
         }
       ]
     },
     {
-      "start_ns": 300307509,
-      "end_ns": 400410012,
+      "start_ns": 300693924,
+      "end_ns": 400925233,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231309
         }
       ]
     },
     {
-      "start_ns": 400410012,
-      "end_ns": 500512515,
+      "start_ns": 400925233,
+      "end_ns": 501156541,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231308
         }
       ]
     },
     {
-      "start_ns": 500512515,
-      "end_ns": 600615018,
+      "start_ns": 501156541,
+      "end_ns": 601387849,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231308
         }
       ]
     },
     {
-      "start_ns": 600615018,
-      "end_ns": 700717521,
+      "start_ns": 601387849,
+      "end_ns": 701619158,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231309
         }
       ]
     },
     {
-      "start_ns": 700717521,
-      "end_ns": 800820024,
+      "start_ns": 701619158,
+      "end_ns": 801850466,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231308
         }
       ]
     },
     {
-      "start_ns": 800820024,
-      "end_ns": 900922527,
+      "start_ns": 801850466,
+      "end_ns": 902081774,
       "lines": [
         {
           "class": "child",
           "subject": "wt-burn",
-          "ns": 100102503
+          "ns": 100231308
         }
       ]
     },
     {
-      "start_ns": 900922527,
-      "end_ns": 1001025030,
+      "start_ns": 902081774,
+      "end_ns": 1002313083,
       "lines": [
-        {
-          "class": "child",
-          "subject": "wt-burn",
-          "ns": 97239642
-        },
         {
           "class": "runqueue",
           "subject": "wt-burn",
-          "ns": 2752908
+          "ns": 70654602
+        },
+        {
+          "class": "child",
+          "subject": "wt-burn",
+          "ns": 28373789
+        },
+        {
+          "class": "other",
+          "subject": "untraced",
+          "ns": 1070272
         },
         {
           "class": "cpu",
           "subject": "wt-child",
-          "ns": 96511
+          "ns": 110417
         },
         {
           "class": "runqueue",
           "subject": "wt-child",
-          "ns": 13442
+          "ns": 22229
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 3978971,
-      "ppid": 3978820,
+      "pid": 4060838,
+      "ppid": 4060722,
       "comm": "wt-child",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-child",
         "1000"
       ],
-      "cpu_ns": 528289,
+      "cpu_ns": 668690,
       "exit_code": 0,
       "critical": true
     },
     {
-      "pid": 3978972,
-      "ppid": 3978971,
+      "pid": 4060839,
+      "ppid": 4060838,
       "comm": "wt-burn",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-burn",
         "1000"
       ],
-      "cpu_ns": 997540177,
+      "cpu_ns": 929693601,
       "exit_code": 0,
       "critical": true
     }

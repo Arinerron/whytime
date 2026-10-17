@@ -5,201 +5,237 @@
     "4",
     "600"
   ],
-  "wall_ns": 600535340,
+  "wall_ns": 602825697,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 2396572879,
+    "cpu_ns": 2297733805,
     "processes": 1,
-    "factor": 3.990727471592263
+    "factor": 3.8116056041320348
   },
   "lines": [
     {
       "class": "cpu",
-      "share": 0.9996540603255755,
-      "ns": 600327591,
+      "share": 0.9510811447707744,
+      "ns": 573336154,
       "subject": "wt-threads"
     },
     {
       "class": "runqueue",
-      "share": 0.00030689617700100714,
-      "ns": 184302,
+      "share": 0.045846001817006155,
+      "ns": 27637148,
       "subject": "wt-threads",
       "held_by": [
         {
-          "comm": "watchmedo",
-          "tgid": 385545,
-          "ns": 157957
+          "comm": "stripe",
+          "tgid": 25749,
+          "ns": 20329340
+        },
+        {
+          "comm": "gunicorn",
+          "tgid": 3575094,
+          "ns": 7200729
         },
         {
           "comm": "idle",
           "tgid": 0,
-          "ns": 26345
+          "ns": 80516
+        },
+        {
+          "comm": "notify 13969696",
+          "tgid": 272257,
+          "ns": 26563
         }
       ]
     },
     {
       "class": "other",
-      "share": 0.00002144919564600478,
-      "ns": 12881,
-      "subject": "outside syscalls (page faults, kernel locks)"
+      "share": 0.002391361229579435,
+      "ns": 1441574,
+      "subject": "in munmap"
+    },
+    {
+      "class": "fault",
+      "share": 0.0006710563302347079,
+      "ns": 404530,
+      "subject": "/var/tmp/whytime-fixtures/bin"
     },
     {
       "class": "other",
-      "share": 0.00001759430177747741,
-      "ns": 10566,
-      "subject": "in munmap"
+      "share": 0.000010435852405276612,
+      "ns": 6291,
+      "subject": "outside syscalls (page faults, kernel locks)"
     }
   ],
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 60053534,
+      "end_ns": 60282569,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60024452
+          "ns": 59899947
+        },
+        {
+          "class": "fault",
+          "subject": "/var/tmp/whytime-fixtures/bin",
+          "ns": 326841
         },
         {
           "class": "runqueue",
           "subject": "wt-threads",
-          "ns": 16201
+          "ns": 49490
         },
         {
           "class": "other",
           "subject": "outside syscalls (page faults, kernel locks)",
-          "ns": 12881
+          "ns": 6291
         }
       ]
     },
     {
-      "start_ns": 60053534,
-      "end_ns": 120107068,
+      "start_ns": 60282569,
+      "end_ns": 120565139,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60053534
+          "ns": 60282570
         }
       ]
     },
     {
-      "start_ns": 120107068,
-      "end_ns": 180160602,
+      "start_ns": 120565139,
+      "end_ns": 180847709,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60053534
+          "ns": 60282570
         }
       ]
     },
     {
-      "start_ns": 180160602,
-      "end_ns": 240214136,
+      "start_ns": 180847709,
+      "end_ns": 241130278,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60053534
+          "ns": 60282569
         }
       ]
     },
     {
-      "start_ns": 240214136,
-      "end_ns": 300267670,
+      "start_ns": 241130278,
+      "end_ns": 301412848,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60053534
+          "ns": 60282570
         }
       ]
     },
     {
-      "start_ns": 300267670,
-      "end_ns": 360321204,
+      "start_ns": 301412848,
+      "end_ns": 361695418,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60053534
+          "ns": 60282570
         }
       ]
     },
     {
-      "start_ns": 360321204,
-      "end_ns": 420374738,
+      "start_ns": 361695418,
+      "end_ns": 421977987,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60053534
-        }
-      ]
-    },
-    {
-      "start_ns": 420374738,
-      "end_ns": 480428272,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60053534
-        }
-      ]
-    },
-    {
-      "start_ns": 480428272,
-      "end_ns": 540481806,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60053534
-        }
-      ]
-    },
-    {
-      "start_ns": 540481806,
-      "end_ns": 600535340,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 59874867
+          "ns": 39940763
         },
         {
           "class": "runqueue",
           "subject": "wt-threads",
-          "ns": 168101
+          "ns": 20329340
+        },
+        {
+          "class": "fault",
+          "subject": "/var/tmp/whytime-fixtures/bin",
+          "ns": 12466
+        }
+      ]
+    },
+    {
+      "start_ns": 421977987,
+      "end_ns": 482260557,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60282570
+        }
+      ]
+    },
+    {
+      "start_ns": 482260557,
+      "end_ns": 542543127,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60282570
+        }
+      ]
+    },
+    {
+      "start_ns": 542543127,
+      "end_ns": 602825697,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 51517455
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-threads",
+          "ns": 7258318
         },
         {
           "class": "other",
           "subject": "in munmap",
-          "ns": 10566
+          "ns": 1441574
+        },
+        {
+          "class": "fault",
+          "subject": "/var/tmp/whytime-fixtures/bin",
+          "ns": 65223
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 3979207,
-      "ppid": 3979138,
+      "pid": 4061084,
+      "ppid": 4061053,
       "comm": "wt-threads",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-threads",
         "4",
         "600"
       ],
-      "cpu_ns": 2396572879,
+      "cpu_ns": 2297733805,
       "exit_code": 0,
       "critical": true
     }
   ],
   "quality": {
-    "events": 14,
+    "events": 28,
     "dropped": 0,
     "syscalls": true,
     "readiness": true,

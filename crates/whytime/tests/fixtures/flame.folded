@@ -1,4 +1,7 @@
-on-CPU (wt-flame);wt-flame;[no sample] 41
-on-CPU (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>;wt_flame::main;wt_flame::burn_cpu_here 602029
-timer sleep (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>;wt_flame::main;wt_flame::sleep_here;sccp;entry_SYSCALL_64_after_hwframe_[k];do_syscall_64_[k];__x64_sys_clock_nanosleep_[k];common_nsleep_timens_[k];hrtimer_nanosleep_[k];do_nanosleep_[k];schedule_[k];__schedule_[k] 399963
-waiting for a CPU (wt-flame) — mostly python 98%;wt-flame;[runqueue] 1415
+on-CPU (wt-flame);wt-flame;[no sample] 78
+on-CPU (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>;wt_flame::main;wt_flame::burn_cpu_here 596544
+page faults on /var/tmp/whytime-fixtures/bin;wt-flame;[wt-flame];asm_exc_page_fault_[k];exc_page_fault_[k];do_user_addr_fault_[k];bpf_trampoline_6442554892_[k];handle_mm_fault_[k];__handle_mm_fault_[k];do_fault_[k];__do_fault_[k];filemap_fault_[k];folio_wait_bit_common_[k];io_schedule_[k];schedule_[k];__schedule_[k] 111
+page faults on /var/tmp/whytime-fixtures/bin;wt-flame;__libc_start_main;asm_exc_page_fault_[k];exc_page_fault_[k];do_user_addr_fault_[k];bpf_trampoline_6442554892_[k];handle_mm_fault_[k];__handle_mm_fault_[k];do_fault_[k];__do_fault_[k];filemap_fault_[k];folio_wait_bit_common_[k];io_schedule_[k];schedule_[k];__schedule_[k] 79
+page faults on /var/tmp/whytime-fixtures/bin;wt-flame;libc_start_main_stage2;std::sys::pal::unix::stack_overflow::imp::make_handler;asm_exc_page_fault_[k];exc_page_fault_[k];do_user_addr_fault_[k];bpf_trampoline_6442554892_[k];handle_mm_fault_[k];__handle_mm_fault_[k];do_fault_[k];__do_fault_[k];filemap_fault_[k];folio_wait_bit_common_[k];io_schedule_[k];schedule_[k];__schedule_[k] 71
+timer sleep (wt-flame);wt-flame;libc_start_main_stage2;main;std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>;wt_flame::main;wt_flame::sleep_here;sccp;entry_SYSCALL_64_after_hwframe_[k];do_syscall_64_[k];__x64_sys_clock_nanosleep_[k];common_nsleep_timens_[k];hrtimer_nanosleep_[k];do_nanosleep_[k];schedule_[k];__schedule_[k] 399951
+waiting for a CPU (wt-flame) — mostly node-V8Worker 83%;wt-flame;[runqueue] 4964
