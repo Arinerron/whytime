@@ -4,31 +4,31 @@
     "/var/tmp/whytime-fixtures/bin/wt-burn",
     "1000"
   ],
-  "wall_ns": 1000317517,
+  "wall_ns": 1000237306,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 999510564,
+    "cpu_ns": 997096122,
     "processes": 1,
-    "factor": 0.9991933031399669
+    "factor": 0.9968595612449592
   },
   "lines": [
     {
       "class": "cpu",
-      "share": 0.9991933031399669,
-      "ns": 999510564,
+      "share": 0.9968595612449592,
+      "ns": 997096122,
       "subject": "wt-burn"
     },
     {
       "class": "runqueue",
-      "share": 0.0008066968600330929,
-      "ns": 806953,
+      "share": 0.003140438755040796,
+      "ns": 3141184,
       "subject": "wt-burn",
       "held_by": [
         {
-          "comm": "migration/13",
-          "tgid": 64,
-          "ns": 806953
+          "comm": "llvm-worker-0",
+          "tgid": 3978105,
+          "ns": 3141184
         }
       ]
     }
@@ -36,130 +36,130 @@
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 100031751,
+      "end_ns": 100023730,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031751
+          "ns": 100023730
         }
       ]
     },
     {
-      "start_ns": 100031751,
-      "end_ns": 200063503,
+      "start_ns": 100023730,
+      "end_ns": 200047461,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031752
+          "ns": 100023731
         }
       ]
     },
     {
-      "start_ns": 200063503,
-      "end_ns": 300095255,
+      "start_ns": 200047461,
+      "end_ns": 300071191,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031752
+          "ns": 100023730
         }
       ]
     },
     {
-      "start_ns": 300095255,
-      "end_ns": 400127006,
+      "start_ns": 300071191,
+      "end_ns": 400094922,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031751
+          "ns": 100023731
         }
       ]
     },
     {
-      "start_ns": 400127006,
-      "end_ns": 500158758,
+      "start_ns": 400094922,
+      "end_ns": 500118653,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031752
+          "ns": 100023731
         }
       ]
     },
     {
-      "start_ns": 500158758,
-      "end_ns": 600190510,
+      "start_ns": 500118653,
+      "end_ns": 600142383,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031752
+          "ns": 100023730
         }
       ]
     },
     {
-      "start_ns": 600190510,
-      "end_ns": 700222261,
+      "start_ns": 600142383,
+      "end_ns": 700166114,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031751
+          "ns": 100023731
         }
       ]
     },
     {
-      "start_ns": 700222261,
-      "end_ns": 800254013,
+      "start_ns": 700166114,
+      "end_ns": 800189844,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031752
+          "ns": 100023730
         }
       ]
     },
     {
-      "start_ns": 800254013,
-      "end_ns": 900285765,
+      "start_ns": 800189844,
+      "end_ns": 900213575,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 100031752
+          "ns": 100023731
         }
       ]
     },
     {
-      "start_ns": 900285765,
-      "end_ns": 1000317517,
+      "start_ns": 900213575,
+      "end_ns": 1000237306,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-burn",
-          "ns": 99224799
+          "ns": 96882547
         },
         {
           "class": "runqueue",
           "subject": "wt-burn",
-          "ns": 806953
+          "ns": 3141184
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 2849946,
-      "ppid": 2849884,
+      "pid": 3978687,
+      "ppid": 3978683,
       "comm": "wt-burn",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-burn",
         "1000"
       ],
-      "cpu_ns": 999510564,
+      "cpu_ns": 997096122,
       "exit_code": 0,
       "critical": true
     }

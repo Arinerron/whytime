@@ -5,49 +5,64 @@
     "udp",
     "127.0.0.153:53",
     "slow.whytime.test",
-    "43279",
+    "33593",
     "3"
   ],
-  "wall_ns": 901889029,
+  "wall_ns": 902312324,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 1023199,
+    "cpu_ns": 959804,
     "processes": 1,
-    "factor": 0.0011345065380543619
+    "factor": 0.0010637159378973527
   },
   "lines": [
     {
       "class": "net",
-      "share": 0.9987662816996081,
-      "ns": 900776352,
-      "subject": "slow.whytime.test:43279",
+      "share": 0.9985972395961645,
+      "ns": 901046596,
+      "subject": "slow.whytime.test:33593",
       "connections": 3,
-      "addr": "127.0.0.1:43279"
+      "addr": "127.0.0.1:33593"
     },
     {
       "class": "cpu",
-      "share": 0.0011345065380543619,
-      "ns": 1023199,
+      "share": 0.0010637159378973527,
+      "ns": 959804,
       "subject": "wt-dns"
     },
     {
       "class": "runqueue",
-      "share": 0.000053929029443820854,
-      "ns": 48638,
+      "share": 0.0002906521312236892,
+      "ns": 262259,
       "subject": "wt-dns",
       "held_by": [
         {
+          "comm": "xtask",
+          "tgid": 3974925,
+          "ns": 176064
+        },
+        {
           "comm": "idle",
           "tgid": 0,
-          "ns": 48638
+          "ns": 36494
+        },
+        {
+          "comm": "whytime",
+          "tgid": 3979435,
+          "ns": 25990
+        },
+        {
+          "comm": "migration/0",
+          "tgid": 20,
+          "ns": 23711
         }
       ]
     },
     {
       "class": "net",
-      "share": 0.000045282732893738303,
-      "ns": 40840,
+      "share": 0.000048392334714470774,
+      "ns": 43665,
       "subject": "unconnected socket",
       "connections": 1
     }
@@ -55,174 +70,174 @@
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 90188902,
+      "end_ns": 90231232,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 89648775
+          "subject": "slow.whytime.test:33593",
+          "ns": 89858058
         },
         {
           "class": "cpu",
           "subject": "wt-dns",
-          "ns": 489111
+          "ns": 323613
         },
         {
           "class": "net",
           "subject": "unconnected socket",
-          "ns": 40840
+          "ns": 43665
         },
         {
           "class": "runqueue",
           "subject": "wt-dns",
-          "ns": 10176
+          "ns": 5896
         }
       ]
     },
     {
-      "start_ns": 90188902,
-      "end_ns": 180377805,
+      "start_ns": 90231232,
+      "end_ns": 180462464,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90188903
+          "subject": "slow.whytime.test:33593",
+          "ns": 90231232
         }
       ]
     },
     {
-      "start_ns": 180377805,
-      "end_ns": 270566708,
+      "start_ns": 180462464,
+      "end_ns": 270693697,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90188903
+          "subject": "slow.whytime.test:33593",
+          "ns": 90231233
         }
       ]
     },
     {
-      "start_ns": 270566708,
-      "end_ns": 360755611,
+      "start_ns": 270693697,
+      "end_ns": 360924929,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90006104
+          "subject": "slow.whytime.test:33593",
+          "ns": 89993221
         },
         {
           "class": "cpu",
           "subject": "wt-dns",
-          "ns": 172311
+          "ns": 219305
         },
         {
           "class": "runqueue",
           "subject": "wt-dns",
-          "ns": 10488
+          "ns": 18706
         }
       ]
     },
     {
-      "start_ns": 360755611,
-      "end_ns": 450944514,
+      "start_ns": 360924929,
+      "end_ns": 451156162,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90188903
+          "subject": "slow.whytime.test:33593",
+          "ns": 90231233
         }
       ]
     },
     {
-      "start_ns": 450944514,
-      "end_ns": 541133417,
+      "start_ns": 451156162,
+      "end_ns": 541387394,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90188903
+          "subject": "slow.whytime.test:33593",
+          "ns": 90231232
         }
       ]
     },
     {
-      "start_ns": 541133417,
-      "end_ns": 631322320,
+      "start_ns": 541387394,
+      "end_ns": 631618626,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 89923120
+          "subject": "slow.whytime.test:33593",
+          "ns": 89890938
         },
         {
           "class": "cpu",
           "subject": "wt-dns",
-          "ns": 249891
+          "ns": 278701
         },
         {
           "class": "runqueue",
           "subject": "wt-dns",
-          "ns": 15892
+          "ns": 61593
         }
       ]
     },
     {
-      "start_ns": 631322320,
-      "end_ns": 721511223,
+      "start_ns": 631618626,
+      "end_ns": 721849859,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90188903
+          "subject": "slow.whytime.test:33593",
+          "ns": 90231233
         }
       ]
     },
     {
-      "start_ns": 721511223,
-      "end_ns": 811700126,
+      "start_ns": 721849859,
+      "end_ns": 812081091,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90188903
+          "subject": "slow.whytime.test:33593",
+          "ns": 90231232
         }
       ]
     },
     {
-      "start_ns": 811700126,
-      "end_ns": 901889029,
+      "start_ns": 812081091,
+      "end_ns": 902312324,
       "lines": [
         {
           "class": "net",
-          "subject": "slow.whytime.test:43279",
-          "ns": 90064935
+          "subject": "slow.whytime.test:33593",
+          "ns": 89916984
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-dns",
+          "ns": 176064
         },
         {
           "class": "cpu",
           "subject": "wt-dns",
-          "ns": 111886
-        },
-        {
-          "class": "runqueue",
-          "subject": "wt-dns",
-          "ns": 12082
+          "ns": 138185
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 2850945,
-      "ppid": 2850911,
+      "pid": 3979460,
+      "ppid": 3979435,
       "comm": "wt-dns",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-dns",
         "udp",
         "127.0.0.153:53",
         "slow.whytime.test",
-        "43279",
+        "33593",
         "3"
       ],
-      "cpu_ns": 1023199,
+      "cpu_ns": 959804,
       "exit_code": 0,
       "critical": true
     }

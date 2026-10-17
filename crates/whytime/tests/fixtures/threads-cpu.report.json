@@ -5,201 +5,201 @@
     "4",
     "600"
   ],
-  "wall_ns": 600518866,
+  "wall_ns": 600535340,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 2398996678,
+    "cpu_ns": 2396572879,
     "processes": 1,
-    "factor": 3.9948731236030808
+    "factor": 3.990727471592263
   },
   "lines": [
     {
       "class": "cpu",
-      "share": 0.99971739772119,
-      "ns": 600349158,
+      "share": 0.9996540603255755,
+      "ns": 600327591,
       "subject": "wt-threads"
     },
     {
       "class": "runqueue",
-      "share": 0.0002465268093675512,
-      "ns": 148044,
+      "share": 0.00030689617700100714,
+      "ns": 184302,
       "subject": "wt-threads",
       "held_by": [
         {
-          "comm": "migration/7",
-          "tgid": 136,
-          "ns": 112884
+          "comm": "watchmedo",
+          "tgid": 385545,
+          "ns": 157957
         },
         {
           "comm": "idle",
           "tgid": 0,
-          "ns": 35160
+          "ns": 26345
         }
       ]
     },
     {
       "class": "other",
-      "share": 0.000032177173930785383,
-      "ns": 19323,
+      "share": 0.00002144919564600478,
+      "ns": 12881,
       "subject": "outside syscalls (page faults, kernel locks)"
     },
     {
       "class": "other",
-      "share": 3.898295511668405e-6,
-      "ns": 2341,
+      "share": 0.00001759430177747741,
+      "ns": 10566,
       "subject": "in munmap"
     }
   ],
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 60051886,
+      "end_ns": 60053534,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-threads",
-          "ns": 60017456
+          "ns": 60024452
+        },
+        {
+          "class": "runqueue",
+          "subject": "wt-threads",
+          "ns": 16201
         },
         {
           "class": "other",
           "subject": "outside syscalls (page faults, kernel locks)",
-          "ns": 19323
+          "ns": 12881
+        }
+      ]
+    },
+    {
+      "start_ns": 60053534,
+      "end_ns": 120107068,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 120107068,
+      "end_ns": 180160602,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 180160602,
+      "end_ns": 240214136,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 240214136,
+      "end_ns": 300267670,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 300267670,
+      "end_ns": 360321204,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 360321204,
+      "end_ns": 420374738,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 420374738,
+      "end_ns": 480428272,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 480428272,
+      "end_ns": 540481806,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 60053534
+        }
+      ]
+    },
+    {
+      "start_ns": 540481806,
+      "end_ns": 600535340,
+      "lines": [
+        {
+          "class": "cpu",
+          "subject": "wt-threads",
+          "ns": 59874867
         },
         {
           "class": "runqueue",
           "subject": "wt-threads",
-          "ns": 15107
-        }
-      ]
-    },
-    {
-      "start_ns": 60051886,
-      "end_ns": 120103773,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051887
-        }
-      ]
-    },
-    {
-      "start_ns": 120103773,
-      "end_ns": 180155659,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051886
-        }
-      ]
-    },
-    {
-      "start_ns": 180155659,
-      "end_ns": 240207546,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051887
-        }
-      ]
-    },
-    {
-      "start_ns": 240207546,
-      "end_ns": 300259433,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051887
-        }
-      ]
-    },
-    {
-      "start_ns": 300259433,
-      "end_ns": 360311319,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051886
-        }
-      ]
-    },
-    {
-      "start_ns": 360311319,
-      "end_ns": 420363206,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051887
-        }
-      ]
-    },
-    {
-      "start_ns": 420363206,
-      "end_ns": 480415092,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051886
-        }
-      ]
-    },
-    {
-      "start_ns": 480415092,
-      "end_ns": 540466979,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 60051887
-        }
-      ]
-    },
-    {
-      "start_ns": 540466979,
-      "end_ns": 600518866,
-      "lines": [
-        {
-          "class": "cpu",
-          "subject": "wt-threads",
-          "ns": 59916609
-        },
-        {
-          "class": "runqueue",
-          "subject": "wt-threads",
-          "ns": 132937
+          "ns": 168101
         },
         {
           "class": "other",
           "subject": "in munmap",
-          "ns": 2341
+          "ns": 10566
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 2850292,
-      "ppid": 2850287,
+      "pid": 3979207,
+      "ppid": 3979138,
       "comm": "wt-threads",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-threads",
         "4",
         "600"
       ],
-      "cpu_ns": 2398996678,
+      "cpu_ns": 2396572879,
       "exit_code": 0,
       "critical": true
     }
   ],
   "quality": {
-    "events": 19,
+    "events": 14,
     "dropped": 0,
     "syscalls": true,
     "readiness": true,
