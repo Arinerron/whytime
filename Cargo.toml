@@ -12,7 +12,7 @@ exclude = ["tracekit"]
 default-members = ["crates/whytime"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -21,8 +21,8 @@ homepage = "https://github.com/Arinerron/whytime"
 
 [workspace.dependencies]
 # The three published crates move in lockstep: bump these `=` pins with `version` above.
-whytime-abi = { version = "=0.1.1", path = "crates/whytime-abi" }
-whytime-bpf = { version = "=0.1.1", path = "crates/whytime-bpf" }
+whytime-abi = { version = "=0.1.2", path = "crates/whytime-abi" }
+whytime-bpf = { version = "=0.1.2", path = "crates/whytime-bpf" }
 
 # Published on crates.io; the submodule paths are used for local builds.
 wire = { version = "0.1.0", path = "tracekit/crates/wire", package = "tracekit-wire" }

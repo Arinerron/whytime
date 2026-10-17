@@ -121,7 +121,7 @@ container; `doctor` checks the host.
 
 ```sh
 cargo install --locked whytime   # build from source
-cargo binstall whytime           # the static release binary (releases after 0.1.1)
+cargo binstall whytime           # the static release binary (0.1.2 and later)
 ```
 
 `cargo install` compiles whytime and its BPF objects on your machine, so it needs clang with

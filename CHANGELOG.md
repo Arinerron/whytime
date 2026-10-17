@@ -7,6 +7,8 @@ All notable changes to whytime are recorded here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-16
+
 ### Added
 
 - More ways to install, see the README: an install script (`curl -fsSL
@@ -23,6 +25,10 @@ All notable changes to whytime are recorded here. The format is based on
   pages; the option lists are still generated from the CLI.
 - The embedded BPF objects no longer contain the build directory, so builds from the same
   source are reproducible across directories.
+
+### Fixed
+
+- Links in the README resolve on crates.io.
 
 ## [0.1.1] - 2026-10-16
 
@@ -137,6 +143,7 @@ First release.
   completions, man pages, the license texts of the code compiled into them
   (`THIRD_PARTY_LICENSES.md`) and SHA-256 checksums.
 
-[Unreleased]: https://github.com/Arinerron/whytime/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Arinerron/whytime/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Arinerron/whytime/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Arinerron/whytime/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Arinerron/whytime/releases/tag/v0.1.0
