@@ -3,7 +3,7 @@
 [![CI](https://github.com/Arinerron/whytime/actions/workflows/ci.yml/badge.svg)](https://github.com/Arinerron/whytime/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Arinerron/whytime?sort=semver)](https://github.com/Arinerron/whytime/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/whytime)](https://crates.io/crates/whytime)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/Arinerron/whytime/blob/main/LICENSE)
 
 `time` tells you how long a command took; whytime tells you where that wall-clock time went.
 
@@ -118,7 +118,7 @@ whytime needs `CAP_BPF` and `CAP_PERFMON`, or root. Pick one:
   flamegraphs additionally need `cap_syslog` (or root).
 
 Every user who can execute a binary with file capabilities gets them; see
-[SECURITY.md](SECURITY.md) for shared machines.
+[SECURITY.md](https://github.com/Arinerron/whytime/blob/main/SECURITY.md) for shared machines.
 
 ### Shell completions and man pages
 
@@ -294,7 +294,7 @@ $ cat report.json
 its lookup, the numeric `addr`; `runqueue` lines carry `held_by`, who held the CPU
 meanwhile; `--timeline` adds `timeline`; attach mode adds `attached_pid`. `quality` says
 which optional probes were attached and whether the kernel lost records. The full field
-reference is in [AGENTS.md](AGENTS.md#report).
+reference is in [AGENTS.md](https://github.com/Arinerron/whytime/blob/main/AGENTS.md#report).
 
 ### Timeline
 
@@ -401,7 +401,8 @@ whytime version, or has no stacks for a requested flamegraph, or if an output fi
 report cannot be written.
 
 Trace files can contain command lines, paths and hostnames: read
-[SECURITY.md](SECURITY.md#trace-files-contain-sensitive-data) before sharing one.
+[SECURITY.md](https://github.com/Arinerron/whytime/blob/main/SECURITY.md#trace-files-contain-sensitive-data)
+before sharing one.
 
 ### `whytime doctor`
 
@@ -502,8 +503,8 @@ flowchart LR
   from the command's main thread, following wakers into other traced threads and processes.
   The walk produces gap-free spans that tile the window; the report sums them.
 
-The developer guide, [AGENTS.md](AGENTS.md), documents every probe, record, rule and limit
-in detail.
+The developer guide, [AGENTS.md](https://github.com/Arinerron/whytime/blob/main/AGENTS.md),
+documents every probe, record, rule and limit in detail.
 
 ## Limits
 
@@ -533,8 +534,9 @@ in detail.
   traced thread and a sampler, which shows on context-switch-heavy work.
 
 The full list, with the reasoning behind each, is in
-[AGENTS.md](AGENTS.md#attribution-model-what-the-numbers-mean) and
-[AGENTS.md](AGENTS.md#flamegraphs---flamegraph-file---folded-file).
+[AGENTS.md](https://github.com/Arinerron/whytime/blob/main/AGENTS.md#attribution-model-what-the-numbers-mean)
+and
+[AGENTS.md](https://github.com/Arinerron/whytime/blob/main/AGENTS.md#flamegraphs---flamegraph-file---folded-file).
 
 ## JSON schema stability
 
@@ -569,21 +571,24 @@ makes x86_64 musl the default target. For aarch64:
 toolchain's `rust-lld`; no cross compiler). Cloned without `--recursive`? Run
 `git submodule update --init`: the shared [tracekit](https://github.com/Arinerron/tracekit)
 crates are a submodule. Tests, the end-to-end suite and conventions are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/Arinerron/whytime/blob/main/CONTRIBUTING.md).
 
 ## Contributing
 
-Bug reports, ideas and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md)
-and the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as
-described in [SECURITY.md](SECURITY.md). Release notes are in [CHANGELOG.md](CHANGELOG.md).
+Bug reports, ideas and pull requests are welcome: see
+[CONTRIBUTING.md](https://github.com/Arinerron/whytime/blob/main/CONTRIBUTING.md) and the
+[Code of Conduct](https://github.com/Arinerron/whytime/blob/main/CODE_OF_CONDUCT.md). Report
+vulnerabilities privately as described in
+[SECURITY.md](https://github.com/Arinerron/whytime/blob/main/SECURITY.md). Release notes are
+in [CHANGELOG.md](https://github.com/Arinerron/whytime/blob/main/CHANGELOG.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The BPF object declares the runtime license string
-`Dual MIT/GPL` because the kernel only grants GPL-only helpers to programs with a
-GPL-compatible license string (MIT code may be distributed under the GPL). The vendored
-libbpf headers in `crates/whytime-bpf/bpf/include/bpf/` keep their own license,
-`LGPL-2.1 OR BSD-2-Clause`. The SVG flamegraph is drawn by whytime itself; every Rust
-dependency is MIT, Apache-2.0, Zlib or Unicode-3.0 licensed (or dual-licensed with one of
-them). Release tarballs carry their license texts in `THIRD_PARTY_LICENSES.md`, which
-`cargo xtask licenses` generates.
+MIT, see [LICENSE](https://github.com/Arinerron/whytime/blob/main/LICENSE). The BPF object
+declares the runtime license string `Dual MIT/GPL` because the kernel only grants GPL-only
+helpers to programs with a GPL-compatible license string (MIT code may be distributed under
+the GPL). The vendored libbpf headers in `crates/whytime-bpf/bpf/include/bpf/` keep their
+own license, `LGPL-2.1 OR BSD-2-Clause`. The SVG flamegraph is drawn by whytime itself;
+every Rust dependency is MIT, Apache-2.0, Zlib or Unicode-3.0 licensed (or dual-licensed
+with one of them). Release tarballs carry their license texts in `THIRD_PARTY_LICENSES.md`,
+which `cargo xtask licenses` generates.

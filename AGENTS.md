@@ -85,7 +85,11 @@ pin the internal crates with `=X.Y.Z` in `[workspace.dependencies]`, so a newer
 submodule `path` (local builds) and the crates.io `version` (published manifests). Each
 published crate has a `LICENSE` symlink to the root one (cargo packs its contents);
 `whytime`'s readme is the root `README.md`, the two internal crates have their own short
-one. `whytime/tests/fixtures` (~190 KB) ships so that `cargo test` works from the package.
+one. crates.io resolves a readme's relative links against the crate's directory
+(`crates/whytime/`), so the README links to repository files with absolute
+`https://github.com/Arinerron/whytime/blob/main/...` URLs (0.1.1's crates.io page has the
+relative ones, which 404). `whytime/tests/fixtures` (~190 KB) ships so that `cargo test`
+works from the package.
 
 Releasing:
 
