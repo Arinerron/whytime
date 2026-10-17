@@ -652,7 +652,10 @@ Honesty limits (state them when presenting results):
   that whole off-CPU gap counts as blocked (µs scale) with waker 0, so it is not followed
   (child waits fall back to the exit-time heuristic).
 - 32-bit syscalls (i386 or AArch32 programs, `int 0x80`) are `other` "32-bit syscall":
-  whytime knows only the native syscall table and argument registers.
+  whytime knows only the native syscall table and argument registers. At attach, `/proc`
+  does not say whether a 64-bit program's pending syscall entered through `int 0x80`, so
+  only 32-bit programs (by ELF class) are seeded as such: a 64-bit one blocked in a 32-bit
+  syscall has its first interval classified by that number in the native table.
 - Mixed segments split on-CPU vs. preempted proportionally when clipped to a sub-interval.
 - A mixed segment's whole preempted time goes to its longest single preemption's holder,
   and the kernel names the task that took the CPU at the preemption: a CPU-bound thread
