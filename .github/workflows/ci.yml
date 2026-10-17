@@ -43,8 +43,12 @@ jobs:
       - name: Package the crates.io crates and build them from the tarballs
         # Verifies against a temporary local registry holding the workspace's own crates.
         # Not --workspace: that also packages the publish = false crates, and xtask's
-        # #[path] include of cli.rs does not resolve from its tarball.
-        run: cargo package --locked -p whytime-abi -p whytime-bpf -p whytime --target x86_64-unknown-linux-gnu
+        # #[path] include of cli.rs does not resolve from its tarball. The unpacked packages
+        # are not worth caching, and rust-cache's cleanup takes their `tests` directories
+        # for test-harness target dirs and reports ENOENT errors for them.
+        run: |
+          cargo package --locked -p whytime-abi -p whytime-bpf -p whytime --target x86_64-unknown-linux-gnu
+          rm -rf target/package
 
   aarch64:
     name: aarch64 check, build and qemu smoke
