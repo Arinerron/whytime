@@ -7,6 +7,14 @@ All notable changes to whytime are recorded here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- More ways to install, see the README: an install script (`curl -fsSL
+  https://github.com/Arinerron/whytime/releases/latest/download/install.sh | sh`), `.deb`,
+  `.rpm`, `.apk` and Arch packages attached to each release (with `SHA256SUMS`), the AUR
+  packages `whytime-bin` and `whytime`, a Nix flake (`nix run github:Arinerron/whytime`), a
+  container image (`ghcr.io/arinerron/whytime`) and `cargo binstall whytime`.
+
 ## [0.1.1] - 2026-10-16
 
 ### Added

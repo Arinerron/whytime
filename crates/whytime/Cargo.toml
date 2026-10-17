@@ -11,6 +11,26 @@ readme = "../../README.md"
 keywords = ["ebpf", "profiler", "performance", "off-cpu", "linux"]
 categories = ["development-tools::profiling", "command-line-utilities", "os::linux-apis"]
 
+# `cargo binstall whytime`: the static musl release tarball, for glibc hosts as well.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/whytime-v{ version }-x86_64-linux-musl.tar.gz"
+bin-dir = "whytime-v{ version }-x86_64-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/whytime-v{ version }-x86_64-linux-musl.tar.gz"
+bin-dir = "whytime-v{ version }-x86_64-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/whytime-v{ version }-aarch64-linux-musl.tar.gz"
+bin-dir = "whytime-v{ version }-aarch64-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/whytime-v{ version }-aarch64-linux-musl.tar.gz"
+bin-dir = "whytime-v{ version }-aarch64-linux-musl/{ bin }"
+
 [dependencies]
 whytime-abi = { workspace = true, features = ["user"] }
 whytime-bpf.workspace = true
