@@ -1,0 +1,107 @@
+.\" whytime-completions(1), hand-written. cargo xtask man adds the title and
+.\" replaces each ".\" @SECTION" line with that section rendered from cli.rs.
+.SH NAME
+whytime\-completions \- print a shell completion script for whytime
+.\" @SYNOPSIS
+.SH DESCRIPTION
+.B whytime completions
+prints to standard output a script that makes
+.I SHELL
+complete
+.BR whytime 's
+subcommands and options.
+.PP
+The distribution packages (Debian, RPM, Alpine, Arch Linux, Nix) and the
+install script already install the bash, zsh and fish scripts; this command
+is for other installations and other shells.
+.SH FILES
+Where the system-wide scripts go, and where a user can put their own:
+.TP
+.B bash
+.I /usr/share/bash\-completion/completions/whytime
+.br
+.I \(ti/.local/share/bash\-completion/completions/whytime
+.TP
+.B zsh
+.I /usr/share/zsh/site\-functions/_whytime
+(Arch Linux, Fedora, Alpine;
+.I /usr/share/zsh/vendor\-completions/_whytime
+on Debian and Ubuntu)
+.br
+a file named
+.I _whytime
+in a directory of
+.B $fpath
+listed before
+.B compinit
+runs, for example
+.I \(ti/.zfunc/_whytime
+with
+.B fpath=(\(ti/.zfunc $fpath)
+in
+.IR \(ti/.zshrc .
+.TP
+.B fish
+.I /usr/share/fish/vendor_completions.d/whytime.fish
+.br
+.I \(ti/.config/fish/completions/whytime.fish
+.TP
+.B elvish
+Evaluate the script from
+.IR \(ti/.config/elvish/rc.elv :
+.B eval (whytime completions elvish | slurp)
+.TP
+.B powershell
+Evaluate the script from the profile
+.RB ( $PROFILE ):
+.B whytime completions powershell | Out\-String | Invoke\-Expression
+.PP
+Installations under
+.I /usr/local
+use
+.I /usr/local/share
+instead of
+.IR /usr/share .
+A new shell picks the script up.
+.\" @OPTIONS
+.SH EXIT STATUS
+.TP
+.B 0
+The script was written.
+.TP
+.B 1
+Writing to standard output failed.
+.TP
+.B 2
+Invalid command-line usage, such as an unknown shell.
+.SH EXAMPLES
+Install the bash completions for the current user:
+.PP
+.RS 4
+.EX
+dir=\(ti/.local/share/bash\-completion/completions
+mkdir \-p "$dir" && whytime completions bash >"$dir/whytime"
+.EE
+.RE
+.PP
+Install the zsh completions system-wide on Arch Linux or Fedora:
+.PP
+.RS 4
+.EX
+whytime completions zsh |
+    sudo tee /usr/share/zsh/site\-functions/_whytime >/dev/null
+.EE
+.RE
+.PP
+Install the fish completions for the current user:
+.PP
+.RS 4
+.EX
+whytime completions fish >\(ti/.config/fish/completions/whytime.fish
+.EE
+.RE
+.SH SEE ALSO
+.BR whytime (1),
+.BR bash (1),
+.BR zsh (1),
+.BR fish (1)

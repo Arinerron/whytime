@@ -11,7 +11,8 @@
 //! `cargo test` compares byte for byte).
 //!
 //! `cargo xtask man [DIR]` writes `whytime.1` and one page per subcommand to DIR (default
-//! `$CARGO_TARGET_DIR/man`, else `target/man`), from the binary's own clap definition.
+//! `$CARGO_TARGET_DIR/man`, else `target/man`): hand-written pages with the option lists
+//! rendered from the binary's own clap definition (see [`man`]).
 //!
 //! `cargo xtask licenses [FILE]` writes the release binary's third-party notices (see
 //! [`licenses`]).
@@ -21,6 +22,7 @@
 #[allow(dead_code)]
 mod cli;
 mod licenses;
+mod man;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -30,7 +32,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail, ensure};
-use clap::CommandFactory as _;
 use serde_json::Value;
 
 const USAGE: &str = "usage: cargo xtask test-e2e | cargo xtask record-fixtures | cargo xtask man [DIR] \
@@ -41,7 +42,8 @@ const HELP: &str = concat!(
     "  record-fixtures  build them, record the replay fixtures (sudo) into\n",
     "                   crates/whytime/tests/fixtures with their expected `whytime report`\n",
     "                   outputs, which `cargo test` compares byte for byte\n",
-    "  man [DIR]        write the man pages to DIR (default $CARGO_TARGET_DIR/man)\n",
+    "  man [DIR]        write the man pages (hand-written, options from cli.rs) to DIR\n",
+    "                   (default $CARGO_TARGET_DIR/man)\n",
     "  licenses [FILE]  write the release binary's third-party notices to FILE\n",
     "                   (default $CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md)",
 );
@@ -96,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("test-e2e") => test_e2e(),
         Some("record-fixtures") => record_fixtures(),
-        Some("man") => man(args.next().map(PathBuf::from)),
+        Some("man") => man::man(args.next().map(PathBuf::from)),
         Some("licenses") => licenses::licenses(args.next().map(PathBuf::from)),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}\n{HELP}");
@@ -104,24 +106,6 @@ fn main() -> anyhow::Result<()> {
         }
         _ => bail!("{USAGE}"),
     }
-}
-
-/// Renders the man pages into `dir`.
-fn man(dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let dir = match dir {
-        Some(dir) => dir,
-        None => std::env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(
-                || Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"),
-                PathBuf::from,
-            )
-            .join("man"),
-    };
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    clap_mangen::generate_to(cli::Cli::command(), &dir)
-        .with_context(|| format!("writing man pages to {}", dir.display()))?;
-    println!("{}", dir.display());
-    Ok(())
 }
 
 fn test_e2e() -> anyhow::Result<()> {

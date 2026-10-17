@@ -42,7 +42,7 @@ export TMPDIR=~/.cache/whytime-tmp CARGO_TARGET_DIR=~/.cache/whytime-target
 | aarch64 | `cargo check --target aarch64-unknown-linux-musl --workspace`; `cargo build --release -p whytime --target aarch64-unknown-linux-musl` (static, linked by `rust-lld`; smoke with `qemu-aarch64 …/whytime --version`) |
 | glibc (`cargo install`) | `cargo check -p whytime --target x86_64-unknown-linux-gnu` (and `aarch64-unknown-linux-gnu`); `cargo package --locked -p whytime-abi -p whytime-bpf -p whytime --target x86_64-unknown-linux-gnu` (builds the three crates from their tarballs against a temporary local registry; not `--workspace`, which also packages xtask, whose `#[path]` cli.rs does not resolve from a tarball) |
 | Completions | `whytime completions <bash\|zsh\|fish\|elvish\|powershell>` (stdout) |
-| Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`) |
+| Man pages | `cargo xtask man [DIR]` (default `$CARGO_TARGET_DIR/man`): `whytime.1` and `whytime-{report,doctor,completions}.1` from the hand-written roff templates `xtask/man/*.1.in`, whose `.\" @OPTIONS`/`@COMMANDS`/`@SYNOPSIS` lines become clap_mangen sections rendered from `cli.rs`; dated by the newest released CHANGELOG entry (compiled in, so the output is reproducible). Update the templates with any change they describe (classes, report lines, notes, exit codes, doctor checks, JSON fields, environment variables, privileges); check with `groff -man -ww -z FILE` and `mandoc -Tlint` |
 | Third-party notices | `cargo xtask licenses [FILE]` (default `$CARGO_TARGET_DIR/THIRD_PARTY_LICENSES.md`): the license texts of every crate in the binary's graph (both release targets) and of the vendored libbpf headers; fails if a dependency ships no license file |
 | Run | `sudo $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/whytime -- sleep 1` |
 | Attach | `sudo whytime -p PID [--duration 30s] [--record t.wt]` (report on exit, deadline or Ctrl-C; exit 0) |
@@ -267,7 +267,8 @@ crates/whytime-testbins/   e2e workloads (src/bin/): wt-sleep, wt-burn, wt-fsync
                            suite's DNS server), wt-flame, wt-iouring (an io_uring SQPOLL
                            thread), wt-compat (a 32-bit syscall); src/lib.rs: argument and
                            timing helpers
-xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR] | licenses [FILE]
+xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR] | licenses [FILE];
+                           man/*.1.in: the man page templates
 .github/                   workflows ci.yml, release.yml, packages.yml, image.yml;
                            actions/setup (clang, rustup); ISSUE_TEMPLATE (bug, feature forms),
                            pull_request_template.md, dependabot.yml

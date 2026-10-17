@@ -1,0 +1,372 @@
+.\" whytime-doctor(1), hand-written. cargo xtask man adds the title line and
+.\" replaces each ".\" @SECTION" line with that section rendered from cli.rs.
+.SH NAME
+whytime\-doctor \- check whether whytime can run on this system
+.\" @SYNOPSIS
+.SH DESCRIPTION
+.B whytime doctor
+checks everything
+.BR whytime (1)
+needs to trace on this system: the kernel, the privileges of the process, the
+security settings that can block BPF, and finally the tracing programs
+themselves, which it loads and attaches like a real run.
+It prints one line per check to standard output: the status, the check's id
+and what it observed.
+A check that did not pass also prints its
+.BR impact ,
+one or more
+.B fix
+commands (alternatives introduced by
+.BR or: ),
+each with a
+.BR note ,
+and
+.B why
+the requirement exists.
+The last line counts the statuses and gives the verdict.
+The output is colored when standard output is a terminal and
+.B NO_COLOR
+is not set.
+.PP
+Run it the way you will run
+.BR whytime ,
+with or without
+.BR sudo :
+the result depends on the privileges it runs with.
+The
+.B setcap
+fixes name the path of the executable that ran.
+.PP
+The statuses are:
+.TP
+.B PASS
+The requirement is met.
+.TP
+.B INFO
+Informational; nothing to do.
+.TP
+.B SKIP
+The check did not apply or could not be evaluated (for example, a probe that
+needs a check that failed).
+.TP
+.B WARN
+.B whytime
+runs, with reduced detail or performance.
+.TP
+.B FAIL
+The requirement is not met.
+A failed required check means
+.B whytime
+will not run; a failed optional check means it runs with reduced
+functionality.
+.PP
+Every
+.B whytime
+run first performs a fast subset of these checks
+.RB ( platform.os_arch ,
+.BR kernel.version ,
+.BR kernel.btf ,
+.BR priv.capabilities ,
+.BR priv.nosuid ,
+.BR priv.nnp ,
+.BR sec.lockdown ,
+.BR env.userns ,
+.BR env.pidns ),
+and when loading the tracing programs fails, it prints the checks related to
+the error; it then exits 125.
+.SH CHECKS
+Checks marked
+.I required
+must pass for
+.B whytime
+to run.
+.TP
+.BR platform.os_arch " (required)"
+Linux on x86_64 or aarch64, the architectures
+.B whytime
+ships tracing programs for.
+.TP
+.BR kernel.version " (required)"
+Linux 5.18 or newer
+.RB ( sched_switch
+reports the previous task's state since 5.18).
+.TP
+.BR kernel.btf " (required)"
+Kernel type information in
+.I /sys/kernel/btf/vmlinux
+.RB ( CONFIG_DEBUG_INFO_BTF ),
+needed to load BTF tracepoints and fentry programs.
+.TP
+.BR priv.capabilities " (required)"
+.B CAP_BPF
+and
+.B CAP_PERFMON
+are effective (or the process is root).
+.TP
+.B priv.file_caps
+Whether the executable carries file capabilities, whether they include the
+required ones, and whether they are in effect (they can be masked by the
+capability bounding set).
+.TP
+.BR priv.nosuid " (required)"
+The executable is not on a file system mounted
+.BR nosuid ,
+where file capabilities are ignored (passes while the capabilities are
+effective anyway).
+.TP
+.B priv.nnp
+The
+.B no_new_privs
+flag is not set; under it (sandboxes, systemd's
+.BR NoNewPrivileges= ,
+some IDE terminals) the kernel ignores file capabilities.
+.TP
+.B priv.optional_caps
+The optional
+.BR CAP_SYS_PTRACE ,
+which lets
+.B whytime
+resolve file paths of descendants that run as another user.
+.TP
+.B priv.sudo
+Whether
+.B whytime
+runs through
+.BR sudo (8)
+(informational).
+.TP
+.B sec.lockdown
+Kernel lockdown: the
+.B confidentiality
+mode disables reading kernel memory from BPF.
+.TP
+.B sec.lsm
+Whether SELinux is enforcing, and the active Linux security modules.
+.TP
+.B sysctl.unpriv_bpf
+.BR kernel.unprivileged_bpf_disabled ;
+informational, since tracing programs never load without privileges.
+.TP
+.B sysctl.perf_paranoid
+.BR kernel.perf_event_paranoid ,
+which
+.B CAP_PERFMON
+overrides.
+.TP
+.B sysctl.jit
+.BR net.core.bpf_jit_enable :
+without the BPF JIT, tracing costs about ten times more.
+.TP
+.BR rlimit.memlock " (required)"
+On kernels that charge BPF memory to
+.BR RLIMIT_MEMLOCK ,
+a hard limit large enough for
+.BR whytime 's
+maps; skipped when BPF memory is charged to the memory cgroup.
+.TP
+.BR env.userns " (required)"
+The initial user namespace: capabilities inside a user namespace do not grant
+BPF.
+.TP
+.BR env.pidns " (required)"
+The initial PID namespace, so the process IDs the kernel reports match
+.IR /proc .
+.TP
+.B env.container
+Whether
+.B whytime
+runs in a container (informational).
+.TP
+.BR env.seccomp " (required)"
+No seccomp filter blocks
+.BR bpf (2).
+.TP
+.B fs.cgroup2
+cgroup v2 is mounted at
+.IR /sys/fs/cgroup .
+.TP
+.B fs.proc_hidepid
+.I /proc
+is mounted without
+.BR hidepid ,
+which hides other users' processes.
+.TP
+.BR probe.ringbuf " (required)"
+A BPF ring buffer can be created.
+.TP
+.B probe.memcg
+Whether the kernel charges BPF memory to the memory cgroup (informational).
+.TP
+.BR probe.sched " (required)"
+Loads
+.BR whytime 's
+tracing object and attaches its scheduler programs
+.RB ( sched_switch ,
+.BR sched_waking ,
+process fork, exec and exit), which the whole report is built from.
+On failure it shows the error number and the fixes for it; a program the
+kernel's verifier rejected points at
+.B WHYTIME_LOG=debug whytime doctor
+for the verifier's log.
+.TP
+.B probe.syscalls
+The system call tracepoints.
+Without them, blocked time is reported as
+.BR other .
+.TP
+.B probe.dns
+The resolver capture on system call exit.
+Without it, network peers are shown as
+.IR ip : port .
+.TP
+.B probe.readiness
+fentry programs on
+.B pollwake
+and
+.BR ep_poll_callback ,
+which need BPF trampolines.
+Without them, poll, select and epoll waits are reported as
+.BR poll .
+.TP
+.B probe.faults
+fentry and fexit programs on
+.BR handle_mm_fault .
+Without them, time blocked in page faults is reported as
+.B other
+or as the interrupted system call.
+.TP
+.B probe.stacks
+.B kernel.perf_event_max_stack
+is at least 127, and the stack capture programs (a sampler on every CPU and
+stack capture at
+.BR sched_switch )
+load.
+Without it,
+.B whytime
+refuses
+.B \-\-flamegraph
+and
+.BR \-\-folded .
+.TP
+.B kernel.kallsyms
+.I /proc/kallsyms
+shows kernel addresses, so flamegraphs can name kernel frames; otherwise they
+collapse into one
+.B [kernel]
+frame.
+.PP
+The probe checks after
+.B probe.sched
+are skipped when it fails.
+.\" @OPTIONS
+.SH JSON OUTPUT
+With
+.BR \-\-json ,
+the report is one JSON object on standard output, schema
+.BR bpfdoctor/1 :
+.BR schema ,
+.B tool
+.RB ( \(dqwhytime\(dq ),
+.B kernel
+(the release),
+.BR arch ,
+.B verdict
+.RB ( \(dqpass\(dq ,
+.B \(dqwarn\(dq
+or
+.BR \(dqfail\(dq ),
+and
+.BR checks ,
+an array of objects with
+.BR id ,
+.BR title ,
+.B status
+(the statuses above, in lower case),
+.BR required ,
+.BR observed ,
+.B impact
+(or null),
+.B fixes
+(an array of
+.B cmd
+and
+.BR note ),
+and
+.B explain
+(or null).
+.SH EXIT STATUS
+.TP
+.B 0
+.B whytime
+can run (the verdict is pass or warn).
+.TP
+.B 2
+Invalid command-line usage.
+.TP
+.B 3
+.B whytime
+cannot run: a required check failed.
+.TP
+.B 125
+The report could not be written.
+.SH EXAMPLES
+Without privileges (long lines wrapped, some checks left out):
+.PP
+.RS 4
+.EX
+$ \fBwhytime doctor\fP
+whytime doctor \(pc kernel 7.2.6\-arch2\-1 x86_64
+ PASS platform.os_arch      Linux x86_64
+ PASS kernel.version        7.2.6 \(>= 5.18
+ PASS kernel.btf            /sys/kernel/btf/vmlinux present
+ FAIL priv.capabilities     missing CAP_BPF, CAP_PERFMON (uid 1000,
+                            no file capabilities on /var/tmp/whytime)
+      impact: cannot load tracing programs; whytime cannot run
+      fix:    sudo setcap cap_bpf,cap_perfmon+ep /var/tmp/whytime
+      note:   one\-time; re\-run after every reinstall
+      or:     sudo whytime ...
+      note:   run once with root
+      why:    CAP_BPF loads BPF programs and maps; CAP_PERFMON
+              attaches them to tracepoints
+\&...
+ SKIP probe.syscalls        not probed: the scheduler probe failed
+\&...
+summary: 2 fail \(pc 2 warn \(pc 15 pass \(pc 3 info \(pc 8 skip
+         \(-> whytime will not run
+$ \fBecho $?\fP
+3
+.EE
+.RE
+.PP
+The same system under
+.BR sudo :
+.PP
+.RS 4
+.EX
+$ \fBsudo whytime doctor | tail \-n 3\fP
+ PASS probe.stacks          perf_event cpu\-clock sampler on every
+                            CPU and stack capture at sched_switch
+                            loaded and attached (371 verified insns)
+ PASS kernel.kallsyms       /proc/kallsyms shows addresses: kernel
+                            frames are symbolized
+summary: 0 fail \(pc 0 warn \(pc 26 pass \(pc 3 info \(pc 1 skip
+         \(-> whytime is ready
+.EE
+.RE
+.PP
+In a script:
+.PP
+.RS 4
+.EX
+if ! whytime doctor >/dev/null; then
+    whytime doctor \-\-json |
+        jq \-r '.checks[] | select(.status == "fail") | .id'
+fi
+.EE
+.RE
+.SH SEE ALSO
+.BR whytime (1),
+.BR capabilities (7),
+.BR setcap (8),
+.BR sysctl (8),
+.BR bpftool (8)

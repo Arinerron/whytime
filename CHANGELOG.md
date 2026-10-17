@@ -17,6 +17,10 @@ All notable changes to whytime are recorded here. The format is based on
 
 ### Changed
 
+- The man pages are written by hand: whytime(1) explains the report, every class, attach
+  mode, trace files, flamegraphs, JSON output, privileges and exit status, and
+  whytime-report(1), whytime-doctor(1) (every check) and whytime-completions(1) are full
+  pages; the option lists are still generated from the CLI.
 - The embedded BPF objects no longer contain the build directory, so builds from the same
   source are reproducible across directories.
 
