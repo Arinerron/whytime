@@ -15,6 +15,11 @@ All notable changes to whytime are recorded here. The format is based on
   packages `whytime-bin` and `whytime`, a Nix flake (`nix run github:Arinerron/whytime`), a
   container image (`ghcr.io/arinerron/whytime`) and `cargo binstall whytime`.
 
+### Changed
+
+- The embedded BPF objects no longer contain the build directory, so builds from the same
+  source are reproducible across directories.
+
 ## [0.1.1] - 2026-10-16
 
 ### Added

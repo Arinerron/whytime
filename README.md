@@ -96,14 +96,14 @@ packages for both architectures (checksums in `SHA256SUMS`). Download yours, the
 | Arch | `whytime-X.Y.Z-1-x86_64.pkg.tar.zst`, `-aarch64` | `sudo pacman -U ./whytime-*.pkg.tar.zst` |
 
 On Arch, the AUR has [`whytime-bin`](https://aur.archlinux.org/packages/whytime-bin) (the
-release binary) and [`whytime`](https://aur.archlinux.org/packages/whytime) (built from
-source): `paru -S whytime-bin`.
+release binary) and [`whytime`](https://aur.archlinux.org/packages/whytime) (built from the
+release tag): `paru -S whytime-bin`.
 
 **Nix** (flakes; builds from source, with man pages and completions):
 
 ```sh
 nix run github:Arinerron/whytime -- doctor
-nix profile install github:Arinerron/whytime
+nix profile add github:Arinerron/whytime   # before Nix 2.30: nix profile install
 ```
 
 **Container** (`ghcr.io/arinerron/whytime`, Alpine based). `--pid=host` is required, since

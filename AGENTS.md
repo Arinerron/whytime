@@ -142,7 +142,7 @@ binary in CI.
 | `.deb`, `.rpm`, `.apk`, Arch `.pkg.tar.zst` (release assets) | `packaging/nfpm.yaml` | `.github/workflows/packages.yml` |
 | `curl … \| sh` (release asset `install.sh`) | `packaging/install.sh` | `packages.yml` |
 | Container `ghcr.io/arinerron/whytime` | `packaging/Containerfile` | `.github/workflows/image.yml` |
-| AUR `whytime` (crate) and `whytime-bin` (tarball) | `packaging/aur/*/PKGBUILD` | by hand |
+| AUR `whytime` (tag source) and `whytime-bin` (tarball) | `packaging/aur/*/PKGBUILD` | by hand |
 | Nix (`nix run github:Arinerron/whytime`) | `flake.nix`, `flake.lock` | the repository itself |
 | `cargo binstall whytime` | `[package.metadata.binstall]` in `crates/whytime/Cargo.toml` | crates.io |
 
@@ -181,9 +181,11 @@ called from `release.yml`, from the tag.
   newest non-prerelease of its line and overall (a backfill never moves them). The run
   command is in the header of `packaging/Containerfile`.
 - **AUR.** `packaging/aur/whytime-bin/PKGBUILD` repackages the tarballs (provides and
-  conflicts `whytime`); `packaging/aur/whytime/PKGBUILD` builds the crate from
-  static.crates.io (glibc; makedepends cargo, clang). Each AUR package is its own git repo
-  holding `PKGBUILD` and `.SRCINFO` (never committed here):
+  conflicts `whytime`); `packaging/aur/whytime/PKGBUILD` builds the GitHub tag archive for
+  the host target with the system toolchain (glibc; makedepends cargo, clang) and renders
+  the man pages with xtask. Tag archives omit submodules: tracekit comes from its own tag
+  archive (`_tracekit` in the PKGBUILD; bump it with the submodule). Each AUR package is its
+  own git repo holding `PKGBUILD` and `.SRCINFO` (never committed here):
 
   ```sh
   git clone ssh://aur@aur.archlinux.org/whytime-bin.git ~/aur/whytime-bin   # once
