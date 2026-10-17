@@ -10,9 +10,9 @@
 //!
 //! - `futex`, `ipc` (pipes, local sockets) and `poll` blocks woken by a tracked thread: that
 //!   thread (the lock holder, the writer, the readiness source), in any tracked process,
-//!   including other threads of the same one. A `futex` or `poll` wait that ended without a
-//!   tracked waker (a timeout) and was retried at once is part of the next wait and takes
-//!   its waker (`Walker::retried_waker`);
+//!   including other threads of the same one. A `futex` or `poll` wait that no task ended
+//!   (a timeout) and was retried at once is part of the next wait and takes its waker
+//!   (`Walker::retried_waker`);
 //! - waiting for a child (`wait4`/`waitid`): the child process that ended the wait (the
 //!   waker when it is a child, else the child that exited last inside the block, else the
 //!   youngest child still alive at its end), along its main thread;
@@ -31,7 +31,7 @@
 //! [`tell_apart`]). Runqueue lines say who held the CPU meanwhile ([`Line::held_by`]).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -113,7 +113,8 @@ pub struct Attribution {
     /// The critical path in time order: each span starts where the previous one ends, from
     /// the window's start to its end. Adjacent stretches with equal fields are one span.
     /// Within a mixed segment, whose on-CPU and preempted time interleave in unknown order,
-    /// the on-CPU part comes first.
+    /// the on-CPU part comes first. Empty when the root process has no thread at all (its
+    /// records lost, or a damaged trace file): then the one line is `untraced`.
     pub spans: Vec<Span>,
 }
 
@@ -126,6 +127,23 @@ impl Attribution {
 
 /// Attributes `[start, end)` of the root process `root`.
 pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attribution {
+    if trace.procs[root].threads.is_empty() {
+        // Every record of the command lost, or a damaged trace: no thread to walk or to name
+        // a span after, so the whole window is one `untraced` line and there are no spans.
+        let untraced = Line {
+            class: Class::Other,
+            subject: "untraced".to_owned(),
+            ns: end - start,
+            connections: None,
+            addr: None,
+            held_by: Vec::new(),
+        };
+        let lines = (end > start).then_some(untraced).into_iter().collect();
+        return Attribution {
+            lines,
+            spans: Vec::new(),
+        };
+    }
     let mut walker = Walker {
         trace,
         root,
@@ -145,7 +163,26 @@ pub fn attribute(trace: &Trace, root: ProcId, start: u64, end: u64) -> Attributi
         }
     }
     for (id, thread) in trace.threads.iter().enumerate() {
-        walker.by_tid.entry(thread.tid).or_default().push(id);
+        // Earlier tids first: a non-leader thread that execs takes over the leader's.
+        let mut from = thread.birth;
+        for &(tid, until) in &thread.former_tids {
+            let tenure = Tenure {
+                thread: id,
+                from,
+                until: Some(until),
+            };
+            walker.by_tid.entry(tid).or_default().push(tenure);
+            from = until;
+        }
+        let tenure = Tenure {
+            thread: id,
+            from,
+            until: None,
+        };
+        walker.by_tid.entry(thread.tid).or_default().push(tenure);
+    }
+    for tenures in walker.by_tid.values_mut() {
+        tenures.sort_by_key(|tenure| tenure.from);
     }
     walker.walk_proc(root, start, end, 0);
     let pieces = std::mem::take(&mut walker.pieces);
@@ -393,14 +430,23 @@ enum Target {
     Proc(ProcId),
 }
 
+/// A thread holding a tid over `[from, until)`; `until` is `None` from its last tid on, dead
+/// or alive (an exiting thread still wakes its joiner).
+#[derive(Clone, Copy)]
+struct Tenure {
+    thread: ThreadId,
+    from: u64,
+    until: Option<u64>,
+}
+
 struct Walker<'a> {
     trace: &'a Trace,
     /// The wrapped command: on-CPU time is `cpu` in it, `child` anywhere else.
     root: ProcId,
     /// Every process lifetime that had a given tgid.
     by_tgid: HashMap<u32, Vec<ProcId>>,
-    /// Every thread that had a given tid.
-    by_tid: HashMap<u32, Vec<ThreadId>>,
+    /// Every thread that had a given tid, by the start of its tenure.
+    by_tid: HashMap<u32, Vec<Tenure>>,
     /// Parent of each process, when it was traced.
     parents: Vec<Option<ProcId>>,
     pieces: Vec<Piece>,
@@ -516,19 +562,24 @@ impl Walker<'_> {
 
     /// The thread that stands for the process at each moment: the original leader while it
     /// lives, then whichever thread alive at that point lives longest (the one that took over
-    /// the leader's identity in a multithreaded exec, or the last to exit).
+    /// the leader's identity in a multithreaded exec, or the last to exit; of equals, the
+    /// last listed). O(T log T) in the process's threads.
     fn main_line(&self, p: ProcId) -> Vec<(ThreadId, u64, u64)> {
+        let threads = &self.trace.threads;
         let proc = &self.trace.procs[p];
         let end = proc.death.unwrap_or(u64::MAX);
-        let lives = |t: ThreadId| {
-            let thread = &self.trace.threads[t];
-            (thread.birth, thread.death.unwrap_or(u64::MAX).min(end))
-        };
+        let death_of = |t: ThreadId| threads[t].death.unwrap_or(u64::MAX).min(end);
+        let mut by_birth: Vec<(usize, ThreadId)> =
+            proc.threads.iter().copied().enumerate().collect();
+        by_birth.sort_by_key(|&(_, t)| threads[t].birth);
+        let mut by_birth = by_birth.into_iter().peekable();
+        // Threads born by the cursor, longest-living (then last listed) on top.
+        let mut born = BinaryHeap::new();
         let mut line = Vec::new();
         let mut cursor = proc.birth;
         let mut current = proc.threads.first().copied();
         while let Some(thread) = current {
-            let (_, death) = lives(thread);
+            let death = death_of(thread);
             if death > cursor {
                 line.push((thread, cursor, death));
                 cursor = death;
@@ -536,16 +587,15 @@ impl Walker<'_> {
             if cursor >= end {
                 break;
             }
-            current = proc
-                .threads
-                .iter()
-                .copied()
-                .filter(|&t| t != thread && !line.iter().any(|&(seen, ..)| seen == t))
-                .filter(|&t| {
-                    let (birth, death) = lives(t);
-                    birth <= cursor && death > cursor
-                })
-                .max_by_key(|&t| lives(t).1);
+            while let Some((listed, t)) = by_birth.next_if(|&(_, t)| threads[t].birth <= cursor) {
+                born.push((death_of(t), listed, t));
+            }
+            // The cursor only moves forward: a thread dead by it never qualifies again (nor
+            // do the ones already on the line).
+            while born.peek().is_some_and(|&(death, ..)| death <= cursor) {
+                born.pop();
+            }
+            current = born.pop().map(|(.., t)| t);
         }
         line
     }
@@ -599,8 +649,12 @@ impl Walker<'_> {
                 Some((Target::Proc(child), (Class::Child, latest(child))))
             }
             class @ (Class::Futex | Class::Ipc | Class::Poll) => {
+                // Only a wait no task ended (a timeout, an interrupt) can have been retried; a
+                // waker outside the tree explains the wait itself (`woken by <comm>`).
                 let waker = match self.thread_at(block.waker_tid, block.waker_tgid, seg.end) {
-                    None if class != Class::Ipc => self.retried_waker(at.thread, index, class),
+                    None if class != Class::Ipc && block.waker_tid == 0 => {
+                        self.retried_waker(at.thread, index, class)
+                    }
                     waker => waker,
                 };
                 waker.map(|waker| (Target::Thread(waker), self.own_line(at, block, s0)))
@@ -717,28 +771,31 @@ impl Walker<'_> {
             .find(|&id| procs[id].birth <= ts)
     }
 
-    /// The latest thread `tid` of process `tgid` born by `ts`, dead or alive (an exiting
-    /// thread wakes its joiner).
+    /// The thread with tid `tid` in process `tgid` at `ts`: the latest to take that tid by
+    /// then, dead or alive (an exiting thread wakes its joiner), unless it gave the tid up
+    /// before `ts` (a non-leader thread's exec moves it onto the leader's).
     fn thread_at(&self, tid: u32, tgid: u32, ts: u64) -> Option<ThreadId> {
         if tid == 0 {
             return None;
         }
-        let threads = &self.trace.threads;
-        let thread = self
+        let tenure = self
             .by_tid
             .get(&tid)?
             .iter()
-            .copied()
             .rev()
-            .find(|&t| threads[t].birth <= ts)?;
-        (self.trace.procs[threads[thread].proc].key.pid == tgid).then_some(thread)
+            .find(|tenure| tenure.from <= ts)?;
+        let thread = tenure.thread;
+        let held = tenure.until.is_none_or(|until| ts < until);
+        let proc = self.trace.threads[thread].proc;
+        (held && self.trace.procs[proc].key.pid == tgid).then_some(thread)
     }
 
-    /// The waker of a retried wait. A `futex` or `poll` wait that no tracked thread ended (a
-    /// timeout, typically) is one wait with the thread's next wait of the same `class` when
-    /// the thread ran less than 1/[`RETRY_CPU_DIVISOR`] of the first in between: it
-    /// re-checked and waited again (a timed condition wait, Python's GIL). The first wait of
-    /// such a chain that a tracked thread ended names the waker of all of them.
+    /// The waker of a retried wait. A `futex` or `poll` wait that no task ended (a timeout,
+    /// typically) is one wait with the thread's next wait of the same `class` when the thread
+    /// ran less than 1/[`RETRY_CPU_DIVISOR`] of the first in between: it re-checked and
+    /// waited again (a timed condition wait, Python's GIL). The first wait of such a chain
+    /// that a tracked thread ended names the waker of all of them; one that a task outside
+    /// the tree ended ends the chain unexplained.
     fn retried_waker(&mut self, t: ThreadId, index: usize, class: Class) -> Option<ThreadId> {
         if let Some(&waker) = self.retries.get(&(t, index)) {
             return waker;
@@ -759,7 +816,7 @@ impl Walker<'_> {
                 SegKind::Runq(_) => {}
                 SegKind::Blocked(block) if block.what.class == class => {
                     waker = self.thread_at(block.waker_tid, block.waker_tgid, seg.end);
-                    if waker.is_some() {
+                    if waker.is_some() || block.waker_tid != 0 {
                         break;
                     }
                     if let Some(&known) = self.retries.get(&(t, i)) {
@@ -786,13 +843,13 @@ fn spawns(subject: &Subject) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use libc::{SYS_nanosleep, SYS_wait4};
+    use libc::{SYS_futex, SYS_nanosleep, SYS_wait4};
     use procctx::ProcKey;
 
     use super::*;
     use crate::classify::Blocked;
     use crate::testkit::{episode, exec, exit, feed, fork, seg, sys, trace};
-    use crate::timeline::{Image, Proc, StackIds, Thread};
+    use crate::timeline::{Image, Proc, ProcSeed, StackIds, Thread};
 
     /// A program `comm` with arguments `argv` (space-separated; none when empty), exec'd at
     /// `from`.
@@ -837,6 +894,7 @@ mod tests {
         let id = t.threads.len();
         t.threads.push(Thread {
             tid,
+            former_tids: Vec::new(),
             proc,
             birth: segs[0].start,
             death: segs.last().map(|s| s.end),
@@ -1006,6 +1064,120 @@ mod tests {
 
         let a = attribute(&t, app, 0, 110);
         assert_eq!(tiled(&a, 0, 110), [(Class::Cpu, "app", 110)]);
+    }
+
+    #[test]
+    fn waits_woken_from_outside_the_tree_are_not_retried_timeouts() {
+        // A timed-out poll, then one a daemon ended, then one the sleeping worker ended,
+        // each re-checked in 1 ns: the daemon's wake explains its own wait and ends the
+        // timeout's chain, so neither is the worker's sleep.
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, 100), None);
+        let daemon = Subject::Waker(Arc::from("dbus-daemon"));
+        let main = vec![
+            block(0, 40, Class::Poll, Subject::Process, (0, 0)),
+            run(40, 41),
+            block(41, 60, Class::Poll, daemon, (999, 999)),
+            run(60, 61),
+            block(61, 100, Class::Poll, Subject::Process, (11, 10)),
+        ];
+        thread(&mut t, app, 10, main);
+        let sleep = block(0, 100, Class::Sleep, Subject::Process, (0, 0));
+        thread(&mut t, app, 11, vec![sleep]);
+
+        let a = attribute(&t, app, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [
+                (Class::Cpu, "app", 2),
+                (Class::Sleep, "app", 39),
+                (Class::Poll, "app", 40),
+                (Class::Poll, "woken by dbus-daemon", 19),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thread_that_execs_is_found_under_the_tid_it_had_at_the_wake() {
+        // The leader waits for thread 101, then exits; 101 execs and takes over tid 100.
+        let mut t = trace(100);
+        feed(&mut t, &exec(1_000, 100, 100, "app", seg(1_000, 0, 0)));
+        feed(&mut t, &fork(1_100, 100, 100, 101, 100));
+        let mut wait = episode(100, 100, seg(1_000, 200, 0), sys(SYS_futex), [1_200, 1_800, 1_800]);
+        (wait.waker_tid, wait.waker_tgid) = (101, 100);
+        feed(&mut t, &wait);
+        feed(&mut t, &exit(1_900, 100, 100, seg(1_800, 100, 0), 0, false));
+        feed(&mut t, &exec(2_000, 101, 100, "tool", seg(1_100, 900, 0)));
+        feed(&mut t, &exit(3_000, 100, 100, seg(2_000, 1_000, 0), 0, true));
+
+        let a = attribute(&t, 0, 1_000, 3_000);
+        let lines = tiled(&a, 1_000, 3_000);
+        assert_eq!(lines, [(Class::Cpu, "app", 1_000), (Class::Cpu, "tool", 1_000)]);
+    }
+
+    #[test]
+    fn the_leader_tid_names_the_old_leader_until_a_non_leader_exec_takes_it() {
+        // sh reads a pipe that thread 61 of app fills; 61 first waits for the leader, 60,
+        // and at 70 execs, which moves it onto tid 60.
+        let mut t = trace(1);
+        let sh = proc(&mut t, 50, "sh", (0, 100), None);
+        let app = proc(&mut t, 60, "app", (0, 100), Some(sh));
+        let pipe = block(0, 60, Class::Ipc, Subject::Process, (61, 60));
+        thread(&mut t, sh, 50, vec![pipe, run(60, 100)]);
+        thread(&mut t, app, 60, vec![run(0, 50)]);
+        let execer = thread(&mut t, app, 60, vec![futex(5, 40, (60, 60)), run(40, 100)]);
+        t.threads[execer].former_tids.push((61, 70));
+
+        let a = attribute(&t, sh, 0, 100);
+        let lines = tiled(&a, 0, 100);
+        assert_eq!(
+            lines,
+            [(Class::Cpu, "sh", 40), (Class::Child, "app", 55), (Class::Ipc, "sh", 5)]
+        );
+    }
+
+    #[test]
+    fn a_long_chain_of_thread_hand_offs_is_walked_in_order() {
+        // The leader exits early and each thread starts its successor before it exits (a
+        // pool replacing its workers): the main line passes through every thread. Quadratic
+        // or worse in the threads, this would not finish.
+        const THREADS: u64 = 20_000;
+        let end = (THREADS - 1) * 10 + 15;
+        let mut t = trace(1);
+        let app = proc(&mut t, 10, "app", (0, end), None);
+        let chain: Vec<ThreadId> = (0..THREADS)
+            .map(|i| {
+                let tid = 10 + u32::try_from(i).unwrap();
+                thread(&mut t, app, tid, vec![run(i * 10, i * 10 + 15)])
+            })
+            .collect();
+
+        let a = attribute(&t, app, 0, end);
+        assert_eq!(tiled(&a, 0, end), [(Class::Cpu, "app", end)]);
+        let walked: Vec<ThreadId> = a.spans.iter().map(|span| span.thread).collect();
+        assert_eq!(walked, chain);
+    }
+
+    #[test]
+    fn a_root_without_a_thread_is_untraced() {
+        // A damaged trace file: the attach target's seed lists no thread, and no record adds
+        // one.
+        let mut t = trace(100);
+        let seed = ProcSeed {
+            key: ProcKey { pid: 100, start: 1 },
+            ppid: 1,
+            comm: "app".to_owned(),
+            argv: b"app\0".to_vec(),
+            birth: 1_000,
+            threads: Vec::new(),
+        };
+        t.seed(&[seed], 1_000);
+
+        let a = attribute(&t, t.root.unwrap(), 1_000, 3_000);
+        assert!(a.spans.is_empty());
+        let lines: Vec<_> = a.lines.iter().map(|l| (l.class, l.subject.as_str(), l.ns)).collect();
+        assert_eq!(lines, [(Class::Other, "untraced", 2_000)]);
     }
 
     #[test]

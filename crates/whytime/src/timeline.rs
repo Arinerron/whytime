@@ -131,8 +131,10 @@ pub struct Seg {
 /// One thread's timeline.
 #[derive(Debug)]
 pub struct Thread {
-    /// Kernel thread id.
+    /// Kernel thread id; a non-leader thread that execs takes over its leader's.
     pub tid: u32,
+    /// Thread ids it had before, oldest first, each with the time of the exec that ended it.
+    pub former_tids: Vec<(u32, u64)>,
     /// Owning process.
     pub proc: ProcId,
     /// Fork (or first exec, or for a thread that predates attach, entry creation) time.
@@ -446,7 +448,9 @@ impl Trace {
             && let Some(thread) = self.live_threads.remove(&r.old_tid)
         {
             // A non-leader thread exec'd and now carries the leader's tid.
-            self.threads[thread].tid = hdr.tid;
+            let execer = &mut self.threads[thread];
+            execer.former_tids.push((r.old_tid, hdr.ts));
+            execer.tid = hdr.tid;
             self.live_threads.insert(hdr.tid, thread);
         }
         let thread = self.thread(hdr.tid, proc, seg.start);
@@ -676,6 +680,7 @@ impl Trace {
         let id = self.threads.len();
         self.threads.push(Thread {
             tid,
+            former_tids: Vec::new(),
             proc,
             birth,
             death: None,

@@ -23,8 +23,12 @@ pub enum Kind {
     },
     /// `connect`: the target address is read from user memory.
     Connect,
-    /// Explicit durability barrier (`fsync`, `fdatasync`, `sync_file_range`, ...).
+    /// Explicit durability barrier on the descriptor in argument 0 (`fsync`, `fdatasync`,
+    /// `sync_file_range`, `syncfs`).
     Fsync,
+    /// Durability barrier without a descriptor (`sync`: every filesystem; `msync`: a
+    /// mapping, named by its address).
+    FsyncNoFd,
     /// Whole-file lock on argument 0 (`flock`).
     Lock,
     /// `fcntl`: a record-lock wait when argument 1 is `F_SETLKW`/`F_OFD_SETLKW`, otherwise
@@ -56,7 +60,8 @@ impl Kind {
         match self {
             Self::FdIo { .. } | Self::Fsync | Self::Lock | Self::Fcntl => SYSF_FD0,
             Self::Connect => SYSF_FD0 | SYSF_SOCKADDR,
-            Self::Aio
+            Self::FsyncNoFd
+            | Self::Aio
             | Self::Ipc
             | Self::PathFs
             | Self::Sleep
@@ -71,6 +76,13 @@ impl Kind {
 
 const READ: Kind = Kind::FdIo { write: false };
 const WRITE: Kind = Kind::FdIo { write: true };
+
+/// `io_pgetevents`, which `libc` only names for musl targets.
+#[cfg(target_arch = "x86_64")]
+const SYS_IO_PGETEVENTS: c_long = 333;
+/// `io_pgetevents`, which `libc` only names for musl targets.
+#[cfg(target_arch = "aarch64")]
+const SYS_IO_PGETEVENTS: c_long = 292;
 
 /// Syscalls with a meaning on every architecture.
 const COMMON: &[(c_long, &str, Kind)] = &[
@@ -104,13 +116,13 @@ const COMMON: &[(c_long, &str, Kind)] = &[
     (libc::SYS_fdatasync, "fdatasync", Kind::Fsync),
     (libc::SYS_sync_file_range, "sync_file_range", Kind::Fsync),
     (libc::SYS_syncfs, "syncfs", Kind::Fsync),
-    (libc::SYS_sync, "sync", Kind::Fsync),
-    (libc::SYS_msync, "msync", Kind::Fsync),
+    (libc::SYS_sync, "sync", Kind::FsyncNoFd),
+    (libc::SYS_msync, "msync", Kind::FsyncNoFd),
     (libc::SYS_flock, "flock", Kind::Lock),
     (libc::SYS_fcntl, "fcntl", Kind::Fcntl),
     (libc::SYS_io_uring_enter, "io_uring_enter", Kind::Aio),
     (libc::SYS_io_getevents, "io_getevents", Kind::Aio),
-    (libc::SYS_io_pgetevents, "io_pgetevents", Kind::Aio),
+    (SYS_IO_PGETEVENTS, "io_pgetevents", Kind::Aio),
     (libc::SYS_semop, "semop", Kind::Ipc),
     (libc::SYS_semtimedop, "semtimedop", Kind::Ipc),
     (libc::SYS_msgrcv, "msgrcv", Kind::Ipc),
@@ -272,6 +284,16 @@ mod tests {
         assert!(!flags.contains_key(&nr(libc::SYS_futex)));
         assert!(!flags.contains_key(&nr(libc::SYS_openat)));
         assert!(!flags.contains_key(&nr(libc::SYS_io_uring_enter)));
+        // No descriptor in their arguments: arg0 is a stale register (sync) or an address.
+        assert!(!flags.contains_key(&nr(libc::SYS_sync)));
+        assert!(!flags.contains_key(&nr(libc::SYS_msync)));
+    }
+
+    /// The number `libc` lacks on glibc targets matches its musl one.
+    #[cfg(target_env = "musl")]
+    #[test]
+    fn io_pgetevents_has_libcs_musl_number() {
+        assert_eq!(SYS_IO_PGETEVENTS, libc::SYS_io_pgetevents);
     }
 
     #[test]
