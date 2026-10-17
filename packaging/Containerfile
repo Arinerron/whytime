@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# Image ghcr.io/arinerron/whytime, built by .github/workflows/image.yml from the release
+# tarball of TAG (no rebuild): the static binary on alpine:3 (the newest 3.x at build
+# time), whose busybox shell and tools give wrap mode something to run.
+#
+#   docker buildx build -f packaging/Containerfile --build-arg TAG=v0.1.1 \
+#     --platform linux/amd64,linux/arm64 packaging
+#
+# The fetch stage runs on the build host and the final stage has no RUN, so a
+# multi-platform build needs no emulation.
+#
+# Run (no --privileged needed):
+#   docker run --rm --pid=host --cap-add BPF --cap-add PERFMON --cap-add SYS_PTRACE \
+#     --cap-add SYSLOG ghcr.io/arinerron/whytime -p PID     (or: -- CMD, or: doctor)
+# --pid=host is required in both modes: the kernel reports host pids. BPF and PERFMON
+# load and attach the programs; SYS_PTRACE reads other users' /proc entries; SYSLOG
+# shows kernel addresses so kernel frames are symbolized.
+
+FROM --platform=$BUILDPLATFORM alpine:3 AS fetch
+ARG TAG
+ARG TARGETARCH
+WORKDIR /fetch
+RUN set -eu; \
+    test -n "$TAG"; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64 ;; \
+      arm64) arch=aarch64 ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    name="whytime-$TAG-$arch-linux-musl"; \
+    url="https://github.com/Arinerron/whytime/releases/download/$TAG/$name.tar.gz"; \
+    wget -q "$url" "$url.sha256"; \
+    sha256sum -c "$name.tar.gz.sha256"; \
+    tar -xozf "$name.tar.gz"; \
+    mv "$name" /out
+
+FROM alpine:3
+ARG TAG
+LABEL org.opencontainers.image.title="whytime" \
+      org.opencontainers.image.description="Explains where a command's wall-clock time went: off-CPU and on-CPU attribution across its process tree, from eBPF" \
+      org.opencontainers.image.source="https://github.com/Arinerron/whytime" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${TAG#v}"
+COPY --from=fetch /out/whytime /usr/bin/whytime
+COPY --from=fetch /out/LICENSE /out/THIRD_PARTY_LICENSES.md /usr/share/licenses/whytime/
+ENTRYPOINT ["whytime"]
