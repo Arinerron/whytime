@@ -74,9 +74,11 @@ the host target, and `.cargo/config.toml` is not in the package) + `cargo packag
 three published crates for x86_64 gnu, aarch64 check/build/qemu smoke, and
 `cargo xtask test-e2e` inside a virtme-ng VM. `release.yml`: a `v*` tag publishes
 `whytime-vX.Y.Z-{x86_64,aarch64}-linux-musl.tar.gz` (binary, `LICENSE`,
-`THIRD_PARTY_LICENSES.md`, `README.md`, `completions/`, `man/`) with a `.sha256` each; the
-README's install snippet depends on these names. Both check out with
-`submodules: recursive`; `.github/actions/setup` installs clang and the toolchain.
+`THIRD_PARTY_LICENSES.md`, `README.md`, `completions/`, `man/`) with a `.sha256` each, then
+calls `packages.yml` and `image.yml` with the tag (see Packaging); the README's install
+snippet, `install.sh`, the AUR `whytime-bin`, the container image and the cargo-binstall
+metadata all depend on these names. Both check out with `submodules: recursive`;
+`.github/actions/setup` installs clang and the toolchain.
 
 crates.io: `whytime-abi`, `whytime-bpf` and `whytime` are published; `whytime-testbins`
 and `xtask` are `publish = false`. The three move in lockstep: `whytime` and `whytime-bpf`
@@ -97,18 +99,24 @@ Releasing:
    `whytime-bpf` in `[workspace.dependencies]` together, run `cargo update -w`, and commit
    `Cargo.lock` with them (CI's `cargo xtask licenses` uses `cargo metadata --locked`, and
    `cargo publish` refuses a dirty tree). Also bump the `bug_report.yml` version placeholder.
+   If the tracekit submodule moved, update `flake.nix`'s `tracekit` input to the same tag
+   (see Packaging).
 2. Date the `CHANGELOG.md` section and update its link refs, push to main and wait for
    green CI.
 3. `git tag -a vX.Y.Z -m 'whytime X.Y.Z' && git push origin vX.Y.Z`. Once `release.yml` has
    published, replace its generated notes with the CHANGELOG section plus an install
    snippet pinned to the tag: `gh release edit vX.Y.Z --title 'whytime X.Y.Z' --notes-file
-   NOTES.md`.
+   NOTES.md`. Check that its `packages` and `image` jobs passed: the release has the eight
+   packages, `SHA256SUMS` and `install.sh`, and `ghcr.io/arinerron/whytime:X.Y.Z` exists.
+   If either failed, fix it on main and rerun it with `gh workflow run`.
 4. From a clean checkout of the tag with the submodule initialized
    (`git clone --recursive --branch vX.Y.Z …`): `cargo publish --workspace --locked --target
    x86_64-unknown-linux-gnu --dry-run`, then the same without `--dry-run`. `--target` makes
    the verify build use glibc (what `cargo install` users get) instead of the musl default.
    Cargo publishes whytime-abi, whytime-bpf, whytime in order, waits for the index between
    them, and skips the `publish = false` crates.
+5. Update the AUR packages, `whytime-bin` (needs the GitHub release) and `whytime` (needs
+   the crates.io release), as described in Packaging, and commit the bumped PKGBUILDs here.
 
 Publishing is manual (a local crates.io token). A future `release.yml` job could do step 4
 with crates.io Trusted Publishing (`rust-lang/crates-io-auth-action`, `id-token: write`)
@@ -123,6 +131,84 @@ keep it self-contained (std, clap, clap_complete only; no `crate::` items).
 
 Do not run `cargo fmt`/`cargo clippy` as part of feature work unless asked; lints are the
 tracekit block (`clippy::all` + `pedantic`) in the root `Cargo.toml`.
+
+## Packaging
+
+Every channel repackages the release tarballs or builds from source; none builds its own
+binary in CI.
+
+| Channel | Files | Published by |
+|---|---|---|
+| `.deb`, `.rpm`, `.apk`, Arch `.pkg.tar.zst` (release assets) | `packaging/nfpm.yaml` | `.github/workflows/packages.yml` |
+| `curl … \| sh` (release asset `install.sh`) | `packaging/install.sh` | `packages.yml` |
+| Container `ghcr.io/arinerron/whytime` | `packaging/Containerfile` | `.github/workflows/image.yml` |
+| AUR `whytime` (crate) and `whytime-bin` (tarball) | `packaging/aur/*/PKGBUILD` | by hand |
+| Nix (`nix run github:Arinerron/whytime`) | `flake.nix`, `flake.lock` | the repository itself |
+| `cargo binstall whytime` | `[package.metadata.binstall]` in `crates/whytime/Cargo.toml` | crates.io |
+
+`packages.yml` and `image.yml` run on `workflow_call` (from `release.yml`, after the
+`release` job: a release made with `GITHUB_TOKEN` fires no `release` event) and on
+`workflow_dispatch`, both with input `tag`. They download the tag's published tarballs and
+never rebuild whytime. To backfill or redo a release: `gh workflow run packages.yml -f
+tag=vX.Y.Z` and `gh workflow run image.yml -f tag=vX.Y.Z`. Dispatched, they take
+`packaging/` from the branch they run on (main), so releases older than `packaging/` work;
+called from `release.yml`, from the tag.
+
+- **System packages.** `packages.yml` verifies each tarball's `.sha256`, gzips the man
+  pages (`gzip -9n`), runs nfpm (pinned with its checksum: `NFPM_VERSION`, `NFPM_SHA256` in
+  `packages.yml`) for deb, rpm, apk and archlinux on amd64 and arm64, writes `SHA256SUMS`
+  (the packages and `install.sh`) and uploads everything with `gh release upload
+  --clobber`. Asset names are nfpm's defaults, which the README's package table names:
+  `whytime_X.Y.Z_{amd64,arm64}.deb`, `whytime-X.Y.Z-1.{x86_64,aarch64}.rpm`,
+  `whytime_X.Y.Z_{x86_64,aarch64}.apk`, `whytime-X.Y.Z-1-{x86_64,aarch64}.pkg.tar.zst`.
+  Contents: `/usr/bin/whytime`, `/usr/share/man/man1/*.1.gz`, bash and fish completions in
+  `/usr/share/{bash-completion/completions,fish/vendor_completions.d}`, zsh in
+  `/usr/share/zsh/vendor-completions` (deb) or `site-functions` (others), licenses in
+  `/usr/share/doc/whytime/copyright` + `THIRD_PARTY_LICENSES.md` (deb) or
+  `/usr/share/licenses/whytime/` (others). No dependencies, no install scripts: a package
+  never runs `setcap` (every user who can execute the binary would gain BPF tracing).
+  Unsigned: users check `SHA256SUMS`, and apk needs `--allow-untrusted`. Local build: the
+  command in the header of `nfpm.yaml`.
+- **install.sh.** POSIX sh (keep it `shellcheck -s sh` clean), served as
+  `releases/latest/download/install.sh`, so every release must carry it. Linux x86_64 and
+  aarch64 only; resolves the latest tag through the `/releases/latest` redirect (curl, or
+  wget for busybox), verifies the `.sha256`, installs to `$prefix/bin`,
+  `$prefix/share/{man/man1,bash-completion/completions,zsh/site-functions,fish/vendor_completions.d,licenses/whytime}`.
+  Prefix: `--prefix DIR` / `WHYTIME_PREFIX`, else `/usr/local` (directly when writable,
+  else via sudo or doas), else `~/.local`. `WHYTIME_VERSION=vX.Y.Z` pins a release. Try a
+  change with `WHYTIME_VERSION=vX.Y.Z sh packaging/install.sh --prefix DIR`.
+- **Container.** `image.yml` tags `X.Y.Z`, and `X.Y` and `latest` only when the tag is the
+  newest non-prerelease of its line and overall (a backfill never moves them). The run
+  command is in the header of `packaging/Containerfile`.
+- **AUR.** `packaging/aur/whytime-bin/PKGBUILD` repackages the tarballs (provides and
+  conflicts `whytime`); `packaging/aur/whytime/PKGBUILD` builds the crate from
+  static.crates.io (glibc; makedepends cargo, clang). Each AUR package is its own git repo
+  holding `PKGBUILD` and `.SRCINFO` (never committed here):
+
+  ```sh
+  git clone ssh://aur@aur.archlinux.org/whytime-bin.git ~/aur/whytime-bin   # once
+  cp packaging/aur/whytime-bin/PKGBUILD ~/aur/whytime-bin/ && cd ~/aur/whytime-bin
+  sed -i 's/^pkgver=.*/pkgver=X.Y.Z/; s/^pkgrel=.*/pkgrel=1/' PKGBUILD
+  updpkgsums && makepkg -cf && makepkg --printsrcinfo > .SRCINFO   # updpkgsums: pacman-contrib
+  git add PKGBUILD .SRCINFO && git commit -m 'Update to X.Y.Z' && git push
+  ```
+
+  The same for `whytime` (`ssh://aur@aur.archlinux.org/whytime.git`); copy the bumped
+  PKGBUILDs back to `packaging/aur/` and commit them. A packaging-only fix bumps `pkgrel`.
+- **Nix.** `flake.nix` builds the checkout itself (`src = self`, version from `Cargo.toml`,
+  dependencies from `Cargo.lock`, so there is no hash to bump), with man pages and
+  completions. `github:` flake sources omit submodules, so tracekit is the flake input
+  `github:Arinerron/tracekit/vT` (locked in `flake.lock`): when the submodule moves to a new
+  tag, change that URL to match and run `nix flake update tracekit`. `nix run
+  github:Arinerron/whytime` follows main; `github:Arinerron/whytime/vX.Y.Z` pins a release
+  from the first tag that has `flake.nix`. `nix develop` gives cargo, clang and bpftool.
+- **cargo-binstall.** Overrides for `{x86_64,aarch64}-unknown-linux-{gnu,musl}` point at the
+  musl tarball and its `whytime-vX.Y.Z-ARCH-linux-musl/whytime`; other targets fall back to
+  building. binstall reads the metadata from the published crate, so it works from the
+  first crates.io release after 0.1.1. Check it against a published release with
+  `cargo binstall --manifest-path crates/whytime/Cargo.toml --targets
+  x86_64-unknown-linux-gnu --root DIR --disable-strategies compile,quick-install
+  whytime@X.Y.Z`.
 
 ## Layout
 
@@ -180,9 +266,11 @@ crates/whytime-testbins/   e2e workloads (src/bin/): wt-sleep, wt-burn, wt-fsync
                            thread), wt-compat (a 32-bit syscall); src/lib.rs: argument and
                            timing helpers
 xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR] | licenses [FILE]
-.github/                   workflows ci.yml, release.yml; actions/setup (clang, rustup);
-                           ISSUE_TEMPLATE (bug, feature forms), pull_request_template.md,
-                           dependabot.yml
+.github/                   workflows ci.yml, release.yml, packages.yml, image.yml;
+                           actions/setup (clang, rustup); ISSUE_TEMPLATE (bug, feature forms),
+                           pull_request_template.md, dependabot.yml
+packaging/                 nfpm.yaml, install.sh, Containerfile, aur/{whytime,whytime-bin}/PKGBUILD
+flake.nix, flake.lock      Nix flake (package, dev shell)
 tracekit/                  git submodule, Arinerron/tracekit pinned at a release tag (v0.1.0)
 README.md                  user documentation (install, usage, report, limits)
 CHANGELOG.md               release notes (Keep a Changelog)

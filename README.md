@@ -70,10 +70,67 @@ I have to make faster for this to finish sooner", not "what was busy".
 
 ## Install
 
-Static binaries for x86_64 and aarch64 are published on the
-[releases page](https://github.com/Arinerron/whytime/releases/latest). Each tarball holds
-the binary, `LICENSE`, `THIRD_PARTY_LICENSES.md` (the licenses of the code compiled into
-it), `README.md`, `completions/` and `man/`:
+whytime is one static binary for x86_64 and aarch64 Linux; every method below installs the
+same program. It then runs with sudo (or two capabilities, see [Privileges](#privileges)).
+
+**Install script.** Downloads the latest release for your machine, checks its SHA-256 and
+installs the binary, man pages and shell completions to `/usr/local` (through sudo when
+needed), or to `~/.local` without sudo. Run it again to upgrade.
+
+```sh
+curl -fsSL https://github.com/Arinerron/whytime/releases/latest/download/install.sh | sh
+```
+
+Pick a release or a directory with `... | WHYTIME_VERSION=v0.1.1 sh` and
+`... | sh -s -- --prefix DIR`.
+
+**Packages.** Every [release](https://github.com/Arinerron/whytime/releases/latest) has
+packages for both architectures (checksums in `SHA256SUMS`). Download yours, then:
+
+| System | Release asset | Install |
+|---|---|---|
+| Debian, Ubuntu | `whytime_X.Y.Z_amd64.deb`, `_arm64.deb` | `sudo apt install ./whytime_*.deb` |
+| Fedora, RHEL | `whytime-X.Y.Z-1.x86_64.rpm`, `.aarch64.rpm` | `sudo dnf install ./whytime-*.rpm` |
+| openSUSE | the same `.rpm` | `sudo zypper install --allow-unsigned-rpm ./whytime-*.rpm` |
+| Alpine | `whytime_X.Y.Z_x86_64.apk`, `_aarch64.apk` | `sudo apk add --allow-untrusted ./whytime_*.apk` |
+| Arch | `whytime-X.Y.Z-1-x86_64.pkg.tar.zst`, `-aarch64` | `sudo pacman -U ./whytime-*.pkg.tar.zst` |
+
+On Arch, the AUR has [`whytime-bin`](https://aur.archlinux.org/packages/whytime-bin) (the
+release binary) and [`whytime`](https://aur.archlinux.org/packages/whytime) (built from
+source): `paru -S whytime-bin`.
+
+**Nix** (flakes; builds from source, with man pages and completions):
+
+```sh
+nix run github:Arinerron/whytime -- doctor
+nix profile install github:Arinerron/whytime
+```
+
+**Container** (`ghcr.io/arinerron/whytime`, Alpine based). `--pid=host` is required, since
+the kernel reports host PIDs:
+
+```sh
+docker run --rm --pid=host --cap-add BPF --cap-add PERFMON --cap-add SYS_PTRACE \
+  --cap-add SYSLOG ghcr.io/arinerron/whytime -p PID
+```
+
+`-p PID` profiles any process on the host; `-- COMMAND` runs and profiles COMMAND inside the
+container; `doctor` checks the host.
+
+**Cargo.**
+
+```sh
+cargo install --locked whytime   # build from source
+cargo binstall whytime           # the static release binary (releases after 0.1.1)
+```
+
+`cargo install` compiles whytime and its BPF objects on your machine, so it needs clang with
+the BPF target (`clang -print-targets | grep bpf`; override with `CLANG=`) and Rust 1.94 or
+newer. `--locked` uses the dependency versions whytime was released with. The result is a
+dynamically linked glibc binary in `~/.cargo/bin`.
+
+**Release tarball.** Each tarball holds the binary, `LICENSE`, `THIRD_PARTY_LICENSES.md`
+(the licenses of the code compiled into it), `README.md`, `completions/` and `man/`:
 
 ```sh
 tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/Arinerron/whytime/releases/latest)
@@ -84,47 +141,6 @@ curl -fsSLO "https://github.com/Arinerron/whytime/releases/download/$tag/$name.t
 sha256sum -c "$name.tar.gz.sha256"
 tar -xzf "$name.tar.gz"
 sudo install -m 755 "$name/whytime" /usr/local/bin/whytime
-```
-
-### From crates.io
-
-```sh
-cargo install --locked whytime
-```
-
-This compiles whytime and its BPF objects on your machine, so it needs clang with the BPF
-target (`clang -print-targets | grep bpf`; override with `CLANG=`) and Rust 1.94 or newer.
-`--locked` uses the dependency versions whytime was released with. The result is a
-dynamically linked glibc binary in `~/.cargo/bin` (the release tarballs are static musl).
-`sudo whytime` usually reports "command not found", because sudo's `secure_path` does not
-include `~/.cargo/bin`: run `sudo "$(command -v whytime)" -- COMMAND`, or grant the
-capabilities to the binary instead (`sudo setcap cap_bpf,cap_perfmon+ep ~/.cargo/bin/whytime`,
-see below).
-
-### Privileges
-
-whytime needs `CAP_BPF` and `CAP_PERFMON`, or root. Pick one:
-
-- Run it with `sudo`. The command still runs as you: your uid, gid, supplementary groups,
-  and `HOME`/`USER`/`LOGNAME`, not root. Trace and output files are handed to you.
-- Grant the capabilities once and run it unprivileged:
-
-  ```sh
-  sudo setcap cap_bpf,cap_perfmon+ep /usr/local/bin/whytime
-  ```
-
-  The capabilities are dropped when the command is executed. File capabilities are ignored
-  on `nosuid` mounts (often `/tmp`), so install to a regular path. Kernel frames in
-  flamegraphs additionally need `cap_syslog` (or root).
-
-Every user who can execute a binary with file capabilities gets them; see
-[SECURITY.md](https://github.com/Arinerron/whytime/blob/main/SECURITY.md) for shared machines.
-
-### Shell completions and man pages
-
-From the release tarball:
-
-```sh
 sudo install -m 644 "$name"/man/*.1 /usr/local/share/man/man1/
 sudo install -m 644 "$name/completions/whytime.bash" /usr/share/bash-completion/completions/whytime
 sudo install -m 644 "$name/completions/_whytime" /usr/share/zsh/site-functions/_whytime
@@ -132,8 +148,30 @@ install -Dm 644 "$name/completions/whytime.fish" ~/.config/fish/completions/whyt
 # also completions/whytime.elv (elvish) and completions/_whytime.ps1 (PowerShell)
 ```
 
-Or generate a completion script from the binary:
-`whytime completions <bash|zsh|fish|elvish|powershell>` writes it to stdout.
+`whytime completions <bash|zsh|fish|elvish|powershell>` also prints a completion script.
+
+### Privileges
+
+whytime needs `CAP_BPF` and `CAP_PERFMON`, or root. No installation method above grants
+them by itself. Pick one:
+
+- Run it with `sudo`. The command still runs as you: your uid, gid, supplementary groups,
+  and `HOME`/`USER`/`LOGNAME`, not root. Trace and output files are handed to you. sudo
+  only searches its `secure_path` (the system directories), so for `~/.local/bin`,
+  `~/.cargo/bin` or `~/.nix-profile/bin` run `sudo "$(command -v whytime)" -- COMMAND`.
+- Grant the capabilities once and run it unprivileged:
+
+  ```sh
+  sudo setcap cap_bpf,cap_perfmon+ep "$(command -v whytime)"
+  ```
+
+  The capabilities are dropped when the command is executed. File capabilities are ignored
+  on `nosuid` mounts (often `/tmp`), so install to a regular path (not the read-only Nix
+  store). Kernel frames in flamegraphs additionally need `cap_syslog` (or root). A package
+  upgrade replaces the binary and drops them; run `setcap` again.
+
+Every user who can execute a binary with file capabilities gets them; see
+[SECURITY.md](https://github.com/Arinerron/whytime/blob/main/SECURITY.md) for shared machines.
 
 ## Requirements
 
