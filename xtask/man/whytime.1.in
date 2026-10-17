@@ -1,0 +1,945 @@
+.\" whytime(1), hand-written. cargo xtask man adds the title line and
+.\" replaces each ".\" @SECTION" line with that section rendered from cli.rs.
+.SH NAME
+whytime \- explain where a command's wall-clock time went
+.SH SYNOPSIS
+.SY whytime
+.RI [ OPTIONS ]
+.RB [ \-\- ]
+.I COMMAND
+.RI [ ARG ...]
+.YS
+.SY whytime
+.RI [ OPTIONS ]
+.BI \-p " PID"
+.YS
+.SY "whytime report"
+.RI [ OPTIONS ]
+.I FILE
+.YS
+.SY "whytime doctor"
+.RB [ \-\-json ]
+.YS
+.SY "whytime completions"
+.I SHELL
+.YS
+.SH DESCRIPTION
+.B whytime
+runs
+.I COMMAND
+with its arguments, traces it and every process it starts with eBPF, and prints
+to standard error where its wall-clock time went: on a CPU, waiting for a CPU,
+waiting on child processes, sleeping, in
+.BR fsync (2),
+reading files, waiting on network peers, pipes, locks and so on.
+.I COMMAND
+inherits standard input, output and error, so its own output passes through
+unchanged, and
+.B whytime
+exits with
+.IR COMMAND 's
+exit status.
+The report is printed when
+.I COMMAND
+exits.
+.PP
+The observation window starts when
+.I COMMAND
+is executed and ends when it exits (or when
+.B \-\-duration
+elapses).
+Within it,
+.B whytime
+follows
+.IR COMMAND 's
+main thread and attributes every nanosecond to exactly one line of the report.
+When the thread blocks on something another traced task provides (a child it
+waits for, a pipe another process writes, a lock another thread releases), the
+time is attributed to what that task was doing meanwhile: it follows the waker.
+The result is one critical path through the process tree, and the shares of the
+report lines sum to 100%.
+.PP
+With
+.BI \-p " PID"
+(attach mode),
+.B whytime
+observes a process that is already running, and its descendants, instead of
+starting one; see
+.BR "ATTACH MODE" .
+.PP
+.B whytime
+needs the
+.B CAP_BPF
+and
+.B CAP_PERFMON
+capabilities (or root) to load its tracing programs; see
+.BR PRIVILEGES .
+.B whytime doctor
+checks whether this system can run it and prints exact fixes; see
+.BR whytime\-doctor (1).
+.\" @OPTIONS
+.\" @COMMANDS
+.SH THE REPORT
+A run of a small shell script (its exit status was 0):
+.PP
+.RS 4
+.EX
+$ \fBsudo whytime \-\- sh \-c 'sleep 0.25;\fP
+    \fBdd if=/dev/zero of=blob bs=1M count=64 conv=fsync status=none;\fP
+    \fBxz \-T2 \-6 \-k \-f \-c blob | sha256sum >/dev/null;\fP
+    \fBpython3 \-c "import time; time.sleep(0.1)"'\fP
+wall 1.61s
+cpu 1.85s across 5 processes \(pc 1.1\(mu parallel
+  61%  waiting on child: xz
+  16%  timer sleep (sleep)
+   8%  waiting on child: dd
+   6%  timer sleep (python3)
+   5%  on\-CPU (python3)
+   2%  fsync on /var/tmp/wt\-man
+   2%  other
+critical path: 5 processes \(pc 0 events lost
+.EE
+.RE
+.PP
+Line by line:
+.TP
+.B wall
+The length of the observation window.
+.TP
+.B cpu
+On-CPU time of every traced thread within the window, the number of processes
+that had any, and their ratio to the wall time: how many CPUs were busy on
+average.
+This counts all the work, including work that ran in parallel with the critical
+path and therefore appears in no line below.
+.TP
+.I share label
+The report lines, largest first: every line of at least 1%, at most 8 of them.
+Each is a class (see
+.BR CLASSES )
+and a subject within it: a process name, a directory, a network peer or a
+system call.
+Here the shell spent 61% of the window waiting for
+.BR xz ,
+which was computing.
+A
+.B runqueue
+line where one task held the CPU for at least half of it ends with
+.RI "\(lq\(em mostly " "comm share" \(rq,
+for example
+.RB \(lq "waiting for a CPU (cc1) \(em mostly chrome 61%" \(rq.
+.TP
+.B other
+The lines below 1% (or beyond the eighth) summed, so that the shares add up to
+100%.
+.TP
+.B critical path
+How many processes contributed time to the lines, and how many records the
+kernel side lost (lost time is reported as
+.BR "other (untraced)" ).
+.TP
+.B note:
+Caveats for this run, one per line: time before an attach is not covered,
+tracing programs that could not be attached, network peers that stayed numeric,
+a run ended by
+.B \-\-duration
+or a signal, lost records.
+.PP
+With
+.BR \-\-timeline ,
+a section before the
+.B critical path
+line divides the window into 10 equal slices and shows up to 3 lines of each
+(class, subject and share of the slice, at least 1%):
+.PP
+.RS 4
+.EX
+timeline (161ms slices):
+  0.00\(en0.16s  sleep sleep 98% \(pc cpu sh 1%
+  0.16\(en0.32s  sleep sleep 57% \(pc child dd 42%
+  0.32\(en0.48s  child xz 39% \(pc child dd 35% \(pc fsync /var/tmp/wt\-man 18%
+  0.48\(en0.64s  child xz 100%
+\&...
+  1.45\(en1.61s  sleep python3 62% \(pc cpu python3 35%
+.EE
+.RE
+.PP
+Process names in subjects are the
+.I comm
+of the process image the time belongs to.
+When processes with the same name but different arguments are on the path,
+each is named by the shortest suffix of its arguments that tells them apart
+.RB ( "sort \-n" ,
+.BR "make \[u2026] all" ),
+or by
+.IR comm [ pid ]
+when the arguments do not.
+Paths are shown as the blocked process saw them, with the home directory of
+the invoking user abbreviated to
+.BR \(ti .
+Control characters in subjects and notes are printed as
+.BI \ex HH .
+.SH CLASSES
+Each line of the report belongs to one class (the
+.B class
+field of the JSON report).
+The label is how the human report prints a line; time blocked in a system call
+is classified by the call and the file descriptor it waits on.
+.TP
+.B cpu
+.RI "on-CPU (" comm )
+.br
+.IR COMMAND 's
+own process (any of its threads) was running on a CPU.
+.TP
+.B child
+.RI "waiting on child: " name
+.br
+.I COMMAND
+(or a process it waited for) waited while a descendant process was running on
+a CPU; the subject is the descendant that was computing.
+.TP
+.B runqueue
+.RI "waiting for a CPU (" comm )
+.br
+Runnable but not running: preempted, or woken and not yet scheduled.
+The JSON line lists in
+.B held_by
+who held the CPU meanwhile
+.RB ( idle
+for an idle CPU).
+.TP
+.B sleep
+.RI "timer sleep (" comm )
+.br
+.BR nanosleep (2),
+.BR clock_nanosleep (2),
+reads of a timerfd.
+.TP
+.B fsync
+.RI "fsync on " directory
+.br
+Waiting for data to become durable:
+.BR fsync (2),
+.BR fdatasync (2),
+.BR sync_file_range (2),
+.BR syncfs (2),
+writes to files opened with
+.B O_SYNC
+or
+.BR O_DSYNC .
+.BR sync (2)
+and
+.BR msync (2)
+name the system call instead
+.RB ( "fsync in sync" ).
+.TP
+.B file
+.RI "file I/O on " directory
+.br
+Other I/O on regular files and block devices, and path system calls such as
+.BR openat (2)
+and
+.BR stat (2),
+which are named by the call
+.RB ( "file I/O in newfstatat" ).
+.TP
+.B lock
+.RI "file lock wait on " directory
+.br
+.BR flock (2),
+.BR fcntl (2)
+with
+.B F_SETLKW
+or
+.BR F_OFD_SETLKW .
+.TP
+.B aio
+.RI "async I/O completion (" comm )
+.br
+.BR io_uring_enter (2),
+.BR io_getevents (2),
+.BR io_pgetevents (2).
+.TP
+.B net
+.RI "blocked on network: " peer " (" n " connections)"
+.br
+Internet sockets.
+The peer is
+.IB host : port
+when the traced processes looked the address up during the window through a
+resolver
+.B whytime
+reads (DNS over port 53, or systemd-resolved's varlink socket), otherwise
+.IR ip : port .
+.TP
+.B ipc
+.RI "IPC wait (" comm )
+.br
+Pipes, FIFOs, UNIX sockets, eventfds, System V semaphores and message queues,
+POSIX message queues.
+A wait ended by a process outside the traced tree is named
+.RI "woken by " comm .
+.TP
+.B futex
+.RI "lock/futex wait (" comm )
+.br
+.BR futex (2)
+waits: mutexes, condition variables, thread joins, when the thread that ended
+the wait could not be followed.
+.TP
+.B poll
+.RI "poll/epoll wait (" comm )
+.br
+.BR poll (2),
+.BR select (2),
+.BR epoll_wait (2)
+when no single resource explains the wait; inotify and fanotify reads.
+A wait whose ready descriptor was seen is classified as that descriptor would
+be (a socket as
+.B net
+or
+.BR ipc ,
+a FIFO as
+.BR ipc ,
+a character device as
+.BR tty ).
+.TP
+.B signal
+.RI "waiting for a signal (" comm )
+.br
+.BR pause (2),
+.BR rt_sigsuspend (2),
+.BR rt_sigtimedwait (2),
+signalfd reads.
+.TP
+.B tty
+.RI "terminal/device I/O (" comm )
+.br
+Terminals and other character devices.
+.TP
+.B fault
+.RI "page faults on " directory
+.br
+Blocked inside a page fault: reading a mapped file (the subject is its
+directory) or
+.BR "anonymous memory (swap)" .
+This takes precedence over the system call the fault interrupted.
+.TP
+.B other
+.RI "other (" what )
+.br
+Everything else:
+.B in syscall
+.I N
+(a system call
+.B whytime
+does not classify),
+.B 32\-bit syscall
+(i386 or AArch32 programs),
+.B outside syscalls (page faults, kernel locks)
+(blocked outside any system call),
+.BR "stopped (signal or tracer)" ,
+.B blocked since attach, syscall unreadable
+(attach mode without ptrace access), and
+.B untraced
+(time whose records the kernel side lost).
+.PP
+Blocks in
+.BR futex ,
+.B ipc
+and
+.B poll
+waits that a traced thread ended,
+.BR wait4 (2)
+and
+.BR waitid (2)
+for a child, and a
+.BR vfork (2)
+or
+.BR posix_spawn (3)
+until the child executes, are not reported as waits: the time goes to what the
+thread that ended the wait was doing, recursively.
+A
+.B futex
+or
+.B poll
+wait that ended by timeout and was retried at once is joined to the retry that
+a traced thread ended.
+.SH ATTACH MODE
+.B whytime \-p
+.I PID
+observes the running process
+.I PID
+and its descendants, including the processes they start after the attach.
+The window starts once
+.B whytime
+has recorded the state of every thread from
+.I /proc
+and ends when the process exits, when
+.B \-\-duration
+elapses, or when
+.B whytime
+receives
+.BR SIGINT ,
+.B SIGTERM
+or
+.B SIGHUP
+(Ctrl-C).
+.B whytime
+never signals the target, and exits 0 after the report.
+.PP
+Time before the attach is not covered.
+Each thread's first interval is classified from what
+.I /proc
+showed at the attach (its state, its system call and file descriptor).
+Without ptrace access to the target (for example with
+.B kernel.yama.ptrace_scope
+at 1 or more under file capabilities), a thread blocked in a system call is
+reported as
+.B other
+for that first interval, and a note says so.
+.PP
+.B whytime
+refuses a
+.I PID
+that does not exist, 1, itself, a thread that is not a thread group leader, a
+zombie, and, without
+root or
+.BR CAP_SYS_PTRACE ,
+a process whose real, effective or saved user or group ID is not the invoking
+user's; it then prints why and exits 1.
+.SH TRACE FILES
+.B \-\-record
+.I FILE
+writes everything the report is computed from to
+.I FILE
+alongside the normal run (wrap or attach mode, with any other option).
+.B whytime report
+.I FILE
+reads it back and prints the identical report, byte for byte, and writes the
+identical
+.BR \-\-json ,
+.BR \-\-perfetto ,
+.B \-\-flamegraph
+and
+.B \-\-folded
+output (flamegraphs only if the recording captured stacks).
+Replaying needs no privileges, no BPF and none of the traced processes, so a
+trace file can be examined on another machine of the same architecture.
+See
+.BR whytime\-report (1).
+.PP
+A trace file describes what the traced processes did and can contain
+sensitive data: the argument vectors of every traced process (which may include
+secrets passed on the command line), file and directory paths, your home
+directory, network peers, the hostnames the processes looked up (from the raw
+resolver messages, stored verbatim), names of processes outside the tree that
+woke a traced thread or held its CPU, symbolized call stacks with
+.B \-\-flamegraph
+or
+.BR \-\-folded ,
+and in attach mode what
+.B whytime
+read from
+.IR /proc .
+Review a trace file before sharing it.
+.SH FLAMEGRAPHS AND PERFETTO
+.B \-\-flamegraph
+.I FILE
+writes an SVG wall-clock flamegraph of the critical path: its width is the
+window, and every attributed nanosecond is in exactly one stack.
+Each stack starts with the report line's label, then the process name, the
+thread name when it differs, then the call stack: user frames, then kernel
+frames marked
+.BR _[k] .
+On-CPU time is split over the stacks sampled at 199 Hz in that stretch; blocked
+time gets the stack captured when the block began; waiting for a CPU ends in
+.BR [runqueue] .
+Placeholders:
+.B [no sample]
+(no on-CPU sample within 5 ms),
+.B [no stack]
+(a thread blocked since before an attach),
+.B [stack lost]
+(the kernel could not store it),
+.B [unknown]
+(an address in no executable mapping),
+.BI [ library ]
+(a mapped file without a covering symbol),
+.B [kernel]_[k]
+(kernel addresses hidden by
+.IR /proc/kallsyms ).
+The SVG is self-contained: click a frame to zoom, Ctrl-F or Search to
+highlight frames matching a regular expression.
+.PP
+.B \-\-folded
+.I FILE
+writes the same stacks in the folded format
+.RI ( frame ; frame ;...\&
+.IR count ,
+one line per distinct stack, counts in microseconds) for
+.BR flamegraph.pl ,
+.B inferno
+or
+.BR speedscope .
+.PP
+Either option makes
+.B whytime
+capture stacks while tracing.
+User stacks are unwound by frame pointers only: code built without them shows
+truncated stacks or
+.BR [unknown] .
+Symbols come from the symbol tables
+.RB ( .symtab ,
+else
+.BR .dynsym ),
+without debug information, so there are no inlined frames.
+Stack capture needs
+.B kernel.perf_event_max_stack
+of at least 127; when it cannot work,
+.B whytime
+exits 125 with the fix before running
+.IR COMMAND .
+.PP
+.B \-\-perfetto
+.I FILE
+writes the window as Chrome Trace Event JSON, to open in
+https://ui.perfetto.dev or chrome://tracing: a
+.B critical path
+track with one slice per attributed stretch (named like the report lines), one
+track per traced thread with its on-CPU, runqueue and blocked stretches, and
+instant events for forks, execs and exits.
+Timestamps are microseconds from the start of the window.
+.PP
+Under
+.BR sudo ,
+all output files are created by the invoking user, so they belong to them and
+their permissions decide where
+.B whytime
+may write.
+A file that cannot be created stops
+.B whytime
+before anything runs (exit status 125).
+.SH JSON OUTPUT
+.B \-\-json
+prints the report to standard error as one JSON object instead of the text.
+Its
+.B schema
+field is
+.BR whytime.report/1 .
+The top-level fields are:
+.TP
+.B schema
+.RB \(dq whytime.report/1 \(dq.
+.TP
+.B command
+.I COMMAND
+and its arguments (attach mode: the target's argument vector).
+.TP
+.B attached_pid
+The target PID; present only in attach mode.
+.TP
+.B wall_ns
+Length of the window in nanoseconds.
+.TP
+.B ended_by
+.BR \(dqexit\(dq ,
+.B \(dqduration\(dq
+or
+.B \(dqinterrupt\(dq
+(attach mode only).
+.TP
+.B exit_code
+.IR COMMAND 's
+exit status (128 plus the signal number if a signal killed it), or null while
+it is still running.
+.TP
+.B parallelism
+.BR cpu_ns ,
+.B processes
+and
+.BR factor :
+the
+.B cpu
+line of the text report.
+.TP
+.B lines
+The breakdown, largest first, every line (not only those of at least 1%):
+.BR class ,
+.B share
+(a fraction of
+.BR wall_ns ;
+the shares sum to 1),
+.BR ns ,
+.BR subject ,
+and where they apply
+.B connections
+and
+.B addr
+.RB ( net
+lines) and
+.B held_by
+.RB ( runqueue
+lines).
+.TP
+.B timeline
+With
+.B \-\-timeline
+only: 10 slices of
+.BR start_ns ,
+.B end_ns
+and their
+.BR lines .
+.TP
+.B processes
+Every process of the traced tree:
+.BR pid ,
+.BR ppid ,
+.BR comm ,
+.BR argv ,
+.B cpu_ns
+(on-CPU time over all its threads),
+.BR exit_code ,
+and
+.B critical
+(whether any line's time came from it).
+.TP
+.B quality
+.B events
+(records received),
+.B dropped
+(records lost in the kernel), and whether the optional probe sets were attached:
+.BR syscalls ,
+.BR readiness ,
+.BR faults ,
+.BR dns .
+.TP
+.B notes
+The caveats, as strings.
+.PP
+The schema changes only additively: new optional fields, new classes, new
+notes.
+Removing or renaming a field, or changing its type or meaning, changes the
+schema name.
+Consumers should ignore unknown fields and treat an unknown class as
+.BR other .
+.SH PRIVILEGES
+Loading the tracing programs needs
+.B CAP_BPF
+and
+.BR CAP_PERFMON ,
+or root.
+There are two ways to run
+.BR whytime :
+.TP
+.BI "sudo whytime \-\- " COMMAND
+.B whytime
+runs as root and runs
+.I COMMAND
+as the invoking user (from
+.B SUDO_UID
+and
+.BR SUDO_GID ,
+with the groups of
+.BR SUDO_USER ),
+with
+.BR HOME ,
+.B USER
+and
+.B LOGNAME
+set back to that user's.
+.TP
+.BI "sudo setcap cap_bpf,cap_perfmon+ep " /path/to/whytime
+Once; then run
+.B whytime
+without sudo.
+.I COMMAND
+does not inherit the capabilities.
+File capabilities are ignored on file systems mounted
+.B nosuid
+(often
+.IR /tmp ),
+under
+.BR no_new_privs ,
+and they are lost whenever the file is replaced: run
+.B setcap
+again after every upgrade.
+The distribution packages do not set them.
+.PP
+Optionally,
+.B CAP_SYS_PTRACE
+(for example
+.BR "setcap cap_bpf,cap_perfmon,cap_sys_ptrace+ep" )
+lets
+.B whytime
+resolve file paths of descendants running as another user, read the system
+calls of an attach target's threads under Yama's
+.BR ptrace_scope ,
+and attach to other users' processes.
+Kernel frames in flamegraphs need
+.I /proc/kallsyms
+addresses: root, or
+.B cap_syslog
+in the file capabilities, or
+.B kernel.kptr_restrict=0
+with
+.B kernel.perf_event_paranoid
+at most 1.
+.PP
+.B whytime
+needs Linux 5.18 or newer with BTF
+.RI ( /sys/kernel/btf/vmlinux )
+on x86_64 or aarch64.
+.SH ENVIRONMENT
+.TP
+.B WHYTIME_LOG
+Log level of
+.BR whytime 's
+diagnostics on standard error:
+.BR off ,
+.BR error ,
+.B warn
+(the default),
+.BR info ,
+.B debug
+or
+.BR trace .
+.B debug
+prints the kernel verifier's log when a tracing program fails to load.
+.TP
+.B NO_COLOR
+When set, the
+.B whytime doctor
+report and the start-up diagnostics are not colored (they are colored only on a
+terminal).
+.TP
+.BR SUDO_UID ", " SUDO_GID ", " SUDO_USER
+When
+.B whytime
+runs as root with these set to another user (as
+.BR sudo (8)
+sets them),
+.I COMMAND
+runs as that user and output files are created as that user.
+.TP
+.B HOME
+The home directory abbreviated to
+.B \(ti
+in paths, when the password database has none for the user.
+.PP
+.I COMMAND
+inherits
+.BR whytime 's
+environment.
+.B WHYTIME_STACK_FLIP_MS
+and
+.B WHYTIME_STACK_MAP_ENTRIES
+exist for
+.BR whytime 's
+own tests only.
+.SH EXIT STATUS
+.TP
+.I status
+.IR COMMAND 's
+exit status, or 128 plus the signal number if a signal killed it.
+With
+.BR \-\-duration ,
+.B whytime
+reports when the time is up, then waits for
+.I COMMAND
+and still exits with its status.
+.TP
+.B 2
+Invalid command-line usage.
+.TP
+.B 125
+.B whytime
+could not start tracing (it prints the failing
+.B whytime doctor
+checks), or could not create an output file.
+.TP
+.B 126
+.I COMMAND
+was found but could not be executed.
+.TP
+.B 127
+.I COMMAND
+was not found.
+.PP
+In attach mode:
+.B 0
+after the report,
+.B 1
+if
+.I PID
+cannot be attached to, and
+.B 125
+as above.
+.B whytime report
+exits 0, or 2 if the trace file cannot be replayed;
+.B whytime doctor
+exits 0 if
+.B whytime
+can run, 3 if it cannot.
+.PP
+.B SIGINT
+and
+.B SIGQUIT
+from the terminal reach
+.I COMMAND
+while
+.B whytime
+ignores them and reports after
+.I COMMAND
+exits;
+.B SIGTERM
+and
+.B SIGHUP
+sent to
+.B whytime
+are forwarded to
+.IR COMMAND .
+.SH EXAMPLES
+Explain a slow build:
+.PP
+.RS 4
+.EX
+sudo whytime \-\- make \-j8
+.EE
+.RE
+.PP
+Grant the capabilities once, then run without sudo:
+.PP
+.RS 4
+.EX
+sudo setcap cap_bpf,cap_perfmon+ep "$(command \-v whytime)"
+whytime \-\- ./run\-tests.sh
+.EE
+.RE
+.PP
+Observe a running service for 30 seconds:
+.PP
+.RS 4
+.EX
+sudo whytime \-\-duration 30s \e
+    \-p "$(systemctl show \-p MainPID \-\-value nginx)"
+.EE
+.RE
+.PP
+Report on the first 10 seconds of a long job (it keeps running, and
+.B whytime
+exits with its status when it ends):
+.PP
+.RS 4
+.EX
+sudo whytime \-\-duration 10s \-\- ./long\-job
+.EE
+.RE
+.PP
+Record once, then examine the trace without privileges: as a timeline, as JSON
+(free of the command's own standard error), and in Perfetto:
+.PP
+.RS 4
+.EX
+sudo whytime \-\-record slow.wt \-\- cargo test
+whytime report slow.wt \-\-timeline
+whytime report slow.wt \-\-json 2>report.json
+whytime report slow.wt \-\-perfetto slow.json
+.EE
+.RE
+.PP
+Draw a flamegraph of the critical path, and keep the folded stacks:
+.PP
+.RS 4
+.EX
+sudo whytime \-\-flamegraph build.svg \-\-folded build.folded \-\- make
+.EE
+.RE
+.PP
+Check the system first, for scripts as JSON:
+.PP
+.RS 4
+.EX
+whytime doctor
+whytime doctor \-\-json | jq \-r .verdict
+.EE
+.RE
+.SH LIMITATIONS
+.IP \(bu 2
+One critical path.
+Work that ran in parallel with it (other threads, children other than the one
+that ended a wait) is in no line; the
+.B cpu
+line and
+.B processes[].cpu_ns
+count it.
+Of N parallel workers that are joined, the report follows the one whose exit
+ended the wait.
+.IP \(bu 2
+Following trusts the last waker: a futex wait is followed to the thread that
+woke it, which is the critical path only if that thread was what the waiter
+needed.
+Retried waits are joined by timing alone.
+.IP \(bu 2
+Dependencies outside the traced tree (a daemon, a display server, a remote
+service) appear only as the resource
+.I COMMAND
+blocked on
+.RB ( net ,
+.BR ipc ).
+.IP \(bu 2
+Network peers are named only from lookups the traced processes made during the
+window through DNS on port 53 or systemd-resolved; lookups before the window,
+from
+.IR /etc/hosts ,
+by a caching daemon, or over DNS-over-TLS/HTTPS leave them as
+.IR ip : port .
+.IP \(bu 2
+File paths are captured when a system call first blocks and are shown relative
+to the blocked process's mount namespace; paths longer than 256 bytes or 32
+components are truncated.
+.IP \(bu 2
+System calls of 32-bit programs are reported as
+.BR "other (32\-bit syscall)" .
+.IP \(bu 2
+A preempted stretch of a CPU-bound thread is credited to the task that held the
+CPU during its longest preemption.
+.IP \(bu 2
+Attach mode does not see time before the attach, and classifies each thread's
+first interval from
+.IR /proc ,
+which can race with the thread by microseconds.
+.IP \(bu 2
+Flamegraphs unwind user stacks by frame pointers only, give a whole block the
+stack at its start, and show interpreters' C frames, not script functions.
+.SH SEE ALSO
+.BR whytime\-report (1),
+.BR whytime\-doctor (1),
+.BR whytime\-completions (1),
+.BR time (1),
+.BR perf (1),
+.BR strace (1),
+.BR bpftrace (8),
+.BR capabilities (7),
+.BR setcap (8)
+.PP
+Project page: https://github.com/Arinerron/whytime
+.SH BUGS
+Report bugs at https://github.com/Arinerron/whytime/issues,
+with the output of
+.B whytime doctor
+and, if possible, a trace file recorded with
+.B \-\-record
+of a minimal reproduction (see
+.B TRACE FILES
+for what it contains).
+.SH AUTHOR
+Aaron Esau.
+.SH COPYRIGHT
+Copyright \(co 2026 Aaron Esau.
+MIT License.
+The BPF programs declare the license string
+.B Dual MIT/GPL
+to the kernel; the vendored libbpf headers compiled into them are licensed
+LGPL-2.1 OR BSD-2-Clause.

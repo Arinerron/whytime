@@ -1,0 +1,132 @@
+.\" whytime-report(1), hand-written. cargo xtask man adds the title line and
+.\" replaces each ".\" @SECTION" line with that section rendered from cli.rs.
+.SH NAME
+whytime\-report \- print the report of a whytime trace file
+.SH SYNOPSIS
+.SY "whytime report"
+.RI [ OPTIONS ]
+.I FILE
+.YS
+.SH DESCRIPTION
+.B whytime report
+reads a trace file written by
+.B whytime \-\-record
+.I FILE
+and prints its report to standard error, exactly as the recording run printed
+it: the same text, or with
+.B \-\-json
+the same JSON, byte for byte.
+It runs the recorded events through the same code as a live run, so
+.B \-\-timeline
+and
+.B \-\-perfetto
+may be given even if the recording run did not use them, and produce the
+output that run would have.
+.PP
+Replaying needs no privileges, no BPF support in the kernel and none of the
+traced processes, so a trace file can be examined later or on another machine.
+It must be replayed by a
+.B whytime
+built for the architecture it was recorded on.
+.PP
+.B \-\-flamegraph
+and
+.B \-\-folded
+need the call stacks, which only a recording made with one of them contains.
+For any other trace file,
+.B whytime report
+prints that there is no flamegraph to draw, prints the report, and exits 2.
+.PP
+A trace file is checked completely before anything is replayed; a file that
+fails the check is rejected with the reason, never half replayed.
+The reasons include:
+.TP
+.B not a whytime trace file
+.I FILE
+is something else.
+.TP
+.BI "trace format version " N " is not supported"
+The file was written by a
+.B whytime
+with a different trace format.
+.TP
+.BI "recorded with wire ABI " X ", but this whytime uses " Y
+The kernel record layout changed between the two versions of
+.BR whytime ;
+record the trace again with this one.
+.TP
+.BI "recorded on " arch ", but this whytime is built for " arch
+System call numbers differ between architectures.
+.TP
+.B truncated
+The recording ended before the observation window did: the recording
+.B whytime
+was killed or failed, or the attach target exited while
+.B whytime
+attached to it.
+.PP
+Trace files can contain sensitive data (argument vectors, paths, network peers
+and looked-up hostnames, call stacks); see
+.B TRACE FILES
+in
+.BR whytime (1).
+.\" @OPTIONS
+.SH EXIT STATUS
+.TP
+.B 0
+The report was printed and every requested file written.
+.TP
+.B 2
+.I FILE
+cannot be read or replayed, an output file cannot be created or written, or
+.B \-\-flamegraph
+or
+.B \-\-folded
+was given for a trace recorded without stacks (the report is still printed),
+or the command line is invalid.
+.SH EXAMPLES
+Record a run, then print its report again, with a timeline:
+.PP
+.RS 4
+.EX
+sudo whytime \-\-record build.wt \-\- make
+whytime report build.wt \-\-timeline
+.EE
+.RE
+.PP
+Replay a trace recorded with
+.BR \-\-flamegraph ,
+writing the same flamegraph, its folded stacks and a Perfetto trace:
+.PP
+.RS 4
+.EX
+whytime report build.wt \-\-flamegraph build.svg \-\-folded build.folded \e
+    \-\-perfetto build.json
+.EE
+.RE
+.PP
+Extract the JSON report (it goes to standard error):
+.PP
+.RS 4
+.EX
+whytime report build.wt \-\-json 2>&1 |
+    jq '.lines[] | {class, subject, share}'
+.EE
+.RE
+.PP
+A trace file recorded without stacks:
+.PP
+.RS 4
+.EX
+$ \fBwhytime report demo.wt \-\-flamegraph demo.svg\fP
+whytime: demo.wt: recorded without stack capture, so there is no
+flamegraph to draw (record with \-\-flamegraph or \-\-folded)
+wall 1.61s
+\&...
+$ \fBecho $?\fP
+2
+.EE
+.RE
+.SH SEE ALSO
+.BR whytime (1),
+.BR whytime\-doctor (1)
