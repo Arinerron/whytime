@@ -6,7 +6,7 @@
 # whytime needs Linux >= 5.18 with BTF and CAP_BPF + CAP_PERFMON (sudo, or setcap).
 
 pkgname=whytime
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 _tracekit=0.1.0
 pkgdesc="Explains where a command's wall-clock time went: off-CPU and on-CPU attribution from eBPF"
@@ -18,8 +18,8 @@ depends=(glibc libgcc)
 makedepends=(cargo clang)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
         "tracekit-$_tracekit.tar.gz::https://github.com/Arinerron/tracekit/archive/v$_tracekit.tar.gz")
-sha256sums=('SKIP'
-            'SKIP')
+sha256sums=('3acf3be9752108acef92b0679d443bfb48b3a775b7f0a2e95d75db8edbfe0dab'
+            'c5d39a2c096b5e743a5b62085e84184cd682e0b6e127bfac23dd37dcfb058252')
 
 _target() {
   rustc -vV | sed -n 's/^host: //p'
