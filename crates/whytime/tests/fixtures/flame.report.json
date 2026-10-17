@@ -5,42 +5,42 @@
     "600",
     "400"
   ],
-  "wall_ns": 1001089413,
+  "wall_ns": 1003448447,
   "ended_by": "exit",
   "exit_code": 0,
   "parallelism": {
-    "cpu_ns": 599996883,
+    "cpu_ns": 602069623,
     "processes": 1,
-    "factor": 0.5993439499094972
+    "factor": 0.6000005528933765
   },
   "lines": [
     {
       "class": "cpu",
-      "share": 0.5993439499094972,
-      "ns": 599996883,
+      "share": 0.6000005528933765,
+      "ns": 602069623,
       "subject": "wt-flame"
     },
     {
       "class": "sleep",
-      "share": 0.39956413763412757,
-      "ns": 399999428,
+      "share": 0.39858897404821036,
+      "ns": 399963487,
       "subject": "wt-flame"
     },
     {
       "class": "runqueue",
-      "share": 0.001091912456375163,
-      "ns": 1093102,
+      "share": 0.0014104730584131343,
+      "ns": 1415337,
       "subject": "wt-flame",
       "held_by": [
         {
-          "comm": "sway",
-          "tgid": 15353,
-          "ns": 1066990
+          "comm": "python",
+          "tgid": 1467820,
+          "ns": 1390515
         },
         {
           "comm": "idle",
           "tgid": 0,
-          "ns": 26112
+          "ns": 24822
         }
       ]
     }
@@ -48,146 +48,146 @@
   "timeline": [
     {
       "start_ns": 0,
-      "end_ns": 100108941,
+      "end_ns": 100344844,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 100108941
+          "ns": 100344844
         }
       ]
     },
     {
-      "start_ns": 100108941,
-      "end_ns": 200217882,
+      "start_ns": 100344844,
+      "end_ns": 200689689,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 100108941
+          "ns": 100344845
         }
       ]
     },
     {
-      "start_ns": 200217882,
-      "end_ns": 300326823,
+      "start_ns": 200689689,
+      "end_ns": 301034534,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 100108941
+          "ns": 100344845
         }
       ]
     },
     {
-      "start_ns": 300326823,
-      "end_ns": 400435765,
+      "start_ns": 301034534,
+      "end_ns": 401379378,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 100108942
+          "ns": 100344844
         }
       ]
     },
     {
-      "start_ns": 400435765,
-      "end_ns": 500544706,
+      "start_ns": 401379378,
+      "end_ns": 501724223,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 100108941
+          "ns": 100344845
         }
       ]
     },
     {
-      "start_ns": 500544706,
-      "end_ns": 600653647,
+      "start_ns": 501724223,
+      "end_ns": 602069068,
       "lines": [
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 99396468
+          "ns": 100304352
         },
         {
           "class": "runqueue",
           "subject": "wt-flame",
-          "ns": 712473
+          "ns": 40493
         }
       ]
     },
     {
-      "start_ns": 600653647,
-      "end_ns": 700762589,
+      "start_ns": 602069068,
+      "end_ns": 702413912,
       "lines": [
         {
           "class": "sleep",
           "subject": "wt-flame",
-          "ns": 99754425
+          "ns": 98994822
         },
         {
           "class": "runqueue",
           "subject": "wt-flame",
-          "ns": 354517
+          "ns": 1350022
         }
       ]
     },
     {
-      "start_ns": 700762589,
-      "end_ns": 800871530,
+      "start_ns": 702413912,
+      "end_ns": 802758757,
       "lines": [
         {
           "class": "sleep",
           "subject": "wt-flame",
-          "ns": 100108941
+          "ns": 100344845
         }
       ]
     },
     {
-      "start_ns": 800871530,
-      "end_ns": 900980471,
+      "start_ns": 802758757,
+      "end_ns": 903103602,
       "lines": [
         {
           "class": "sleep",
           "subject": "wt-flame",
-          "ns": 100108941
+          "ns": 100344845
         }
       ]
     },
     {
-      "start_ns": 900980471,
-      "end_ns": 1001089413,
+      "start_ns": 903103602,
+      "end_ns": 1003448447,
       "lines": [
         {
           "class": "sleep",
           "subject": "wt-flame",
-          "ns": 100027121
+          "ns": 100278975
         },
         {
           "class": "cpu",
           "subject": "wt-flame",
-          "ns": 55709
+          "ns": 41048
         },
         {
           "class": "runqueue",
           "subject": "wt-flame",
-          "ns": 26112
+          "ns": 24822
         }
       ]
     }
   ],
   "processes": [
     {
-      "pid": 2851318,
-      "ppid": 2851272,
+      "pid": 3979847,
+      "ppid": 3979785,
       "comm": "wt-flame",
       "argv": [
         "/var/tmp/whytime-fixtures/bin/wt-flame",
         "600",
         "400"
       ],
-      "cpu_ns": 599996883,
+      "cpu_ns": 602069623,
       "exit_code": 0,
       "critical": true
     }

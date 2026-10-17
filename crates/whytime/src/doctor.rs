@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use aya::programs::ProgramError;
 use bpfdoctor::{
     Cap, Check, Diagnostic, Doctor, Env, Fix, RealEnv, Report, Status, Tool, errno_name,
 };
@@ -137,10 +138,43 @@ impl Probe {
     }
 }
 
-/// `error: EPERM (Operation not permitted)`, naming the errno when there is one.
+/// What a failed load or attach says about its cause.
+#[derive(Clone, Copy, Debug)]
+struct Failure {
+    /// The errno behind it, if the chain carries one.
+    errno: Option<i32>,
+    /// The kernel's verifier rejected a program: a load error with a verifier log. The
+    /// verifier returns EACCES (or EINVAL) for programs it cannot prove safe, which says
+    /// nothing about privileges.
+    rejected: bool,
+}
+
+impl Failure {
+    fn of(err: &anyhow::Error) -> Self {
+        let rejected = err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<ProgramError>(),
+                Some(ProgramError::LoadError { verifier_log, .. })
+                    if !verifier_log.to_string().trim().is_empty()
+            )
+        });
+        Self {
+            errno: tracer::errno(err),
+            rejected,
+        }
+    }
+}
+
+/// `error: EPERM (Operation not permitted)`, naming the errno when there is one;
+/// `error: rejected by the kernel's verifier (EACCES)` for a verifier rejection.
 pub fn describe(err: &anyhow::Error) -> String {
     let what = err.to_string();
-    match tracer::errno(err) {
+    let failure = Failure::of(err);
+    match failure.errno {
+        Some(errno) if failure.rejected => format!(
+            "{what}: rejected by the kernel's verifier ({})",
+            errno_name(errno).unwrap_or("errno")
+        ),
         Some(errno) => format!(
             "{what}: {} ({})",
             errno_name(errno).unwrap_or("errno"),
@@ -151,8 +185,11 @@ pub fn describe(err: &anyhow::Error) -> String {
 }
 
 /// Fixes for a failed load or attach, by errno.
-fn fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
-    match tracer::errno(err) {
+fn fixes(failure: Failure, tool: &Tool) -> Vec<Fix> {
+    if failure.rejected {
+        return rejected_fixes(tool);
+    }
+    match failure.errno {
         Some(libc::EPERM | libc::EACCES) => vec![
             Fix::new(
                 tool.setcap_command(&[], &tool.exe),
@@ -169,9 +206,9 @@ fn fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
 }
 
 /// Fixes for a failed fentry/fexit set on `functions`.
-fn fentry_fixes(err: &anyhow::Error, tool: &Tool, functions: &str) -> Vec<Fix> {
-    match tracer::errno(err) {
-        Some(libc::EPERM | libc::EACCES) => fixes(err, tool),
+fn fentry_fixes(failure: Failure, tool: &Tool, functions: &str) -> Vec<Fix> {
+    match failure.errno {
+        Some(libc::EPERM | libc::EACCES) if !failure.rejected => fixes(failure, tool),
         _ => vec![
             Fix::new(
                 "Linux with BPF trampolines (x86-64 >= 5.5, arm64 >= 6.0) and \
@@ -184,9 +221,12 @@ fn fentry_fixes(err: &anyhow::Error, tool: &Tool, functions: &str) -> Vec<Fix> {
 }
 
 /// Fixes for a failed stack-capture set (stack maps, perf_event sampler).
-fn stack_fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
-    match tracer::errno(err) {
-        Some(libc::EPERM | libc::EACCES) => fixes(err, tool),
+fn stack_fixes(failure: Failure, tool: &Tool) -> Vec<Fix> {
+    if failure.rejected {
+        return rejected_fixes(tool);
+    }
+    match failure.errno {
+        Some(libc::EPERM | libc::EACCES) => fixes(failure, tool),
         Some(libc::EINVAL) => vec![
             Fix::new(
                 format!("sudo sysctl kernel.perf_event_max_stack={STACK_DEPTH}"),
@@ -205,6 +245,17 @@ fn stack_fixes(err: &anyhow::Error, tool: &Tool) -> Vec<Fix> {
             debug_fix(tool),
         ],
     }
+}
+
+/// Fixes for a program the verifier rejected: neither privileges nor configuration help.
+fn rejected_fixes(tool: &Tool) -> Vec<Fix> {
+    vec![
+        debug_fix(tool),
+        Fix::new(
+            "upgrade the kernel, or report the log at https://github.com/Arinerron/whytime/issues",
+            "older verifiers reject some programs that newer ones accept",
+        ),
+    ]
 }
 
 fn debug_fix(tool: &Tool) -> Fix {
@@ -234,7 +285,7 @@ impl Check for SchedCheck {
                         "the timeline is built from tp_btf/sched_switch (with prev_state, \
                          5.18+), sched_waking and sched_process_fork/exec/exit",
                     );
-                for fix in fixes(err, tool) {
+                for fix in fixes(Failure::of(err), tool) {
                     diag = diag.with_fix(fix);
                 }
                 diag
@@ -341,10 +392,11 @@ impl Check for OptionalCheck {
                     Diagnostic::new(spec.id, spec.title, false, Status::Warn, describe(err))
                         .with_impact(spec.impact)
                         .with_explain(spec.explain);
+                let failure = Failure::of(err);
                 let fixes = match spec.attach {
-                    Attach::Fentry(functions) => fentry_fixes(err, tool, functions),
-                    Attach::Tracepoints => fixes(err, tool),
-                    Attach::Stacks => stack_fixes(err, tool),
+                    Attach::Fentry(functions) => fentry_fixes(failure, tool, functions),
+                    Attach::Tracepoints => fixes(failure, tool),
+                    Attach::Stacks => stack_fixes(failure, tool),
                 };
                 for fix in fixes {
                     diag = diag.with_fix(fix);
@@ -434,5 +486,41 @@ mod tests {
                     0000000000000000 A cpu_debug_store\n\
                     0000000000000000 T _stext\n";
         assert_eq!(kallsyms_status(head), Status::Warn);
+    }
+
+    #[test]
+    fn verifier_rejections_point_at_the_log_not_at_privileges() {
+        let tool = tool();
+        let commands = |fixes: Vec<Fix>| fixes.into_iter().map(|f| f.cmd).collect::<Vec<_>>();
+        let privileged = |cmds: &[String]| {
+            cmds.iter()
+                .any(|c| c.contains("setcap") || c.starts_with("sudo "))
+        };
+        // The verifier answers EACCES or EINVAL for programs it cannot prove safe.
+        for errno in [libc::EACCES, libc::EINVAL, libc::EPERM] {
+            let rejected = Failure {
+                errno: Some(errno),
+                rejected: true,
+            };
+            for cmds in [
+                commands(fixes(rejected, &tool)),
+                commands(fentry_fixes(rejected, &tool, "pollwake")),
+                commands(stack_fixes(rejected, &tool)),
+            ] {
+                assert!(!privileged(&cmds), "errno {errno}: {cmds:?}");
+                assert!(cmds.iter().any(|c| c.starts_with("WHYTIME_LOG=debug ")), "{cmds:?}");
+                assert!(!cmds.iter().any(|c| c.contains("perf_event_max_stack")), "{cmds:?}");
+            }
+        }
+        // Refused before any verification: privileges are the fix.
+        let refused = Failure {
+            errno: Some(libc::EACCES),
+            rejected: false,
+        };
+        assert!(privileged(&commands(fixes(refused, &tool))));
+        assert!(privileged(&commands(fentry_fixes(refused, &tool, "pollwake"))));
+        assert!(privileged(&commands(stack_fixes(refused, &tool))));
+        let plain = anyhow::Error::new(io::Error::from_raw_os_error(libc::EACCES));
+        assert!(!Failure::of(&plain).rejected);
     }
 }

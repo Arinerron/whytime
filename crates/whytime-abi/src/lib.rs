@@ -303,7 +303,8 @@ wire::wire! {
         /// Bytes the syscall transferred (for `recvmmsg`/`sendmmsg`: of the first message).
         pub total: u32,
         /// Leading bytes captured in `data` (at most `DNS_BYTES`; from the first buffer of a
-        /// vector).
+        /// vector, and for `DNS_TCP` also the second when the first holds just the 2-byte
+        /// length, as musl reads: `data` is then the length followed by the message).
         pub len: u32,
         /// The payload's leading bytes.
         pub data: [u8; DNS_BYTES as usize],
@@ -339,6 +340,9 @@ wire::wire_consts! {
 
     /// [`SysInfo::nr`] outside syscalls.
     pub const NR_NONE: i32 = -1;
+    /// [`SysInfo::nr`] in a 32-bit (compat) syscall, whose number and argument registers
+    /// follow another table: nothing about it is described.
+    pub const NR_COMPAT: i32 = -3;
 
     /// [`EpisodeRecord::flags`]: the thread blocked inside a page fault (`fault` is valid).
     pub const EPF_FAULT: u32 = 1;

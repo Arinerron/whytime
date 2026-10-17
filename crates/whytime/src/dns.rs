@@ -47,10 +47,23 @@ pub struct Hosts {
 /// What a resolver connection carried so far.
 #[derive(Debug, Default)]
 struct Conn {
-    /// TCP: the last read was just the 2-byte length, so the next one is the message.
-    body_next: bool,
+    /// TCP: where the next bytes received fall.
+    next: Framing,
     /// varlink: the name of the pending `ResolveHostname` request.
     asked: Option<Arc<str>>,
+}
+
+/// Where the next bytes received on a TCP resolver connection fall in its stream of
+/// length-prefixed DNS messages, which reads may split anywhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Framing {
+    /// At a message's 2-byte length.
+    #[default]
+    Length,
+    /// At the start of a message of this many bytes (the last read ended after its length).
+    Message(usize),
+    /// Inside a message, this many bytes before its end (the last read ended inside it).
+    Rest(usize),
 }
 
 impl Hosts {
@@ -62,17 +75,7 @@ impl Hosts {
         match u32::from(r.transport) {
             DNS_UDP if r.sent == 0 => self.answer(data),
             DNS_TCP if r.sent == 0 => {
-                let state = self.conns.entry(conn).or_default();
-                if r.total == 2 && len == 2 {
-                    state.body_next = true;
-                    return;
-                }
-                let message = if std::mem::take(&mut state.body_next) {
-                    data
-                } else {
-                    data.get(2..).unwrap_or_default()
-                };
-                self.answer(message);
+                self.tcp(conn, usize::try_from(r.total).unwrap_or(usize::MAX), data);
             }
             DNS_VARLINK => {
                 for message in data.split(|&b| b == 0).filter(|m| !m.is_empty()) {
@@ -86,6 +89,42 @@ impl Hosts {
     /// The name `ip` was last resolved from.
     pub fn name(&self, ip: IpAddr) -> Option<&Arc<str>> {
         self.names.get(&ip)
+    }
+
+    /// Learns from one read of `total` bytes on TCP resolver connection `conn`, of which
+    /// `data` is the captured start: glibc reads a message's length, then the message; musl
+    /// both at once; a message longer than one segment comes in several reads.
+    fn tcp(&mut self, conn: (u32, u64), mut total: usize, mut data: &[u8]) {
+        let mut next = self.conns.entry(conn).or_default().next;
+        while total > 0 {
+            next = match next {
+                Framing::Length => {
+                    // Half a length, or one past the capture: the framing is lost; assume the
+                    // next read starts at a length again.
+                    let Some(&length) = data.first_chunk::<2>().filter(|_| total >= 2) else {
+                        break;
+                    };
+                    total -= 2;
+                    data = &data[2..];
+                    Framing::Message(usize::from(u16::from_be_bytes(length)))
+                }
+                Framing::Message(len) => {
+                    self.answer(data.get(..len).unwrap_or(data));
+                    Framing::Rest(len)
+                }
+                Framing::Rest(left) if total < left => {
+                    let left = left - total;
+                    total = 0;
+                    Framing::Rest(left)
+                }
+                Framing::Rest(left) => {
+                    total -= left;
+                    data = data.get(left..).unwrap_or_default();
+                    Framing::Length
+                }
+            };
+        }
+        self.conns.entry(conn).or_default().next = next;
     }
 
     /// Learns from one DNS message (an answer, else nothing).
@@ -728,7 +767,8 @@ mod tests {
         let msg = response(3, &name("db.internal"), &[rr(&QUESTION, TYPE_A, &[10, 1, 2, 3])]);
         let mut framed = u16::try_from(msg.len()).unwrap().to_be_bytes().to_vec();
         framed.extend_from_slice(&msg);
-        // One read with the prefix.
+        // One read with the prefix (musl's recvmsg into a length and a message buffer, which
+        // the kernel side captures as one).
         let mut hosts = Hosts::default();
         hosts.ingest(&dns(5, 6, DNS_TCP, false, &framed));
         assert!(hosts.name(ip("10.1.2.3")).is_some());
@@ -737,6 +777,46 @@ mod tests {
         hosts.ingest(&dns(5, 6, DNS_TCP, false, &framed[..2]));
         hosts.ingest(&dns(5, 6, DNS_TCP, false, &msg));
         assert_eq!(hosts.name(ip("10.1.2.3")).map(|n| n.to_string()).as_deref(), Some("db.internal"));
+    }
+
+    #[test]
+    fn tcp_reads_inside_a_message_never_start_a_new_one() {
+        let framed = |msg: &[u8]| {
+            let mut out = u16::try_from(msg.len()).unwrap().to_be_bytes().to_vec();
+            out.extend_from_slice(msg);
+            out
+        };
+        // The first answer's last record (an unknown type) holds what looks like a whole
+        // framed answer naming 10.6.6.6; a read that starts there is still inside the message.
+        let decoy = framed(&response(9, &name("decoy.test"), &[rr(&QUESTION, TYPE_A, &[10, 6, 6, 6])]));
+        let first = framed(&response(
+            3,
+            &name("db.internal"),
+            &[rr(&QUESTION, TYPE_A, &[10, 1, 2, 3]), rr(&QUESTION, 16, &decoy)],
+        ));
+        let second = framed(&response(4, &name("cache.internal"), &[rr(&QUESTION, TYPE_A, &[10, 1, 2, 4])]));
+        let split = first.len() - decoy.len();
+        // musl: the length with the message's start, then the rest; glibc: the length, the
+        // message in two reads, then the next length and message.
+        let musl = [&first[..split], &first[split..], &second];
+        let glibc = [&first[..2], &first[2..split], &first[split..], &second[..2], &second[2..]];
+        for reads in [&musl[..], &glibc[..]] {
+            let mut hosts = Hosts::default();
+            for read in reads {
+                hosts.ingest(&dns(5, 6, DNS_TCP, false, read));
+            }
+            let named = |addr| hosts.name(ip(addr)).map(|n| n.to_string());
+            assert_eq!(named("10.1.2.3").as_deref(), Some("db.internal"));
+            assert_eq!(named("10.6.6.6"), None);
+            assert_eq!(named("10.1.2.4").as_deref(), Some("cache.internal"));
+        }
+        // A read past the capture (`total` beyond `len`) still moves past the whole message.
+        let mut hosts = Hosts::default();
+        let mut cut = dns(5, 6, DNS_TCP, false, &first[..split]);
+        cut.total = u32::try_from(first.len()).unwrap();
+        hosts.ingest(&cut);
+        hosts.ingest(&dns(5, 6, DNS_TCP, false, &second));
+        assert!(hosts.name(ip("10.1.2.3")).is_some() && hosts.name(ip("10.1.2.4")).is_some());
     }
 
     #[test]

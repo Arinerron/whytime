@@ -172,7 +172,9 @@ crates/whytime/            the binary
 crates/whytime-testbins/   e2e workloads (src/bin/): wt-sleep, wt-burn, wt-fsync, wt-child,
                            wt-futex, wt-tcp, wt-attach, wt-threads, wt-vfork, wt-flock,
                            wt-syscalls, wt-poll, wt-fault, wt-fifo, wt-dns (DNS client and the
-                           suite's DNS server), wt-flame; src/lib.rs: argument and timing helpers
+                           suite's DNS server), wt-flame, wt-iouring (an io_uring SQPOLL
+                           thread), wt-compat (a 32-bit syscall); src/lib.rs: argument and
+                           timing helpers
 xtask/                     cargo xtask test-e2e | record-fixtures | man [DIR] | licenses [FILE]
 .github/                   workflows ci.yml, release.yml; actions/setup (clang, rustup);
                            ISSUE_TEMPLATE (bug, feature forms), pull_request_template.md,
@@ -349,7 +351,7 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 | State | Entry | Fields set (all others zero, as in a fresh kernel entry) |
 |---|---|---|
 | `R` | `ST_RUNNING` | `seg.start`/`last_ts` = now, `sys` = none. A thread that was queued, not on a CPU, gets its first queue wait folded into the first mixed segment (split proportionally) |
-| `S` `D` `I` `P` ... | `ST_BLOCKED` | also `block_ts` = now, `block_state` (`S`→1, `D`→2, `I`→0x402, `P`→0x40), `sys` from `/proc/TID/syscall`: `nr`, `detail.args` = its arguments 0–2, `detail.flags` = `SYSD_DESCRIBED`, and for `SYSF_FD0` syscalls `fd` = arg0 described like `describe_blocked` (`stat` of `/proc/TGID/task/TID/fd/N` → `S_IFMT`, ino, dev re-encoded as `major << 20 \| minor`; `flags:` from `fdinfo`; sockets: family/peer from `/proc/TGID/net/{tcp,udp}{,6}` and `unix`, cached per network namespace; `detail.magic` = `statfs` `f_type` of the link; anonymous inodes: `detail.path` = the name after `anon_inode:` in the link, no `SYSD_PATH_*` flag). No path is captured for files (no `SYSD_PATH_ROOTED`), so their subject comes from the classifier's `FdTarget` fallback when the record is processed; a descriptor `/proc` cannot stat stays undescribed (the kernel describes it if the syscall blocks again). `running` there → `ST_RUNNING`; `-1` → no syscall; unreadable (no ptrace access) → `nr = NR_UNREADABLE` (-2, user space only) → `other` "blocked since attach, syscall unreadable", counted in a report note |
+| `S` `D` `I` `P` ... | `ST_BLOCKED` | also `block_ts` = now, `block_state` (`S`→1, `D`→2, `I`→0x402, `P`→0x40), `sys` from `/proc/TID/syscall`: `nr`, `detail.args` = its arguments 0–2, `detail.flags` = `SYSD_DESCRIBED`, and for `SYSF_FD0` syscalls `fd` = arg0 described like `describe_blocked` (`stat` of `/proc/TGID/task/TID/fd/N` → `S_IFMT`, ino, dev re-encoded as `major << 20 \| minor`; `flags:` from `fdinfo`; sockets: family/peer from `/proc/TGID/net/{tcp,udp}{,6}` and `unix`, cached per network namespace; `detail.magic` = `statfs` `f_type` of the link; anonymous inodes: `detail.path` = the name after `anon_inode:` in the link, no `SYSD_PATH_*` flag). No path is captured for files (no `SYSD_PATH_ROOTED`), so their subject comes from the classifier's `FdTarget` fallback when the record is processed; a descriptor `/proc` cannot stat stays undescribed (the kernel describes it if the syscall blocks again). `running` there → `ST_RUNNING`; `-1` → no syscall; unreadable (no ptrace access) → `nr = NR_UNREADABLE` (-2, user space only) → `other` "blocked since attach, syscall unreadable", counted in a report note; in a syscall of a 32-bit program (ELF class of `/proc/TGID/exe`), whose numbers and registers `/proc` shows → `nr = NR_COMPAT`, nothing else, as `on_sys_enter` records it |
 | `T` / `t` | `ST_BLOCKED` | `block_state` `TASK_STOPPED` / `TASK_TRACED`, `sys` = none (stops happen after `sys_exit`) → `other` "stopped" |
 | `Z` `X` | none | exited |
 
@@ -357,12 +359,12 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 
 | Program | Attach point | Prototype (`btf_trace_*`) | Does | Fallback |
 |---|---|---|---|---|
-| `on_switch` | `tp_btf/sched_switch` | `(void *, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)` | prev: add on-CPU time; `!preempt && prev_state != 0` → BLOCKED (record block ts + state), else RUNNABLE. next: RUNNABLE → add runqueue time; BLOCKED/WOKEN → emit EPISODE, open a new segment. CPU holders: a preempted prev remembers `next` (`pend_tgid/comm`); when a RUNNABLE thread runs again, the longest such wait of the segment and its holder go to `seg.preempt_*` (a new task's holder is the `prev` it replaced); an episode carries `prev` as `run_holder_*`. At a block: `note_block` (clear the waker; inside a page fault `describe_file(vma->vm_file)` into `fault`), then at the first block of a syscall **describe** it (below) | required; needs ≥ 5.18 for `prev_state` (min_kernel) |
+| `on_switch` | `tp_btf/sched_switch` | `(void *, bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)` | prev: add on-CPU time; `!preempt && prev_state != 0` → BLOCKED (record block ts + state), else RUNNABLE. next: RUNNABLE → add runqueue time; BLOCKED/WOKEN → emit EPISODE, open a new segment. CPU holders: a preempted prev remembers `next` (`pend_tgid/comm`); when a RUNNABLE thread runs again, the longest such wait of the segment and its holder go to `seg.preempt_*` (a new task's holder is the `prev` it replaced); an episode carries `prev` as `run_holder_*`. At a block: `note_block` (clear the waker; inside a page fault `describe_file(vma->vm_file)` into `fault`), publish `ST_BLOCKED` last (an atomic exchange after the clears, so a concurrent `on_waking` or readiness probe is never wiped), then at the first block of a syscall (`nr` ≥ 0) **describe** it (below). prev's final switch (`prev_state` `TASK_DEAD`) without an entry: `worker_died`, the group exit of a worker (see `on_exit`) whose `on_exit` the kernel skipped | required; needs ≥ 5.18 for `prev_state` (min_kernel) |
 | `on_waking` | `tp_btf/sched_waking` | `(void *, struct task_struct *p)` | BLOCKED → WOKEN, record wake ts and the waker (current) tid/tgid, plus its comm when it is outside `tracked` and not exiting. Interrupt context (preempt_count has NMI, HARDIRQ or SOFTIRQ_OFFSET bits) → waker stays 0/0. preempt_count: `thread_info.preempt_count` where it exists (arm64, riscv); on x86-64 the per-CPU `__preempt_count` at `current->se.cfs_rq->rq` (checked `rq->curr == current`) + `preempt_count_from_rq` (user space: `.data..percpu` DATASEC offsets in vmlinux BTF, `pcpu_hot.preempt_count` on 6.2–6.14); aya cannot load `__ksym`s. Without either (no BTF var, no `CONFIG_FAIR_GROUP_SCHED`): waker = current, as before | required |
 | `on_fork` | `tp_btf/sched_process_fork` | `(void *, struct task_struct *parent, struct task_struct *child)` | parent tracked → add child tgid to `tracked` (in kernel: the child can never run untracked), create its task entry (RUNNABLE), emit FORK | required |
 | `on_exec` | `tp_btf/sched_process_exec` | `(void *, struct task_struct *p, pid_t old_pid, struct linux_binprm *)` | tracked tgid: create the root's task entry (window start) or flush the segment; migrate `old_pid`'s entry if a non-leader thread exec'd; emit EXEC with comm, argv (≤ 256 B from `mm->arg_start`), leader `start_boottime`; forget the process's resolver sockets (`dns_procs`) | required |
-| `on_exit` | `tp_btf/sched_process_exit` | `(void *, struct task_struct *p, bool group_dead)` | close the segment, emit EXIT (exit_code, group_dead), delete the task entry; last thread → remove from `tracked` and `dns_procs` | `group_dead` is computed from `p->signal->live.counter == 0` instead of the argument, which older kernels lack |
-| `on_sys_enter` | `tp_btf/sys_enter` | `(void *, struct pt_regs *regs, long id)` | remember nr and arguments 0–2 (`PT_REGS_PARMn_SYSCALL`: direct BTF loads, no helper calls), clear `detail.flags`; nothing else, it runs on every syscall | optional: if the pair fails, all blocked time is `other` and a note says so |
+| `on_exit` | `tp_btf/sched_process_exit` | `(void *, struct task_struct *p, bool group_dead)` | `exit_thread`: close the segment, emit EXIT (exit_code, group_dead), delete the task entry; last thread → remove from `tracked` and `dns_procs`, and the code is the group's wait status (`signal->group_exit_code` after `exit_group` or a fatal signal, else the leader's `exit_code`). Threads without an entry, io_uring (`iou-sqp`, `iou-wrk`) and vhost workers (no `sched_process_fork`, yet counted in `signal->live`), matter only as a tracked process's last thread: a zero-segment group EXIT. The kernel skips this program on a CPU where another task is preempted inside it (`recursion_misses`, seen on 7.2), typically for an io_uring thread right after the main thread's exit: `on_switch` catches those at the final switch | `group_dead` is computed from `p->signal->live.counter == 0` instead of the argument, which older kernels lack |
+| `on_sys_enter` | `tp_btf/sys_enter` | `(void *, struct pt_regs *regs, long id)` | remember nr and arguments 0–2 (`PT_REGS_PARMn_SYSCALL`: direct BTF loads), clear `detail.flags`; nothing else, it runs on every syscall. A 32-bit (compat) syscall, whose number and registers follow the 32-bit ABI, is `NR_COMPAT` without arguments (`compat_syscall`: x86-64 `thread_info.status & TS_COMPAT`, set at every 32-bit entry incl. `int 0x80` from 64-bit code, CO-RE guarded; arm64 the saved PSTATE's uapi `PSR_MODE32_BIT`, as `TIF_32BIT` is a kernel-internal bit number) → `other` "32-bit syscall" | optional: if the pair fails, all blocked time is `other` and a note says so |
 | `on_sys_exit` | `tp_btf/sys_exit` | `(void *, struct pt_regs *regs, long ret)` | clear nr | attached before `sys_enter` so a half-attached pair is harmless; only when `on_sys_exit_dns` does not load |
 | `on_sys_exit_dns` | `tp_btf/sys_exit` | same | `on_sys_exit` plus the **resolver capture** (below); attached in its place, never both | optional (`probe.dns`): without it peers stay `ip:port` and a note says so; reported unavailable when `sys_enter` is missing |
 | `on_pollwake` | `fentry/pollwake` | `int (struct wait_queue_entry *wait, unsigned mode, int sync, void *key)` | poll/select: `container_of(wait, poll_table_entry, wait)->filp` is the ready file, `((poll_wqueues *)wait->private)->polling_task` the poller; tracked + BLOCKED + key matches `entry->key` → the first source claims `ready` (`describe_file`, fd −1) | optional (with `on_ep_poll_callback`: `probe.readiness`); without them poll waits stay `poll` |
@@ -374,7 +376,9 @@ Attach-mode startup (`attach.rs`, `snapshot.rs`; `whytime -p PID`):
 `sched_switch` `current` is still `prev`, so its fd table and user memory are at hand. Per
 `sys_flags[nr]`: arg0's fd (`task->files->fdt->fd[fd]` → `describe_file`: `f_inode->i_mode &
 S_IFMT`, ino, `i_sb->s_dev`, `f_flags`; sockets: `private_data→sk→__sk_common` family,
-daddr/v6_daddr, dport), the filesystem (`i_sb->s_magic`), for regular files, directories,
+daddr/v6_daddr (only where `skc_v6_daddr` exists: `CONFIG_IPV6=n` kernels lack it, and an
+unguarded relocation would keep `on_switch` from loading), dport), the filesystem
+(`i_sb->s_magic`), for regular files, directories,
 block devices and anonymous inodes the **path** (`capture_path`: `f_path.dentry→d_parent`
 names, crossing mounts through `container_of(vfsmount, struct mount, mnt)` →
 `mnt_mountpoint`/`mnt_parent`, until the mount whose parent is itself; ≤ 32 steps, names leaf
@@ -388,9 +392,14 @@ socket inode, transport): `connect` (ret 0 or `-EINPROGRESS`) whose user sockadd
 port 53 (`DNS_UDP`, or `DNS_TCP` when `socket->type` is `SOCK_STREAM`) or the unix path
 `/run/systemd/resolve/io.systemd.Resolve` (`DNS_VARLINK`); `sendto` (dest in args 4/5, read
 from `regs` at exit: arguments survive in `pt_regs`) and `sendmsg`/`sendmmsg` (`msg_name` of
-the first header) to port 53. `connect` elsewhere and `close` forget the fd. Exec and the last
+the first header) to port 53, also when they return `-EINPROGRESS`: with `MSG_FASTOPEN` they
+connect a TCP socket, which without a Fast Open cookie returns that (musl's TCP fallback:
+`TCP_FASTOPEN_CONNECT`, then `sendmsg(MSG_FASTOPEN)` naming the server). `connect` elsewhere
+and `close` forget the fd. Exec and the last
 thread's exit drop the process's entry. On a successful recv-family exit (`read`, `recvfrom`,
-`readv`, `recvmsg`, `recvmmsg`: first buffer / first message) on a marked fd, and for varlink
+`readv`, `recvmsg`, `recvmmsg`: first buffer / first message; on a `DNS_TCP` socket whose
+first buffer is exactly the 2-byte length, the second one too, appended as if contiguous:
+musl receives into `{length, 2}` and `{answer, size}`) on a marked fd, and for varlink
 also the send family (`write`, `sendto`, `writev`, `sendmsg`, `sendmmsg`: the request names
 the host), the fd's inode is checked against the slot (a reused number is forgotten) and up to
 `DNS_BYTES` (1024) of the payload go into a `dns_record`. While the `.bss` counter
@@ -479,12 +488,12 @@ appended at the end of a struct, 8-byte aligned.
 | `fork_record` (EV_FORK) | 40 | hdr (parent), child_tid, child_tgid, child_start (`start_boottime`) |
 | `exec_record` (EV_EXEC) | 376 | hdr, seg (up to exec), start (leader `start_boottime` = procctx key), ppid, old_tid, comm[16], argv_len, argv[256] |
 | `episode_record` (EV_EPISODE) | 624 | hdr (ts = switch-in), seg (up to block), block_ts, wake_ts (0 = unseen), sys_info, waker_tid/tgid (0/0 = unknown or interrupt context), block_state (`prev_state`), sys_detail, flags (`EPF_FAULT`, `EPF_READY`), run_holder_tgid/comm (ran just before the switch-in), waker_comm (out-of-tree waker, else empty), ready (sys_info of the file that ended a poll), fault (sys_info of the faulting vma's file; mode 0 = anonymous), user_stack/kernel_stack/stack_gen (at the block; see Stack capture), comm (the thread's own name) |
-| `exit_record` (EV_EXIT) | 96 | hdr, seg (up to exit), start, code (`task->exit_code`), group_dead |
-| `dns_record` (EV_DNS) | 1072 | hdr (ts = syscall exit), ino (resolver socket's inode: the connection), fd, transport (`DNS_UDP`, `DNS_TCP` = 2-byte length prefixes, `DNS_VARLINK` = NUL-terminated JSON), sent (1: a varlink request), total (bytes the syscall moved; first message for `*mmsg`), len, data[1024] (leading bytes of the first buffer) |
+| `exit_record` (EV_EXIT) | 96 | hdr, seg (up to exit; zero for a worker without an entry), start, code (`task->exit_code`; with group_dead the group's wait status), group_dead |
+| `dns_record` (EV_DNS) | 1072 | hdr (ts = syscall exit), ino (resolver socket's inode: the connection), fd, transport (`DNS_UDP`, `DNS_TCP` = 2-byte length prefixes, `DNS_VARLINK` = NUL-terminated JSON), sent (1: a varlink request), total (bytes the syscall moved; first message for `*mmsg`), len, data[1024] (leading bytes of the first buffer; for `DNS_TCP`, length then message when they were two buffers) |
 | `task_state` (map value) | 616 | seg, last_ts, block_ts, wake_ts, sys_info, tgid, state (`ST_*`), block_state, waker_tid/tgid, sys_detail, ready, fault, fault_file (kernel `struct file *`), in_fault, has_ready, pend_tgid/comm (took the CPU at the last preemption), waker_comm, user_stack/kernel_stack/stack_gen (last block's) |
 | `sample_record` (EV_SAMPLE = 6) | 56 | hdr (sampled thread, ts = sample time), user_stack, kernel_stack, stack_gen, comm[16] (thread name) |
 | `stack_record` (EV_STACK = 7) | 1048 | hdr (thread; ts = capture time: the block or sample time it belongs to), kernel (0 user, 1 kernel), nr, ips[127] (innermost first): a stack the map could not take, before the record that refers to it with `STACK_INLINE`; the timeline ignores it |
-| `sys_info` | 48 | nr (−1 = none), fd, mode (`S_IFMT` bits), f_flags, ino, dev (kernel `dev_t`), family, port (host order), addr[16]; for the syscall all but nr valid only with `SYSD_DESCRIBED`; `ready`/`fault` are complete when set (user space classifies them as described, without a path) |
+| `sys_info` | 48 | nr (−1 = none, −3 = `NR_COMPAT`: a 32-bit syscall), fd, mode (`S_IFMT` bits), f_flags, ino, dev (kernel `dev_t`), family, port (host order), addr[16]; for the syscall all but nr valid only with `SYSD_DESCRIBED`; `ready`/`fault` are complete when set (user space classifies them as described, without a path) |
 | `sys_detail` | 296 | args[3] (raw, from `sys_enter`), magic (`s_magic`), flags (`SYSD_DESCRIBED`, `SYSD_PATH_ROOTED` = whole path, `SYSD_PATH_TRUNCATED` = tail only, neither = pseudo-fs name), path_len, path[256] (names leaf first, NUL-terminated: `lock\0app\0home\0` = `/home/app/lock`) |
 
 One EPISODE per block → wake → run cycle; on-CPU and preemption are accumulated in kernel,
@@ -524,7 +533,8 @@ sum to 1 (the e2e suite checks 1 ± 0.001; in practice exactly 1 up to float rou
   SysV semaphores/message queues, POSIX message queues), `tty` (character devices), `futex`,
   `sleep` (nanosleep/clock_nanosleep, timerfd reads), `poll` (poll/select/epoll; inotify and
   fanotify reads with subject `inotify`/`fanotify`), `signal` (incl. signalfd reads), `other`
-  (unknown syscall, off-CPU outside syscalls, stopped, or `untraced` gaps from lost records),
+  (unknown syscall, a 32-bit syscall, off-CPU outside syscalls, stopped, or `untraced` gaps
+  from lost records),
   `fault` (blocked inside a page fault; subject = the mapped file's directory, from
   `/proc/<pid>/maps` via `FdTarget::mapped_file` matched by dev:ino, or `anonymous memory
   (swap)`; takes precedence over the syscall the fault interrupted). Anonymous inodes are
@@ -622,7 +632,10 @@ Honesty limits (state them when presenting results):
   own cache), by another process (a local caching daemon is outside the tree; only what the
   tree received counts), `/etc/hosts` read by glibc's `files` module, DNS-over-TLS/HTTPS from
   the program itself, resolvers on other ports, and payload beyond the first 1024 bytes of a
-  reply (or of a read's first buffer). The name is the one the program asked for (the DNS
+  reply (or of a read's first buffer, or first two for musl's TCP length and message). TCP
+  reads are followed by message length, so a reply split across reads is parsed from its
+  start only (complete records), never mistaken for a new one. The name is the one the
+  program asked for (the DNS
   question; varlink: the request's name, else the reply's canonical one), the latest answer
   per address wins, and a socket keeps the name it had when first classified. The report
   notes how many peers stayed numeric.
@@ -638,6 +651,8 @@ Honesty limits (state them when presenting results):
 - A wake that races the switch-out (seen before the block is recorded) is not observed;
   that whole off-CPU gap counts as blocked (µs scale) with waker 0, so it is not followed
   (child waits fall back to the exit-time heuristic).
+- 32-bit syscalls (i386 or AArch32 programs, `int 0x80`) are `other` "32-bit syscall":
+  whytime knows only the native syscall table and argument registers.
 - Mixed segments split on-CPU vs. preempted proportionally when clipped to a sub-interval.
 - A mixed segment's whole preempted time goes to its longest single preemption's holder,
   and the kernel names the task that took the CPU at the preemption: a CPU-bound thread
@@ -920,7 +935,9 @@ well-formedness checker), label truncation, root colors and byte-identical outpu
 an eventfd). `dns.rs` tests build DNS
 messages (CNAME chains, compression pointers, errors) and varlink JSON and feed every
 truncation and single-byte corruption of them to the parsers (no panic; complete records
-kept). `timeline.rs` checks that `net` lines take the resolved name (per socket, with `addr`
+kept), and TCP reads split glibc's and musl's ways (a read inside a message never starts a
+new one). `doctor.rs` checks that verifier rejections get the debug fix, never privileges.
+`timeline.rs` checks that `net` lines take the resolved name (per socket, with `addr`
 and per-socket connection counts) and that holders reach segments (idle CPUs merged, the
 sweep's pending holder). `attribute.rs` also tests process naming (`tell_apart`: suffix
 length, elision, cut and unknown arguments, the variant cap), runqueue `held_by` from
@@ -981,7 +998,7 @@ memcg) plus:
 
 | Id | Required | Observed / impact / fix |
 |---|---|---|
-| `probe.sched` | yes | loads the real object and attaches the 5 scheduler programs; PASS shows verified insn count. FAIL shows the errno; impact "cannot observe scheduling"; fixes by errno: EPERM/EACCES → `sudo setcap cap_bpf,cap_perfmon+ep <exe>` or run with sudo; ENOENT/EINVAL/E2BIG/EOPNOTSUPP → kernel ≥ 5.18 with `CONFIG_DEBUG_INFO_BTF`; else `WHYTIME_LOG=debug whytime doctor` for the verifier log |
+| `probe.sched` | yes | loads the real object and attaches the 5 scheduler programs; PASS shows verified insn count. FAIL shows the errno; impact "cannot observe scheduling"; fixes by errno: EPERM/EACCES → `sudo setcap cap_bpf,cap_perfmon+ep <exe>` or run with sudo; ENOENT/EINVAL/E2BIG/EOPNOTSUPP → kernel ≥ 5.18 with `CONFIG_DEBUG_INFO_BTF`; else `WHYTIME_LOG=debug whytime doctor` for the verifier log. A verifier rejection (an aya `ProgramError::LoadError` with a non-empty verifier log; the verifier answers EACCES or EINVAL for programs it cannot prove safe) is observed as "rejected by the kernel's verifier (EACCES)" and gets that debug fix plus "upgrade the kernel, or report the log", never privilege or configuration fixes; so do the optional probes' |
 | `probe.syscalls` | no | attaches `sys_exit` then `sys_enter`; WARN impact "blocked time is reported as other"; SKIP if the scheduler probe failed |
 | `probe.dns` | no | `on_sys_exit_dns` (the `sys_exit` with the resolver capture) loaded and attached in place of `on_sys_exit`; WARN impact "network peers are reported as ip:port"; fixes by errno as for the scheduler probe, else the verifier log; also WARN when `sys_enter` failed; SKIP if the scheduler probe failed |
 | `probe.readiness` | no | attaches `fentry/pollwake` and `fentry/ep_poll_callback`; WARN impact "poll/select/epoll waits are reported as poll"; fixes: BPF trampolines (x86-64 ≥ 5.5, arm64 ≥ 6.0) + BTF, or the verifier log; SKIP if the scheduler probe failed |
@@ -1014,6 +1031,8 @@ per-program cost; the programs fire for every task, so averages mix tracked and 
 The resolver capture adds, for tracked threads only, one inlined `sys_flags` array lookup and
 a `dns_live` read per syscall exit (no hash lookup while no traced process has a resolver
 socket open): within the noise above, and the `overhead` scenario measured 1.77 with it.
+The 32-bit check adds, for tracked threads, one `bpf_get_current_task_btf` call and one load
+per `sys_enter` on x86-64 (one load on arm64): the `overhead` scenario measured 1.55 with it.
 
 Flamegraphs (wall of the whole run, best of 3 interleaved, load ~17–21 on 22 cores; whytime's
 load, verification, kallsyms read and symbolization included, so the ratios are higher than
@@ -1219,6 +1238,19 @@ Runtime behaviour around the run (xtask first makes `$WORK/root-owned`, 0644 roo
     --json -- sh -c 'kill -INT $$; kill -HUP $$; ulimit -S -l'` → COMMAND survives both
     signals (exit 0) and prints `64`
 
+Kernel-side edge cases:
+
+42. `dns-tcp-musl`: `wt-dns tcp-musl …` (the suite's DNS server, as 27) does what musl's TCP
+    fallback does: non-blocking socket, `TCP_FASTOPEN_CONNECT`, `sendmsg(MSG_FASTOPEN)`
+    naming the server (`EINPROGRESS`), then `recvmsg` into a 2-byte length buffer and a
+    message buffer → `net` subject `slow.whytime.test:PORT` as in 27
+43. `iouring-exit`: `sh` runs `wt-iouring 3` 20 times (an io_uring with an SQPOLL thread,
+    which has no fork record and often exits last) → 20 `wt-iouring` processes, each
+    `exit_code` 3; SKIP when `io_uring_setup` fails (exit 77)
+44. `compat-syscall`: `wt-compat 600` (i386 `poll(NULL, 0, 600)` through `int 0x80`, number
+    168 = `swapoff` in the 64-bit table) → `other` subject `32-bit syscall` ≥ 0.8; SKIP
+    without IA-32 emulation (exit 77, or 139 when `int 0x80` faults)
+
 ## Gotchas
 
 - clang folds `if (!p && !n)` on two map-value pointers into `p | n`; the verifier rejects
@@ -1325,6 +1357,19 @@ Runtime behaviour around the run (xtask first makes `$WORK/root-owned`, 0644 roo
 - Frame pointers show the callers of the innermost function with a frame record: a leaf
   without them (musl's syscall wrappers) hides its caller, a tail call hides the caller
   (`wt-flame` keeps code after its calls).
+- Tracepoint programs can be preempted on 7.2 (`bpftool prog show` lists
+  `recursion_misses`): while a task is preempted inside one, the kernel skips that program
+  for every other task on the CPU. An io_uring thread exiting right after its process's main
+  thread (whose `exit_group` woke it there) lost its `on_exit` that way; anything that must
+  not be lost needs a second chance in `on_switch`, which runs with preemption off.
+- Kernel-created user workers (io_uring's `iou-sqp`/`iou-wrk`, vhost) are threads of the
+  traced process without `sched_process_fork`: no `tasks` entry, but they count in
+  `signal->live` and can be its last thread.
+- A new `wire_consts!` constant changes `ABI_HASH` (the header is hashed whole), so every
+  replay fixture must be re-recorded (`cargo xtask record-fixtures`); doc comments do not.
+- On arm64 a plain store does not order earlier stores for other CPUs: publish a state other
+  programs act on with an atomic (`__sync_lock_test_and_set`, a full-barrier exchange), not
+  a compiler barrier.
 - Never empty a stack map the programs may still store into, or one whose ids a record or a
   blocked thread's `task_state` still refers to: flip, barrier, keep, barrier, drain, then
   empty (`stacks.rs`). Test the flip path with `WHYTIME_STACK_FLIP_MS=5

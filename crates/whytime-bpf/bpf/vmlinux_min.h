@@ -69,7 +69,7 @@ typedef struct {
 
 /* Syscall argument registers read by PT_REGS_PARM*_CORE_SYSCALL. arm64 reads arg 1 from
  * pt_regs.orig_x0 (bpf_tracing.h's pt_regs___arm64 flavor) and the rest from user_pt_regs.regs[],
- * which the kernel's pt_regs embeds. */
+ * which the kernel's pt_regs embeds; `pstate` is the saved user PSTATE (AArch32 or not). */
 #if defined(__TARGET_ARCH_x86)
 struct pt_regs {
 	unsigned long r10;
@@ -82,6 +82,9 @@ struct pt_regs {
 #elif defined(__TARGET_ARCH_arm64)
 struct user_pt_regs {
 	__u64 regs[31];
+	__u64 sp;
+	__u64 pc;
+	__u64 pstate;
 };
 
 struct pt_regs;
@@ -185,9 +188,11 @@ struct sched_entity {
 	struct cfs_rq *cfs_rq;
 };
 
-/* preempt_count is here on arm64 and riscv; x86-64 keeps it per-CPU. */
+/* preempt_count is here on arm64 and riscv; x86-64 keeps it per-CPU. `status` (x86 only)
+ * holds TS_COMPAT during a 32-bit syscall. */
 struct thread_info {
 	int preempt_count;
+	unsigned int status;
 };
 
 struct list_head {
@@ -241,6 +246,8 @@ struct eppoll_entry {
 
 struct signal_struct {
 	atomic_t live;
+	int group_exit_code;
+	unsigned int flags;
 };
 
 struct task_struct {

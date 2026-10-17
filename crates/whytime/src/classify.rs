@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use whytime_abi::{
-    ANON_INODE_FS_MAGIC, DnsRecord, NR_NONE, PATH_BYTES, SYSD_DESCRIBED, SYSD_PATH_ROOTED,
-    SYSD_PATH_TRUNCATED, SysDetail, SysInfo,
+    ANON_INODE_FS_MAGIC, DnsRecord, NR_COMPAT, NR_NONE, PATH_BYTES, SYSD_DESCRIBED,
+    SYSD_PATH_ROOTED, SYSD_PATH_TRUNCATED, SysDetail, SysInfo,
 };
 
 use crate::dns::Hosts;
@@ -129,7 +129,7 @@ pub enum Subject {
     Unconnected,
     /// The syscall, when it explains more than the class.
     Syscall(&'static str),
-    /// A kernel object whytime names by kind (`inotify`, `fanotify`).
+    /// What whytime names by kind: a kernel object (`inotify`, `fanotify`), a 32-bit syscall.
     Named(&'static str),
     /// A syscall number whytime has no name for.
     UnknownSyscall(i32),
@@ -323,6 +323,9 @@ impl Classifier {
         };
         if sys.nr == NR_UNREADABLE {
             return plain(Class::Other, Subject::Unreadable);
+        }
+        if sys.nr == NR_COMPAT {
+            return plain(Class::Other, Subject::Named("32-bit syscall"));
         }
         if sys.nr == NR_NONE {
             let subject = if block_state & (TASK_STOPPED | TASK_TRACED) != 0 {
@@ -1106,6 +1109,28 @@ mod tests {
         assert_eq!(
             woken(&mut c, &sys(libc::SYS_nanosleep)),
             (Class::Sleep, String::new())
+        );
+    }
+
+    #[test]
+    fn a_32_bit_syscall_is_other_whatever_ended_it() {
+        let mut c = classifier();
+        let mut compat = sys(libc::SYS_read);
+        compat.nr = NR_COMPAT;
+        compat.mode = S_IFSOCK;
+        let socket = described(S_IFSOCK, 0, 9);
+        let waker: Arc<str> = Arc::from("dbus-daemon");
+        let b = c.classify_block(
+            1,
+            &BlockInfo {
+                ready: Some(&socket),
+                waker: Some(&waker),
+                ..block(&compat)
+            },
+        );
+        assert_eq!(
+            (b.class, b.subject.to_string()),
+            (Class::Other, "32-bit syscall".to_owned())
         );
     }
 }

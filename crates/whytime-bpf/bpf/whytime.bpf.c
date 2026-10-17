@@ -292,7 +292,10 @@ static __always_inline void describe_file(struct sys_info *s, struct file *f)
 
 		__builtin_memcpy(s->addr, &daddr, sizeof(daddr));
 		s->port = __builtin_bswap16(BPF_CORE_READ(sk, __sk_common.skc_dport));
-	} else if (s->family == AF_INET6) {
+	} else if (s->family == AF_INET6 &&
+		   bpf_core_field_exists(sk->__sk_common.skc_v6_daddr)) {
+		/* Kernels without CONFIG_IPV6 have no skc_v6_daddr: the relocation would fail and
+		 * poison every program that describes files, on_switch included. */
 		BPF_CORE_READ_INTO(&s->addr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr8);
 		s->port = __builtin_bswap16(BPF_CORE_READ(sk, __sk_common.skc_dport));
 	}
@@ -608,18 +611,6 @@ static __always_inline void dns_mark(u32 tgid, int fd, u32 target)
 	p->socks[slot].transport = transport;
 }
 
-/* First buffer of a user iovec array: its address, and its length capped at `n`. */
-static __always_inline const void *first_iov(u64 iov, u64 *n)
-{
-	struct u_iovec v;
-
-	if (!iov || bpf_probe_read_user(&v, sizeof(v), (const void *)iov))
-		return 0;
-	if (v.len < *n)
-		*n = v.len;
-	return (const void *)v.base;
-}
-
 /*
  * The resolver part of a syscall exit, for a tracked thread. Port-53 or varlink targets of
  * connect/sendto/sendmsg mark the socket; close forgets it; bytes received on a marked socket
@@ -631,8 +622,8 @@ static __always_inline void dns_exit(struct task_state *t, s32 nr, u32 tid, u32 
 {
 	u32 key = nr, *flags, op, i, slot = DNS_SOCKS, sent = 0;
 	int fd = t->detail.args[0];
-	u64 arg1 = t->detail.args[1], n = ret, total = ret;
-	const void *buf = 0;
+	u64 arg1 = t->detail.args[1], n = ret, total = ret, iov = 0, iovlen = 0, rest = 0;
+	const void *buf = 0, *body = 0;
 	struct dns_record *e;
 	struct dns_proc *p;
 	struct file *f;
@@ -659,16 +650,20 @@ static __always_inline void dns_exit(struct task_state *t, s32 nr, u32 tid, u32 
 		if (!ret && dns_live)
 			dns_forget(tgid, fd);
 		return;
+	/* sendto/sendmsg with MSG_FASTOPEN connect a TCP socket (musl's TCP fallback): without a
+	 * Fast Open cookie they return -EINPROGRESS, like a non-blocking connect. */
 	case DNSOP_SENDTO:
-		if (ret > 0 && dns_target((const void *)PT_REGS_PARM5_SYSCALL(regs),
-					  PT_REGS_PARM6_SYSCALL(regs)) == DNS_UDP)
+		if ((ret > 0 || ret == -EINPROGRESS) &&
+		    dns_target((const void *)PT_REGS_PARM5_SYSCALL(regs),
+			       PT_REGS_PARM6_SYSCALL(regs)) == DNS_UDP)
 			dns_mark(tgid, fd, DNS_UDP);
 		break;
 	case DNSOP_SENDMSG:
 	case DNSOP_SENDMMSG: {
 		struct u_msghdr m;
 
-		if (ret > 0 && !bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) &&
+		if ((ret > 0 || ret == -EINPROGRESS) &&
+		    !bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) &&
 		    dns_target((const void *)m.name, m.namelen) == DNS_UDP)
 			dns_mark(tgid, fd, DNS_UDP);
 		break;
@@ -707,26 +702,46 @@ static __always_inline void dns_exit(struct task_state *t, s32 nr, u32 tid, u32 
 		break;
 	case DNSOP_READV:
 	case DNSOP_WRITEV:
-		buf = first_iov(arg1, &n);
+		iov = arg1;
+		iovlen = t->detail.args[2];
 		break;
 	case DNSOP_RECVMSG:
 	case DNSOP_SENDMSG: {
 		struct u_msghdr m;
 
-		if (!bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) && m.iovlen)
-			buf = first_iov(m.iov, &n);
+		if (!bpf_probe_read_user(&m, sizeof(m), (const void *)arg1)) {
+			iov = m.iov;
+			iovlen = m.iovlen;
+		}
 		break;
 	}
 	case DNSOP_RECVMMSG:
 	case DNSOP_SENDMMSG: {
 		struct u_mmsghdr m;
 
-		if (!bpf_probe_read_user(&m, sizeof(m), (const void *)arg1) && m.hdr.iovlen) {
+		if (!bpf_probe_read_user(&m, sizeof(m), (const void *)arg1)) {
 			total = n = m.len;
-			buf = first_iov(m.hdr.iov, &n);
+			iov = m.hdr.iov;
+			iovlen = m.hdr.iovlen;
 		}
 		break;
 	}
+	}
+	if (iov && iovlen) {
+		struct u_iovec v;
+
+		if (bpf_probe_read_user(&v, sizeof(v), (const void *)iov))
+			return;
+		buf = (const void *)v.base;
+		if (v.len < n)
+			n = v.len;
+		/* musl receives a TCP answer into two buffers, the 2-byte length and the message:
+		 * capture the message too, as if it followed the length in one buffer. */
+		if (v.len == 2 && total > 2 && iovlen > 1 && p->socks[slot].transport == DNS_TCP &&
+		    !bpf_probe_read_user(&v, sizeof(v), (const void *)(iov + sizeof(v)))) {
+			body = (const void *)v.base;
+			rest = total - 2 < v.len ? total - 2 : v.len;
+		}
 	}
 	if (!buf || !n)
 		return;
@@ -735,11 +750,16 @@ static __always_inline void dns_exit(struct task_state *t, s32 nr, u32 tid, u32 
 		return;
 	if (n > DNS_BYTES)
 		n = DNS_BYTES;
-	if (bpf_probe_read_user(e->data, n, buf)) {
+	if (rest > DNS_BYTES - 2)
+		rest = DNS_BYTES - 2;
+	if (bpf_probe_read_user(e->data, n, buf) ||
+	    (body && bpf_probe_read_user(e->data + 2, rest, body))) {
 		bpf_ringbuf_discard(e, 0);
 		stat_inc(STAT_DNS_LOST);
 		return;
 	}
+	if (body)
+		n = 2 + rest;
 	fill_hdr(&e->hdr, EV_DNS, tid, tgid, bpf_ktime_get_ns());
 	e->ino = p->socks[slot].ino;
 	e->fd = fd;
@@ -787,6 +807,68 @@ static __always_inline void note_preemption(struct task_state *n, struct task_st
 	}
 }
 
+#define TASK_DEAD 0x00000080
+#define SIGNAL_GROUP_EXIT 0x00000004
+
+/* The thread group's status as its parent's wait() reports it: the group exit code after
+ * exit_group or a fatal signal, else the leader's own (it called exit() while other threads
+ * ran on). */
+static __always_inline int group_status(struct task_struct *task)
+{
+	struct signal_struct *sig = BPF_CORE_READ(task, signal);
+
+	if (BPF_CORE_READ(sig, flags) & SIGNAL_GROUP_EXIT)
+		return BPF_CORE_READ(sig, group_exit_code);
+	return BPF_CORE_READ(task, group_leader, exit_code);
+}
+
+/*
+ * Emits the EXIT record of thread `tid` (`task`, its entry `t`) at `now`, deletes the entry,
+ * and when it ends the thread group (no `live` thread left) forgets the process. `t` is null
+ * for threads that never passed sched_process_fork: io_uring's (iou-sqp, iou-wrk:
+ * create_io_thread) and vhost's workers. They count in signal->live, so one may be the last
+ * thread of a tracked process, and then its exit is the group's.
+ */
+static __always_inline void exit_thread(struct task_struct *task, struct task_state *t,
+					u32 tid, u32 tgid, int live, u64 now)
+{
+	struct exit_record *e = reserve(sizeof(*e));
+
+	if (e) {
+		fill_hdr(&e->hdr, EV_EXIT, tid, tgid, now);
+		if (t)
+			e->seg = t->seg;
+		else
+			__builtin_memset(&e->seg, 0, sizeof(e->seg));
+		e->start = BPF_CORE_READ(task, group_leader, start_boottime);
+		e->code = live ? BPF_CORE_READ(task, exit_code) : group_status(task);
+		e->group_dead = live == 0;
+		bpf_ringbuf_submit(e, 0);
+	}
+	if (t)
+		bpf_map_delete_elem(&tasks, &tid);
+	if (!live) {
+		bpf_map_delete_elem(&tracked, &tgid);
+		dns_forget_proc(tgid);
+	}
+}
+
+/*
+ * The final switch (TASK_DEAD) of a thread without an entry. on_exit does not always run:
+ * the kernel skips a tracepoint program on a CPU where another task is preempted inside it
+ * (a recursion miss; seen on 7.2), and a process's io_uring thread typically exits on the
+ * CPU of the main thread whose exit_group woke it, while that thread is still in on_exit.
+ * sched_switch runs with preemption off, so a worker that ended its tracked process (and
+ * on_exit missed) is caught here.
+ */
+static __always_inline void worker_died(struct task_struct *task)
+{
+	u32 tgid = task->tgid;
+
+	if (!BPF_CORE_READ(task, signal, live.counter) && bpf_map_lookup_elem(&tracked, &tgid))
+		exit_thread(task, 0, task->pid, tgid, 0, bpf_ktime_get_ns());
+}
+
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_struct *next,
 	     unsigned int prev_state)
@@ -800,6 +882,8 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 		p = bpf_map_lookup_elem(&tasks, &ptid);
 	if (ntid)
 		n = bpf_map_lookup_elem(&tasks, &ntid);
+	if (!p && prev_state == TASK_DEAD)
+		worker_died(prev);
 	/* Separate tests: clang folds `!p && !n` into `p | n`, which the verifier rejects. */
 	if (p)
 		now = bpf_ktime_get_ns();
@@ -813,11 +897,15 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 			p->seg.run_ns += now - p->last_ts;
 		p->last_ts = now;
 		if (!preempt && prev_state != TASK_RUNNING) {
-			p->state = ST_BLOCKED;
 			p->block_ts = now;
 			p->block_state = prev_state;
 			note_block(p);
-			if (p->sys.nr != NR_NONE && !(p->detail.flags & SYSD_DESCRIBED))
+			/* Publish the block last: on_waking and the readiness probes act only on a
+			 * BLOCKED thread, from other CPUs, and what they record must not be wiped by
+			 * note_block. The exchange orders the stores above before it on every arch. */
+			__sync_lock_test_and_set(&p->state, ST_BLOCKED);
+			/* Not NR_NONE, nor NR_COMPAT (no table describes it). */
+			if (p->sys.nr >= 0 && !(p->detail.flags & SYSD_DESCRIBED))
 				describe_blocked(p);
 #ifdef WHYTIME_STACKS
 			/* `current` is still `prev`: its stacks are where it blocked. */
@@ -1033,36 +1121,44 @@ int BPF_PROG(on_exit, struct task_struct *p)
 {
 	u32 tid = p->pid, tgid = p->tgid;
 	struct task_state *t = bpf_map_lookup_elem(&tasks, &tid);
-	struct exit_record *e;
 	/* do_exit decrements signal->live before this tracepoint on every kernel; reading it
 	 * avoids depending on the tracepoint's group_dead argument (added in 6.x). */
 	int live = BPF_CORE_READ(p, signal, live.counter);
 	u64 now;
 
-	if (!t)
+	/* A worker without an entry (see exit_thread) matters only when it ends its process. */
+	if (!t && (live || !bpf_map_lookup_elem(&tracked, &tgid)))
 		return 0;
 	now = bpf_ktime_get_ns();
-	if (t->state == ST_RUNNING)
+	if (t && t->state == ST_RUNNING)
 		t->seg.run_ns += now - t->last_ts;
-
-	e = reserve(sizeof(*e));
-	if (e) {
-		fill_hdr(&e->hdr, EV_EXIT, tid, tgid, now);
-		e->seg = t->seg;
-		e->start = BPF_CORE_READ(p, group_leader, start_boottime);
-		e->code = p->exit_code;
-		e->group_dead = live == 0;
-		bpf_ringbuf_submit(e, 0);
-	}
-	bpf_map_delete_elem(&tasks, &tid);
-	if (live == 0) {
-		bpf_map_delete_elem(&tracked, &tgid);
-		dns_forget_proc(tgid);
-	}
+	exit_thread(p, t, tid, tgid, live, now);
 	return 0;
 }
 
 /* ---- syscalls ----------------------------------------------------------------------- */
+
+#define TS_COMPAT 0x0002
+#define PSR_MODE32_BIT 0x00000010
+
+/*
+ * True in a 32-bit (compat) syscall, whose number and argument registers follow the 32-bit
+ * ABI. x86-64 sets TS_COMPAT in thread_info.status at the 32-bit entries (int 0x80, sysenter,
+ * 32-bit syscall; int 0x80 from 64-bit code too) until the return to user mode. On arm64 only
+ * AArch32 tasks make them, and their saved PSTATE has the uapi PSR_MODE32_BIT (TIF_32BIT is
+ * a kernel-internal bit number).
+ */
+static __always_inline bool compat_syscall(struct pt_regs *regs)
+{
+#if defined(__TARGET_ARCH_x86)
+	struct task_struct *task = bpf_get_current_task_btf();
+
+	return bpf_core_field_exists(task->thread_info.status) &&
+	       (task->thread_info.status & TS_COMPAT);
+#else
+	return ((const struct user_pt_regs *)regs)->pstate & PSR_MODE32_BIT;
+#endif
+}
 
 SEC("tp_btf/sys_enter")
 int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id)
@@ -1073,8 +1169,13 @@ int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id)
 	if (!t)
 		return 0;
 	/* Runs on every syscall: keep only what a later block needs, describe nothing. */
-	t->sys.nr = id;
 	t->detail.flags = 0;
+	if (compat_syscall(regs)) {
+		/* Another numbering and other registers: nothing to describe or capture. */
+		t->sys.nr = NR_COMPAT;
+		return 0;
+	}
+	t->sys.nr = id;
 	t->detail.args[0] = PT_REGS_PARM1_SYSCALL(regs);
 	t->detail.args[1] = PT_REGS_PARM2_SYSCALL(regs);
 	t->detail.args[2] = PT_REGS_PARM3_SYSCALL(regs);
