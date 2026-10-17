@@ -451,7 +451,7 @@ processes of the same name ran with different arguments (`sort -R` and `sort -n`
 | `child` | `waiting on child: comm` | the path waited on a descendant process while it computed |
 | `runqueue` | `waiting for a CPU (comm)` | runnable but not running (preempted, or woken and not yet scheduled); `— mostly X 61%` names the task that held the CPU when one did most of it |
 | `sleep` | `timer sleep (comm)` | `nanosleep`, `clock_nanosleep`, timerfd reads |
-| `fsync` | `fsync on DIR` | `fsync`, `fdatasync`, `sync_file_range`, `syncfs`, `msync`, writes to `O_SYNC`/`O_DSYNC` files |
+| `fsync` | `fsync on DIR` | `fsync`, `fdatasync`, `sync_file_range`, `syncfs`, writes to `O_SYNC`/`O_DSYNC` files; `sync` and `msync` by name (`fsync in msync`) |
 | `file` | `file I/O on DIR` | other regular-file and block-device I/O, path syscalls |
 | `lock` | `file lock wait on DIR` | `flock`, `fcntl` `F_SETLKW`/`F_OFD_SETLKW` |
 | `aio` | `async I/O completion (...)` | `io_uring_enter`, `io_getevents`, `io_pgetevents` |
@@ -462,7 +462,7 @@ processes of the same name ran with different arguments (`sort -R` and `sort -n`
 | `signal` | `waiting for a signal (...)` | `pause`, `sigsuspend`, `sigwait`, signalfd reads |
 | `tty` | `terminal/device I/O (...)` | character devices, terminals |
 | `fault` | `page faults on DIR` | blocked in a page fault: a mapped file's directory, or `anonymous memory (swap)` |
-| `other` | `other (...)` | unknown syscalls, off-CPU outside syscalls, stopped, `untraced` gaps from lost records |
+| `other` | `other (...)` | unknown syscalls, 32-bit syscalls of 32-bit programs (`other (32-bit syscall)`), off-CPU outside syscalls, stopped, `untraced` gaps from lost records |
 
 Waits on another traced task never appear as such: a futex, pipe or poll wait ended by a
 traced thread, a `wait4` on a child, or a `vfork` is replaced by what that task did in the

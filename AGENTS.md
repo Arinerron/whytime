@@ -85,7 +85,7 @@ pin the internal crates with `=X.Y.Z` in `[workspace.dependencies]`, so a newer
 submodule `path` (local builds) and the crates.io `version` (published manifests). Each
 published crate has a `LICENSE` symlink to the root one (cargo packs its contents);
 `whytime`'s readme is the root `README.md`, the two internal crates have their own short
-one. `whytime/tests/fixtures` (~230 KB) ships so that `cargo test` works from the package.
+one. `whytime/tests/fixtures` (~190 KB) ships so that `cargo test` works from the package.
 
 Releasing:
 
@@ -204,7 +204,7 @@ build and commit the new gitlink.
 2. runs `clang -target bpfel -O2 -g -mcpu=v3 -Wall -Werror -D__TARGET_ARCH_{x86,arm64} -I bpf
    -I bpf/include -I $OUT_DIR -c bpf/whytime.bpf.c` twice: `whytime.bpf.o` (plain runs) and,
    with `-DWHYTIME_STACKS`, `whytime_stacks.bpf.o` (stack capture: the stack maps, stacks
-   at blocks in `on_switch`, the `on_sample` sampler; ~172 KB against ~153 KB). Plain runs
+   at blocks in `on_switch`, the `on_sample` sampler; ~180 KB against ~161 KB). Plain runs
    create no stack map and attach no sampler, so nothing about stack capture can keep them
    from loading (a STACK_TRACE map deeper than `kernel.perf_event_max_stack` fails to create
    with EINVAL, flags or not). Arch from `CARGO_CFG_TARGET_ARCH`; other arches

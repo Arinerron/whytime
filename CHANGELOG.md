@@ -15,6 +15,11 @@ All notable changes to whytime are recorded here. The format is based on
   and Rust 1.94 or newer). The internal crates `whytime-abi` and `whytime-bpf` are
   published alongside it, pinned to the same version.
 
+### Changed
+
+- The trace file format changed (32-bit syscalls are recorded as such): `whytime report`
+  refuses files recorded by 0.1.0 with exit status 2.
+
 ### Security
 
 - Under `sudo`, output files (`--record`, `--perfetto`, `--flamegraph`, `--folded`) are
@@ -43,7 +48,10 @@ All notable changes to whytime are recorded here. The format is based on
 - `whytime doctor` points to the verifier log (`WHYTIME_LOG=debug`) when the verifier
   rejects a program, instead of suggesting `setcap` or `sudo`.
 - whytime loads on kernels built without IPv6.
-- Host names are recovered from DNS over TCP as musl's resolver does it.
+- Host names are recovered from DNS over TCP as musl's resolver does it, and a TCP reply
+  read in several pieces is no longer partly parsed as a new message.
+- A wakeup or a ready descriptor recorded just as a thread blocked is no longer lost, which
+  attributed the wait to its syscall instead of to its waker or the ready descriptor.
 - Report time no longer grows quadratically or cubically with chains of threads handing
   work over to each other.
 - Waits ended by a process outside the traced tree are no longer chained as timeouts.

@@ -151,9 +151,10 @@ before sharing one publicly. Also include the full `whytime doctor` output, your
   ran and on which kernel.
 - Add an entry under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for user-visible
   changes.
-- CI runs the build, unit tests, an aarch64 build with a qemu smoke test, and the e2e suite
-  in a VM. A maintainer reviews every pull request; expect questions about overhead and
-  about how the change is reflected in the report.
+- CI runs the build, unit tests, the glibc checks and `cargo package` of the published
+  crates, an aarch64 build with a qemu smoke test, and the e2e suite in a VM. A maintainer
+  reviews every pull request; expect questions about overhead and about how the change is
+  reflected in the report.
 
 ## Report schema policy
 
