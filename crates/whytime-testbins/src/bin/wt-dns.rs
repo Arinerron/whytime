@@ -1,8 +1,8 @@
-//! `wt-dns udp|tcp SERVER NAME PORT N` resolves NAME with one DNS query (type A) to SERVER,
-//! then N times connects to the answer's address on PORT and reads until the peer closes.
-//! `udp` sends the query from an unconnected socket (`sendto`/`recvfrom`, as musl does);
-//! `tcp` connects to SERVER and reads the 2-byte length and the message separately (as glibc
-//! does).
+//! `wt-dns udp|tcp|tcp-musl SERVER NAME PORT N` resolves NAME with one DNS query (type A) to
+//! SERVER, then N times connects to the answer's address on PORT and reads until the peer
+//! closes. `udp` sends the query from an unconnected socket (`sendto`/`recvfrom`, as musl
+//! does); `tcp` connects to SERVER and reads the 2-byte length and the message separately (as
+//! glibc does); `tcp-musl` does what musl's TCP fallback does (see [`musl_tcp`]).
 //!
 //! `wt-dns serve ADDR NAME=IPV4...` is the DNS server the e2e suite starts outside the traced
 //! tree: on UDP and TCP ADDR it answers A queries for each NAME with its IPV4 (other names:
@@ -18,7 +18,7 @@ const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 
 fn main() {
-    let usage = "wt-dns udp|tcp SERVER NAME PORT N | wt-dns serve ADDR NAME=IPV4...";
+    let usage = "wt-dns udp|tcp|tcp-musl SERVER NAME PORT N | wt-dns serve ADDR NAME=IPV4...";
     let mode: String = whytime_testbins::arg(1, usage);
     if mode == "serve" {
         let addr: SocketAddr = whytime_testbins::arg(2, usage);
@@ -58,6 +58,7 @@ fn main() {
             stream.read_exact(&mut reply).expect("read message");
             reply
         }
+        "tcp-musl" => musl_tcp(server, &query),
         _ => {
             eprintln!("usage: {usage}");
             std::process::exit(2);
@@ -71,6 +72,124 @@ fn main() {
         data.clear();
         stream.read_to_end(&mut data).expect("read");
     }
+}
+
+/// musl's TCP fallback (`res_msend.c`, 1.2.4+): a non-blocking socket with
+/// `TCP_FASTOPEN_CONNECT`; the length and the query sent by one `sendmsg(MSG_FASTOPEN)` naming
+/// the server, which connects (`EINPROGRESS` without a Fast Open cookie), the rest sent once
+/// writable; the reply received by `recvmsg` into two buffers, the 2-byte length and the
+/// message, each call continuing where the last one stopped.
+fn musl_tcp(server: SocketAddr, query: &[u8]) -> Vec<u8> {
+    let SocketAddr::V4(v4) = server else {
+        panic!("tcp-musl needs an IPv4 server");
+    };
+    let addr = libc::sockaddr_in {
+        sin_family: libc::sa_family_t::try_from(libc::AF_INET).expect("small"),
+        sin_port: v4.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(*v4.ip()).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let addr_len = libc::socklen_t::try_from(size_of_val(&addr)).expect("small");
+    let flags = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    // SAFETY: socket has no memory arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET, flags, 0) };
+    assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+    let mut length = u16::try_from(query.len()).expect("short").to_be_bytes();
+    let one: libc::c_int = 1;
+    let one_len = libc::socklen_t::try_from(size_of_val(&one)).expect("small");
+    // SAFETY: setsockopt reads `one_len` bytes of `one`.
+    let fastopen = unsafe {
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT, (&raw const one).cast(), one_len)
+    } == 0;
+    let mut query_buf = query.to_vec();
+    let request = [(length.as_mut_ptr(), 2), (query_buf.as_mut_ptr(), query.len())];
+    let mut sent = 0;
+    let started = fastopen && {
+        let r = msg(fd, &request, 0, Some((&addr, addr_len)), libc::MSG_FASTOPEN, false);
+        sent = usize::try_from(r).unwrap_or(0);
+        r >= 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EINPROGRESS)
+    };
+    if !started {
+        // SAFETY: connect reads `addr_len` bytes of `addr`.
+        let r = unsafe { libc::connect(fd, (&raw const addr).cast(), addr_len) };
+        let err = io::Error::last_os_error();
+        assert!(r == 0 || err.raw_os_error() == Some(libc::EINPROGRESS), "connect: {err}");
+    }
+    while sent < 2 + query.len() {
+        wait_for(fd, libc::POLLOUT);
+        let r = msg(fd, &request, sent, None, 0, false);
+        sent += usize::try_from(r).unwrap_or_else(|_| panic!("sendmsg: {}", io::Error::last_os_error()));
+    }
+    let mut alen = [0_u8; 2];
+    let mut reply = vec![0_u8; 4096];
+    let mut got = 0;
+    loop {
+        wait_for(fd, libc::POLLIN);
+        let buffers = [(alen.as_mut_ptr(), 2), (reply.as_mut_ptr(), reply.len())];
+        let r = msg(fd, &buffers, got, None, 0, true);
+        assert!(r > 0, "recvmsg: {r}: {}", io::Error::last_os_error());
+        got += usize::try_from(r).expect("positive");
+        let want = 2 + usize::from(u16::from_be_bytes(alen));
+        if got >= 2 && got >= want.min(2 + reply.len()) {
+            break;
+        }
+    }
+    // SAFETY: `fd` is ours.
+    unsafe { libc::close(fd) };
+    reply.truncate(usize::from(u16::from_be_bytes(alen)));
+    reply
+}
+
+/// `sendmsg` (or with `recv`, `recvmsg`) on `fd` over `buffers` past their first `skip` bytes
+/// (musl's `step_mh`), to `to` if given, with `flags` and `MSG_NOSIGNAL`.
+fn msg(
+    fd: libc::c_int,
+    buffers: &[(*mut u8, usize)],
+    skip: usize,
+    to: Option<(&libc::sockaddr_in, libc::socklen_t)>,
+    flags: libc::c_int,
+    recv: bool,
+) -> isize {
+    let mut skip = skip;
+    let mut iov = Vec::new();
+    for &(base, len) in buffers {
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        iov.push(libc::iovec {
+            iov_base: base.wrapping_add(skip).cast(),
+            iov_len: len - skip,
+        });
+        skip = 0;
+    }
+    // SAFETY: an all-zero msghdr is an empty message.
+    let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
+    mh.msg_iov = iov.as_mut_ptr();
+    mh.msg_iovlen = iov.len().try_into().expect("two buffers");
+    if let Some((addr, len)) = to {
+        mh.msg_name = std::ptr::from_ref(addr).cast_mut().cast();
+        mh.msg_namelen = len;
+    }
+    // SAFETY: the iovecs point into live buffers of the given lengths; the name, if any, is
+    // a sockaddr_in of `msg_namelen` bytes.
+    unsafe {
+        if recv {
+            libc::recvmsg(fd, &raw mut mh, flags)
+        } else {
+            libc::sendmsg(fd, &raw const mh, flags | libc::MSG_NOSIGNAL)
+        }
+    }
+}
+
+/// Waits until `fd` has `events`.
+fn wait_for(fd: libc::c_int, events: libc::c_short) {
+    let mut pfd = libc::pollfd { fd, events, revents: 0 };
+    // SAFETY: poll reads and writes one pollfd.
+    let r = unsafe { libc::poll(&raw mut pfd, 1, 5000) };
+    assert!(r == 1, "poll: {r}: {}", io::Error::last_os_error());
 }
 
 /// A recursive query for `name`, type A.

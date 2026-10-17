@@ -13,13 +13,14 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 
 use procctx::StatLine;
 use whytime_abi::{
-    ANON_INODE_FS_MAGIC, CpuSegment, NR_NONE, PATH_BYTES, ST_BLOCKED, ST_RUNNING, SYSD_DESCRIBED,
-    SYSF_FD0, SysDetail, SysInfo, TaskState,
+    ANON_INODE_FS_MAGIC, CpuSegment, NR_COMPAT, NR_NONE, PATH_BYTES, ST_BLOCKED, ST_RUNNING,
+    SYSD_DESCRIBED, SYSF_FD0, SysDetail, SysInfo, TaskState,
 };
 
 use crate::classify::NR_UNREADABLE;
@@ -37,6 +38,8 @@ const TASK_STOPPED: u32 = 0x4;
 const TASK_TRACED: u32 = 0x8;
 const TASK_PARKED: u32 = 0x40;
 const TASK_NOLOAD: u32 = 0x400;
+/// `e_ident[EI_CLASS]` of a 32-bit ELF program.
+const ELFCLASS32: u8 = 1;
 
 /// A thread as `/proc` shows it at attach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +126,8 @@ pub struct Snapshot<'a> {
     syscalls: &'a SyscallTable,
     /// Network namespace inode → socket inode → family and peer.
     sockets: HashMap<u64, HashMap<u64, Peer>>,
+    /// Process → whether it runs a 32-bit program.
+    compat: HashMap<u32, bool>,
     /// Off-CPU threads whose syscall could not be read (no ptrace access).
     pub unreadable: usize,
 }
@@ -154,6 +159,7 @@ impl<'a> Snapshot<'a> {
         Self {
             syscalls,
             sockets: HashMap::new(),
+            compat: HashMap::new(),
             unreadable: 0,
         }
     }
@@ -188,6 +194,11 @@ impl<'a> Snapshot<'a> {
             Ok(text) => match parse_syscall(&text) {
                 Some(SyscallLine::Running) => return existing(Activity::Running),
                 Some(SyscallLine::Outside) => (no_syscall(), no_detail()),
+                // `/proc` shows a 32-bit program's syscalls by its numbers and registers; the
+                // kernel side records them as NR_COMPAT, without arguments.
+                Some(SyscallLine::In { .. }) if self.is_32bit(tgid) => {
+                    (SysInfo { nr: NR_COMPAT, ..no_syscall() }, no_detail())
+                }
                 Some(SyscallLine::In { nr, args }) => self.syscall(tgid, &dir, nr, args),
                 None => self.unread(),
             },
@@ -211,6 +222,17 @@ impl<'a> Snapshot<'a> {
             ..no_syscall()
         };
         (sys, no_detail())
+    }
+
+    /// Whether process `tgid` runs a 32-bit program (by the ELF class of `/proc/<pid>/exe`;
+    /// unreadable counts as native).
+    fn is_32bit(&mut self, tgid: u32) -> bool {
+        *self.compat.entry(tgid).or_insert_with(|| {
+            let mut ident = [0_u8; 5];
+            fs::File::open(format!("/proc/{tgid}/exe"))
+                .and_then(|mut exe| exe.read_exact(&mut ident))
+                .is_ok_and(|()| ident[..4] == *b"\x7fELF" && ident[4] == ELFCLASS32)
+        })
     }
 
     /// Syscall `nr` with arguments `args`, as the BPF program leaves it after the syscall's
@@ -447,7 +469,7 @@ fn inet_socket(line: &str, family: u16) -> Option<(u64, Peer)> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 

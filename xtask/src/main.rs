@@ -546,6 +546,29 @@ fn test_e2e() -> anyhow::Result<()> {
                 move |out: &Output| check_flame_flip(out, &folded, Need::Copied)
             }),
         ),
+        (
+            // musl's TCP fallback: Fast Open sendmsg naming the server, then recvmsg into a
+            // length buffer and a message buffer.
+            "dns-tcp-musl",
+            sudo(&[&bin("wt-dns"), "tcp-musl", DNS_SERVER, DNS_NAME, &port, "3"]),
+            Box::new(move |out: &Output| check_host(out, DNS_NAME, server)),
+        ),
+        (
+            // Each run's io_uring polling thread (no fork record) often exits last.
+            "iouring-exit",
+            sudo(&[
+                "sh",
+                "-c",
+                "i=0; while [ $i -lt 20 ]; do \"$0\" 3; [ $? = 77 ] && exit 77; i=$((i+1)); done",
+                &bin("wt-iouring"),
+            ]),
+            Box::new(check_iouring_exit),
+        ),
+        (
+            "compat-syscall",
+            sudo(&[&bin("wt-compat"), "600"]),
+            Box::new(check_compat),
+        ),
     ];
 
     let mut failed = 0;
@@ -918,6 +941,8 @@ fn build() -> anyhow::Result<HashMap<String, PathBuf>> {
         "wt-fifo",
         "wt-dns",
         "wt-flame",
+        "wt-iouring",
+        "wt-compat",
     ] {
         ensure!(
             bins.contains_key(name),
@@ -2167,4 +2192,40 @@ fn check_attach_flame(out: &Output, folded_path: &Path) -> anyhow::Result<String
         burn / total * 100.0,
         total / 1e6
     ))
+}
+
+/// Every `wt-iouring` run exited with 3 in `processes[]`, whichever thread exited last.
+fn check_iouring_exit(out: &Output) -> anyhow::Result<String> {
+    if out.status.code() == Some(77) {
+        return Err(Skip("io_uring is unavailable (io_uring_setup failed)".to_owned()).into());
+    }
+    exited(out, 0)?;
+    let report = report(out)?;
+    let codes: Vec<&Value> = report["processes"]
+        .as_array()
+        .context("no processes[]")?
+        .iter()
+        .filter(|p| p["comm"] == "wt-iouring")
+        .map(|p| &p["exit_code"])
+        .collect();
+    ensure!(codes.len() == 20, "{} wt-iouring processes (want 20)", codes.len());
+    let wrong = codes.iter().filter(|&&code| *code != 3).count();
+    ensure!(wrong == 0, "{wrong} of 20 exit codes are not 3: {codes:?}");
+    Ok("20 runs with an SQPOLL thread, each exit code 3".to_owned())
+}
+
+/// A wait in a 32-bit syscall is `other` "32-bit syscall", not whatever its number is in the
+/// 64-bit table (168: swapoff).
+fn check_compat(out: &Output) -> anyhow::Result<String> {
+    match out.status.code() {
+        Some(77) => return Err(Skip("no IA-32 emulation (x86-64 only)".to_owned()).into()),
+        // 128 + SIGSEGV: int 0x80 faults when IA-32 emulation is disabled at boot.
+        Some(139) => return Err(Skip("int 0x80 faulted: IA-32 emulation disabled".to_owned()).into()),
+        _ => {}
+    }
+    exited(out, 0)?;
+    let report = report(out)?;
+    let compat = class_share(&report, "other", |s| s == "32-bit syscall");
+    ensure!(compat >= 0.8, "other (32-bit syscall) share {compat:.3} < 0.8");
+    Ok(format!("int 0x80 poll: other (32-bit syscall) {:.1}%", compat * 100.0))
 }
